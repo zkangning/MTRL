@@ -1,6 +1,4 @@
-import copy
 from typing import Any, Dict, List
-
 from rllm.agents.agent import Action, BaseAgent, Trajectory
 
 # 引入四种具体的 Agent
@@ -71,40 +69,7 @@ class CompositeAgent(BaseAgent):
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:
-        """
-        返回对话历史，移除历史 assistant 消息中的 <think>...</think> 内容。
-        
-        注意：只移除 messages[:-1] 中的 <think> 内容，保留最后一条消息完整。
-        这样设计的原因：
-        1. Prompt 构建时（最后一条是 user 消息）：所有历史 assistant 消息的 <think> 被移除，减少上下文长度
-        2. Token 计算时（最后一条是 assistant 消息）：当前步骤的 assistant 消息保持完整，确保训练时 <think> token 被正确更新
-        """
-        messages = copy.deepcopy(self.active_agent.chat_completions)
-        
-        # 对除最后一条之外的所有 assistant 消息移除 <think> 内容
-        for msg in messages[:-1]:
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                # 移除 <think>...</think> 内容（包括 </think> 标签本身）
-                if "</think>" in content:
-                    _, sep, after = content.partition("</think>")
-                    if sep:
-                        msg["content"] = after.strip()
-        
-        return messages
-
-    @chat_completions.setter
-    def chat_completions(self, messages: List[Dict[str, str]]):
-        """
-        设置对话历史（用于初始 prompt 截断场景）。
-        
-        直接覆盖当前激活 Agent 的内部消息列表。
-        注意：这会丢失原有的 system prompt 等信息，仅用于紧急截断场景。
-        """
-        if hasattr(self.active_agent, 'messages'):
-            self.active_agent.messages = messages
-        else:
-            raise AttributeError(f"Active agent {type(self.active_agent).__name__} does not have 'messages' attribute")
+        return self.active_agent.chat_completions
 
     @property
     def trajectory(self) -> Trajectory:
