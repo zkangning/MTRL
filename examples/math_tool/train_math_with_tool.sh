@@ -1,5 +1,7 @@
 set -x
 
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export BASE_MODEL_PATH=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/ckpt/Qwen3-4B
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
@@ -15,7 +17,7 @@ python3 -m examples.math_tool.train_math_with_tool \
     data.val_batch_size=500 \
     data.max_prompt_length=2048 \
     data.max_response_length=8192 \
-    actor_rollout_ref.model.path=Qwen/Qwen3-4B \
+    actor_rollout_ref.model.path=$BASE_MODEL_PATH \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -35,7 +37,7 @@ python3 -m examples.math_tool.train_math_with_tool \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
-    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.temperature=0.8 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
@@ -54,9 +56,9 @@ python3 -m examples.math_tool.train_math_with_tool \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
+    trainer.save_freq=50 \
     trainer.test_freq=20 \
     trainer.default_hdfs_dir=null \
     rllm.agent.max_steps=2 \
     rllm.stepwise_advantage.enable=False \
-    trainer.total_epochs=100
+    trainer.total_epochs=4

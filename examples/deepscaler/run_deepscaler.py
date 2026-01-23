@@ -7,7 +7,7 @@ from rllm.data.dataset import DatasetRegistry
 from rllm.engine.agent_execution_engine import AgentExecutionEngine
 from rllm.environments.base.single_turn_env import SingleTurnEnvironment
 from rllm.rewards.reward_fn import math_reward_fn
-from rllm.utils import compute_pass_at_k
+from rllm.utils import compute_pass_at_k, save_trajectories, save_trajectories_json
 
 if __name__ == "__main__":
     import os
@@ -56,3 +56,5 @@ if __name__ == "__main__":
 
     results = asyncio.run(engine.execute_tasks(tasks))
     compute_pass_at_k(results)
+    save_trajectories_json(results, save_dir="./trajectories", filename="trajectories.json")
+

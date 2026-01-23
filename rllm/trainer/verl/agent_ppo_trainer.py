@@ -8,6 +8,7 @@ from functools import reduce
 from pprint import pprint
 from queue import Queue
 from threading import Thread
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -123,6 +124,117 @@ class AgentPPOTrainer(RayPPOTrainer):
                 agents[idx] = agent
         self.agent_execution_engine.update_envs_and_agents(envs, agents)
         return envs
+
+    def _compute_multitask_metrics(self, batch: DataProto):
+        """
+        计算多任务细分指标，包括“模型更新贡献度分析”。
+        """
+        stats = defaultdict(list)
+        
+        # 1. 获取分组标签
+        if "data_source" in batch.non_tensor_batch:
+            task_types = batch.non_tensor_batch["data_source"]
+        elif "extra_info" in batch.non_tensor_batch:
+            task_types = []
+            for item in batch.non_tensor_batch["extra_info"]:
+                try:
+                    if isinstance(item, str):
+                        t = json.loads(item).get("task_type", "unknown")
+                    else:
+                        t = item.get("task_type", "unknown")
+                except:
+                    t = "unknown"
+                task_types.append(t)
+            task_types = np.array(task_types)
+        else:
+            return {}
+
+        batch_size = len(task_types)
+        
+        # 2. 获取数据并转为 Numpy
+        # Reward: (B,)
+        token_scores = batch.batch.get("token_level_scores")
+        if token_scores is not None:
+            seq_rewards = token_scores.sum(dim=-1).detach().float().cpu().numpy()
+        else:
+            seq_rewards = np.zeros(batch_size)
+
+        # Advantage & Mask: (B, T)
+        advantages = batch.batch.get("advantages")
+        response_mask = batch.batch.get("response_mask")
+        
+        # 确保 Advantage 存在以便计算影响力
+        has_adv = (advantages is not None and response_mask is not None)
+        if has_adv:
+            # 转换为 numpy 以便向量化操作
+            np_adv = advantages.detach().float().cpu().numpy()
+            np_mask = response_mask.detach().float().cpu().numpy()
+            
+            # 计算每个样本的 Advantage 绝对值之和 (S, ) -> 代表该样本对梯度的贡献力度
+            # abs(A) * mask -> sum over tokens
+            sample_impact_mass = (np.abs(np_adv) * np_mask).sum(axis=-1)
+            total_batch_mass = sample_impact_mass.sum() + 1e-8 # 防止除零
+
+        # Lengths
+        prompts = batch.batch.get("prompts")
+        responses = batch.batch.get("responses")
+        pad_token_id = self.tokenizer.pad_token_id
+        step_nums = batch.non_tensor_batch.get("step_nums")
+
+        # 3. 遍历聚合
+        unique_tasks = np.unique(task_types)
+        metrics = {}
+
+        for t_type in unique_tasks:
+            indices = np.where(task_types == t_type)[0]
+            
+            # --- 基础指标 ---
+            # 1. Count
+            count = len(indices)
+            metrics[f"train/count/{t_type}"] = count
+            
+            # 2. Reward Mean
+            task_rewards = seq_rewards[indices]
+            metrics[f"train/reward/{t_type}_mean"] = np.mean(task_rewards)
+
+            # 3. Advantage Mean (保留原有指标，查看方向)
+            if has_adv:
+                curr_adv = np_adv[indices]
+                curr_mask = np_mask[indices]
+                valid_advs = curr_adv[curr_mask > 0.5] # boolean indexing
+                if valid_advs.size > 0:
+                    metrics[f"train/advantage/{t_type}_mean"] = np.mean(valid_advs)
+
+                task_mass = sample_impact_mass[indices].sum()
+                metrics[f"train/total_mass/{t_type}"] = task_mass
+                
+                # 5. Impact Ratio (该任务占总更新量的比例)
+                # 这个指标最能回答你的问题：模型这一步更新，有多大比例是由该任务主导的
+                metrics[f"train/mass_ratio/{t_type}"] = task_mass / total_batch_mass
+
+                valid_token_count = curr_mask.sum()
+                if valid_token_count > 0:
+                    metrics[f"train/per_token_mass/{t_type}"] = task_mass / valid_token_count
+
+            # 6. Lengths
+            if prompts is not None:
+                curr_prompts = prompts[indices]
+                # 计算非 pad 长度
+                p_lens = (curr_prompts != pad_token_id).sum(dim=1).float().cpu().numpy()
+                metrics[f"train/length/prompt/{t_type}"] = np.mean(p_lens)
+
+            if responses is not None:
+                curr_responses = responses[indices]
+                r_lens = (curr_responses != pad_token_id).sum(dim=1).float().cpu().numpy()
+                metrics[f"train/length/response/{t_type}"] = np.mean(r_lens)
+
+            # 7. Steps
+            if step_nums is not None:
+                curr_steps = step_nums[indices]
+                metrics[f"train/steps/{t_type}"] = np.mean(curr_steps)
+
+        return metrics
+
 
     def fit_agent(self):
         """
@@ -412,6 +524,13 @@ class AgentPPOTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    try:
+                        multitask_metrics = self._compute_multitask_metrics(batch)
+                        metrics.update(multitask_metrics)
+                    except Exception as e:
+                        # 捕获异常防止监控逻辑导致训练崩溃
+                        print(f"[Warning] Failed to compute multitask metrics: {e}")
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw):
@@ -454,16 +573,139 @@ class AgentPPOTrainer(RayPPOTrainer):
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
 
+    # def _validate_agent(self):
+    #     """
+    #     [更新版] 验证循环，增加对 Prompt Length 的统计。
+    #     """
+    #     rewards_lst = []
+    #     data_source_lst = []
+    #     uid_lst = []
+        
+    #     # 新增长度统计列表
+    #     response_lens_lst = []
+    #     prompt_lens_lst = [] 
+
+    #     pad_token_id = self.tokenizer.pad_token_id
+
+    #     for test_data in self.val_dataloader:
+    #         test_batch = DataProto.from_single_dict(test_data)
+    #         test_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
+            
+    #         n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
+    #         test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
+    #         test_batch.pop(["input_ids", "attention_mask", "position_ids"]) 
+            
+    #         test_batch.meta_info = {
+    #             "eos_token_id": self.tokenizer.eos_token_id,
+    #             "pad_token_id": self.tokenizer.pad_token_id,
+    #             "recompute_log_prob": False,
+    #             "do_sample": False,
+    #             "validate": True,
+    #         }
+            
+    #         self.init_envs_and_agents(test_batch)
+
+    #         if self.config.rllm.stepwise_advantage.enable:
+    #             test_output_gen_batch = self.generate_agent_steps(meta_info=test_batch.meta_info, uids=test_batch.non_tensor_batch["uid"])
+    #             is_last_step = test_output_gen_batch.non_tensor_batch["is_last_step"]
+    #             last_step_indices = np.where(is_last_step == True)[0]
+    #             test_output_gen_batch = test_output_gen_batch.select_idxs(last_step_indices)
+    #         else:
+    #             test_output_gen_batch, _ = self.generate_agent_trajectory(meta_info=test_batch.meta_info)
+
+    #         # 合并 Batch，此时 batch 中会包含 'prompts' 和 'responses'
+    #         test_batch = test_batch.union(test_output_gen_batch)
+
+    #         # --- 收集基础数据 ---
+    #         reward_tensor = test_batch.batch["token_level_scores"]
+    #         rewards_lst.append(reward_tensor.sum(-1).cpu())
+            
+    #         data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+    #         uid_lst.append(test_batch.non_tensor_batch["uid"])
+
+    #         # --- 收集 Response Length ---
+    #         responses = test_batch.batch.get("responses")
+    #         if responses is not None:
+    #             r_lens = (responses != pad_token_id).sum(dim=1).cpu()
+    #             response_lens_lst.append(r_lens)
+            
+    #         # --- [新增] 收集 Prompt Length ---
+    #         prompts = test_batch.batch.get("prompts")
+    #         if prompts is not None:
+    #             p_lens = (prompts != pad_token_id).sum(dim=1).cpu()
+    #             prompt_lens_lst.append(p_lens)
+
+    #     # 如果没有数据则返回空
+    #     if not rewards_lst: 
+    #         return {}
+            
+    #     # --- 聚合数据 ---
+    #     reward_tensor = torch.cat(rewards_lst, dim=0)
+    #     data_sources = np.concatenate(data_source_lst, axis=0)
+    #     uid_tensor = np.concatenate(uid_lst, axis=0)
+        
+    #     # 处理长度 Tensor
+    #     response_lens_tensor = torch.cat(response_lens_lst, dim=0) if response_lens_lst else torch.zeros_like(reward_tensor)
+    #     prompt_lens_tensor = torch.cat(prompt_lens_lst, dim=0) if prompt_lens_lst else torch.zeros_like(reward_tensor)
+
+    #     # --- 计算指标 ---
+    #     metric_dict = {}
+    #     unique_sources = np.unique(data_sources)
+        
+    #     # 辅助 Pass@K
+    #     data_source_uid_pass_rates = defaultdict(lambda: defaultdict(float))
+
+    #     for i in range(reward_tensor.shape[0]):
+    #         ds = data_sources[i]
+    #         r = reward_tensor[i].item()
+    #         u = uid_tensor[i]
+    #         data_source_uid_pass_rates[ds][u] = max(data_source_uid_pass_rates[ds][u], r)
+
+    #     for ds in unique_sources:
+    #         indices = np.where(data_sources == ds)[0]
+            
+    #         # Score
+    #         ds_rewards = reward_tensor[indices].numpy()
+    #         metric_dict[f"val/test_score/{ds}"] = np.mean(ds_rewards)
+            
+    #         # Response Length
+    #         ds_r_lens = response_lens_tensor[indices].float().numpy()
+    #         metric_dict[f"val/length/response/{ds}"] = np.mean(ds_r_lens)
+
+    #         # [新增] Prompt Length
+    #         ds_p_lens = prompt_lens_tensor[indices].float().numpy()
+    #         metric_dict[f"val/length/prompt/{ds}"] = np.mean(ds_p_lens)
+
+    #     # Pass@K
+    #     for ds, pass_rates in data_source_uid_pass_rates.items():
+    #         pass_k_lst = [score >= 1.0 for score in pass_rates.values()]
+    #         metric_dict[f"val/test_score/pass@k/{ds}"] = np.mean(pass_k_lst)
+
+    #     return metric_dict
+
     def _validate_agent(self):
+        """
+        [更新版] 验证循环，支持细粒度 (Sub-source) 测评结果展示。
+        """
         rewards_lst = []
         data_source_lst = []
+        sub_source_lst = []  # [新增] 用于存储子数据源
         uid_lst = []
+        
+        # 长度统计
+        response_lens_lst = []
+        prompt_lens_lst = [] 
+
+        pad_token_id = self.tokenizer.pad_token_id
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             test_batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object)
+            
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_batch.pop(["input_ids", "attention_mask", "position_ids"])  # these are not needed for environment based interaction
+            test_batch.pop(["input_ids", "attention_mask", "position_ids"]) 
+            
             test_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
@@ -471,65 +713,140 @@ class AgentPPOTrainer(RayPPOTrainer):
                 "do_sample": False,
                 "validate": True,
             }
+            
             self.init_envs_and_agents(test_batch)
 
+            # 生成轨迹
             if self.config.rllm.stepwise_advantage.enable:
                 test_output_gen_batch = self.generate_agent_steps(meta_info=test_batch.meta_info, uids=test_batch.non_tensor_batch["uid"])
-                # for validation, we only need the last step
                 is_last_step = test_output_gen_batch.non_tensor_batch["is_last_step"]
                 last_step_indices = np.where(is_last_step == True)[0]
-                test_output_gen_batch = test_output_gen_batch.select_idxs(last_step_indices)  # This batch only has last steps
+                test_output_gen_batch = test_output_gen_batch.select_idxs(last_step_indices)
             else:
                 test_output_gen_batch, _ = self.generate_agent_trajectory(meta_info=test_batch.meta_info)
 
+            # 合并 Batch
             test_batch = test_batch.union(test_output_gen_batch)
 
+            # --- 收集基础数据 ---
             reward_tensor = test_batch.batch["token_level_scores"]
-
             rewards_lst.append(reward_tensor.sum(-1).cpu())
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            
+            # 1. 获取主 Task 类型 (math, code, etc.)
+            ds_list = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            if isinstance(ds_list, np.ndarray):
+                ds_list = ds_list.tolist()
+            data_source_lst.extend(ds_list)
+            
+            # 2. [新增] 获取 Sub Source (aime2024, polymath, etc.)
+            # extra_info 通常包含原始数据字典，我们在 load_data 时把 sub_source 放进去了
+            curr_sub_sources = []
+            extra_infos = test_batch.non_tensor_batch.get("extra_info", [])
+            for item in extra_infos:
+                try:
+                    # extra_info 可能是 dict 或 json str
+                    d = json.loads(item) if isinstance(item, str) else item
+                    sub = d.get("sub_source") or d.get("source") or "default"
+                    curr_sub_sources.append(sub)
+                except:
+                    curr_sub_sources.append("unknown")
+            sub_source_lst.extend(curr_sub_sources)
+
             uid_lst.append(test_batch.non_tensor_batch["uid"])
 
-        reward_tensor = torch.cat(rewards_lst, dim=0)  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
-        data_source_reward = {}
+            # --- 收集 Length ---
+            responses = test_batch.batch.get("responses")
+            if responses is not None:
+                r_lens = (responses != pad_token_id).sum(dim=1).cpu()
+                response_lens_lst.append(r_lens)
+            
+            prompts = test_batch.batch.get("prompts")
+            if prompts is not None:
+                p_lens = (prompts != pad_token_id).sum(dim=1).cpu()
+                prompt_lens_lst.append(p_lens)
 
-        # to group for pass@k
+        if not rewards_lst: 
+            return {}
+            
+        # --- 数据聚合 ---
+        reward_tensor = torch.cat(rewards_lst, dim=0)
+        data_sources = np.array(data_source_lst)
+        sub_sources = np.array(sub_source_lst)  # 转为 numpy 以便筛选
         uid_tensor = np.concatenate(uid_lst, axis=0)
-        data_source_uid_pass_rates = {}  # data source to {uid: pass or not}
-
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
-
-            # pass@k
-            if data_source not in data_source_uid_pass_rates:
-                data_source_uid_pass_rates[data_source] = {}
-
-            uid = uid_tensor[i]
-            if uid not in data_source_uid_pass_rates[data_source]:
-                data_source_uid_pass_rates[data_source][uid] = 0  # default to not pass
-            # take highest score
-            data_source_uid_pass_rates[data_source][uid] = max(data_source_uid_pass_rates[data_source][uid], reward_tensor[i].item())
-
+        
+        response_lens_tensor = torch.cat(response_lens_lst, dim=0) if response_lens_lst else torch.zeros_like(reward_tensor)
+        
         metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            # clip rewards to be between 0 and 1
-            rewards_array = np.array(rewards)
-            rewards_array = np.clip(rewards_array, 0, 1)
-            metric_dict[f"val/test_score/{data_source}"] = np.mean(rewards_array)
+        
+        # ---------------------------------------------------------
+        # 核心逻辑修改：双层循环计算指标
+        # 1. 先按一级分类 (Task Type) 聚合，如 val/test_score/math
+        # 2. 再按二级分类 (Sub Source) 聚合，如 val/test_score/math/aime2024
+        # ---------------------------------------------------------
+        
+        # 辅助结构：{data_source: {sub_source: {uid: max_score}}}
+        # 用于计算 Pass@K (只要某一个 uid 下有一次成功即为成功)
+        pass_tracker = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+        
+        # 遍历所有样本填充数据
+        for i in range(reward_tensor.shape[0]):
+            ds = data_sources[i]
+            sub = sub_sources[i]
+            r = reward_tensor[i].item()
+            u = uid_tensor[i]
+            
+            # 记录 Pass@K 数据
+            pass_tracker[ds]["__total__"][u] = max(pass_tracker[ds]["__total__"][u], r)
+            pass_tracker[ds][sub][u] = max(pass_tracker[ds][sub][u], r)
 
-        for data_source, pass_rates in data_source_uid_pass_rates.items():
-            pass_k_lst = []
-            for uid, pass_score in pass_rates.items():
-                pass_k_lst.append(pass_score >= 1)  # assuming 1 means passed
-            metric_dict[f"val/test_score/pass@k/{data_source}"] = np.mean(pass_k_lst)
+        # ---------------------------
+        # 计算指标并写入 metric_dict
+        # ---------------------------
+        unique_tasks = np.unique(data_sources)
+        
+        for task in unique_tasks:
+            # === A. 一级指标 (Overall Task) ===
+            task_indices = np.where(data_sources == task)[0]
+            
+            # Mean Score
+            task_mean_score = reward_tensor[task_indices].numpy().mean()
+            metric_dict[f"val/test_score/{task}"] = task_mean_score
+            
+            # Length
+            task_mean_len = response_lens_tensor[task_indices].float().numpy().mean()
+            metric_dict[f"val/length/{task}"] = task_mean_len
+
+            # Pass@K (Overall)
+            # 只要该 uid 在该 task 下任意一次尝试 >= 1.0 就算 pass
+            task_uids = pass_tracker[task]["__total__"]
+            if task_uids:
+                passes = [s >= 1.0 for s in task_uids.values()]
+                metric_dict[f"val/test_score/pass@k/{task}"] = np.mean(passes)
+
+            # === B. 二级指标 (Sub Source breakdown) ===
+            # 找到该 task 下所有的 sub_sources
+            current_subs = np.unique(sub_sources[task_indices])
+            
+            for sub in current_subs:
+                if sub == "default" or sub == "unknown": continue # 跳过无意义的标签
+                
+                # 组合索引: data_source == task AND sub_source == sub
+                sub_indices = np.where((data_sources == task) & (sub_sources == sub))[0]
+                
+                if len(sub_indices) == 0: continue
+                
+                # Sub Mean Score
+                sub_mean_score = reward_tensor[sub_indices].numpy().mean()
+                metric_dict[f"val/test_score/{task}/{sub}"] = sub_mean_score
+                
+                # Sub Pass@K
+                # sub_uids = pass_tracker[task][sub]
+                # if sub_uids:
+                #     sub_passes = [s >= 1.0 for s in sub_uids.values()]
+                #     metric_dict[f"val/test_score/pass@k/{task}/{sub}"] = np.mean(sub_passes)
 
         return metric_dict
+
 
     def generate_agent_trajectory(self, timing_raw=None, meta_info=None):
         """

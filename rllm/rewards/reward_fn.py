@@ -5,6 +5,7 @@ from rllm.rewards.code_reward import RewardCodeFn
 from rllm.rewards.math_reward import RewardMathFn
 from rllm.rewards.reward_types import RewardConfig, RewardInput, RewardOutput
 from rllm.rewards.search_reward import RewardSearchFn
+from rllm.rewards.toolcall_reward import ToolCallRewardFn
 
 
 @runtime_checkable
@@ -97,3 +98,13 @@ def code_reward_fn(task_info: dict, action: str) -> RewardOutput:
     if isinstance(action, Action):
         action = action.action
     return reward_fn(task_info, action)
+
+# 包装函数，适配 Trainer 调用约定
+def tool_call_reward_fn(task_info: dict, action: str) -> RewardOutput:
+    # 确保兼容性，如果 task_info 中包含 'task' 键，则展开
+    reward_config = RewardConfig()
+    reward_fn = ToolCallRewardFn(reward_config)
+    if isinstance(action, Action):
+        action = action.action
+    return reward_fn(task_info, action)
+

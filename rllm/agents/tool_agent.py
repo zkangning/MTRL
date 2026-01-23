@@ -66,6 +66,8 @@ class ToolAgent(BaseAgent):
         if isinstance(obs, dict):
             if "question" in obs:
                 messages.append({"role": "user", "content": obs["question"]})
+            elif "prompt" in obs:
+                messages.append({"role": "user", "content": obs["prompt"]})
             elif "tool_outputs" in obs:
                 # Format tool outputs from environment observation
                 for tool_call_id, tool_output_str in obs["tool_outputs"].items():
@@ -180,3 +182,79 @@ class MCPToolAgent(ToolAgent):
         self._trajectory = Trajectory()
         self.messages: list[dict[str, Any]] = []
         self.reset()
+
+class ToolCallAgent(BaseAgent):
+    """
+    Agent specifically for Tool Use / Function Calling tasks.
+    Parses structured observation to assign System and User roles.
+    """
+    def __init__(self, **kwargs):
+        # super().__init__(**kwargs)
+        super().__init__()
+        self._trajectory = Trajectory()
+        self.messages = []
+
+    def reset(self):
+        self._trajectory = Trajectory()
+        self.messages = []
+
+    def update_from_env(self, observation: Any, reward: float, done: bool, info: dict, **kwargs):
+        """
+        Receives the observation. 
+        If observation is a dict with 'instruction' and 'input', splits them into System/User roles.
+        """
+        if done:
+            if self.trajectory.steps:
+                self.trajectory.steps[-1].reward = reward
+                self.trajectory.steps[-1].done = done
+            return
+
+        # 核心修改逻辑：处理字典类型的 Observation
+        if isinstance(observation, dict) and "instruction" in observation and "input" in observation:
+            
+            # 1. 添加 System Message (Instruction)
+            instruction = observation["instruction"]
+            if instruction:
+                self.messages.append({"role": "system", "content": instruction})
+            
+            # 2. 添加 User Message (Input)
+            user_input = observation["input"]
+            self.messages.append({"role": "user", "content": user_input})
+            
+            # 为了 Trajectory 的记录方便（打印日志时可读），我们在 Step 中保存一个拼接后的字符串版本
+            # 或者你可以选择直接保存 dict，取决于后续 Trainer 如何处理 trajectory.observation
+            # 这里为了兼容性，保存为人类可读的字符串
+            step_observation = f"System:\n{instruction}\n\nUser:\n{user_input}"
+            
+        else:
+            # Fallback: 如果 observation 是字符串或其他格式，默认作为 User 消息
+            # 这保证了代码的健壮性，防止 Env 改回字符串时 Agent 报错
+            content = str(observation)
+            self.messages.append({"role": "user", "content": content})
+            step_observation = content
+
+        # 创建 Step 并记录
+        step = Step(observation=step_observation)
+        self._trajectory.steps.append(step)
+
+    def update_from_model(self, response: str, **kwargs) -> Action:
+        """
+        Stores the model response.
+        """
+        self.messages.append({"role": "assistant", "content": response})
+        
+        if self.trajectory.steps:
+            cur_step = self.trajectory.steps[-1]
+            cur_step.model_response = response
+            cur_step.action = Action(response)
+            
+        return Action(response)
+
+    @property
+    def trajectory(self) -> Trajectory:
+        return self._trajectory
+    
+    @property
+    def chat_completions(self) -> list:
+        return self.messages
+

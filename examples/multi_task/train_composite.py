@@ -1,0 +1,263 @@
+import hydra
+import logging
+import requests
+import random
+import os
+import json
+import sys
+from typing import List, Dict, Any
+
+# HF Dataset
+from datasets import load_dataset
+
+# RLLM 基础组件
+from rllm.data.dataset import DatasetRegistry
+from rllm.trainer.agent_trainer import AgentTrainer
+# 引入所有任务的 Reward Function
+from rllm.rewards.reward_fn import math_reward_fn, code_reward_fn, search_reward_fn, tool_call_reward_fn
+from rllm.agents.composite_agent import CompositeAgent
+from rllm.environments.composite.composite_env import CompositeEnvironment
+
+from rllm.data.utils import (
+    create_standard_sample, 
+    fetch_bfcl_tasks, 
+    load_comprehensive_math_test, 
+    load_and_tag_dataset, 
+    load_dapo_math_dataset, 
+    load_deepmath_dataset, 
+    load_search_data,
+    load_tool_call_dataset,
+    load_tool_call_json_dataset
+)
+
+# 引入 System Prompts
+from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT
+
+
+# 引入 MCP 组件 (用于 Search/Browsing)
+# 假设该模块在项目中存在，如果不存在需确保路径正确
+try:
+    from rllm.environments.tools.mcp_env import MCPConnectionManager
+except ImportError:
+    MCPConnectionManager = None
+
+random.seed(42)
+logger = logging.getLogger(__name__)
+
+
+
+# --- 数据准备主逻辑 (支持 4 种任务) ---
+def prepare_composite_dataset(
+    bfcl_url: str, 
+    dataset_name: str, 
+    math_num: int, 
+    code_num: int, 
+    bfcl_num: int,
+    search_num: int,
+    tool_call_num: int,        
+    tool_call_data_path: str
+):
+    logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search)...")
+    
+    # 1. BFCL
+    bfcl_train = fetch_bfcl_tasks(bfcl_url, "train") if bfcl_num > 0 else []
+    bfcl_test = fetch_bfcl_tasks(bfcl_url, "val") if bfcl_num > 0 else []
+    
+    # 2. Math
+    if math_num > 0:
+        # 假设 deepscaler_math 已在 Registry 中，或者按需替换为 load_dataset
+        # math_train = load_dapo_math_dataset(math_num)
+        math_train = load_deepmath_dataset(math_num)
+        math_test = load_comprehensive_math_test()
+    else:
+        math_train, math_test = [], []
+
+    # 3. Code
+    if code_num > 0:
+        code_train = load_and_tag_dataset("deepcoder", "train", "code")
+        if code_train and len(code_train) > code_num:
+            code_train = code_train[:code_num]
+        code_test = load_and_tag_dataset("deepcoder", "test", "code")
+    else:
+        code_train, code_test = [], []
+
+    # 4. Search
+    if search_num > 0:
+        search_train = load_search_data("train", search_num)
+        search_test = load_search_data("test", 500) # 这里的 500 可配置化
+    else:
+        search_train, search_test = [], []
+
+    # 5. Tool Call
+    if tool_call_num > 0 and tool_call_data_path:
+        # 分别加载 train 和 test parquet
+        tc_train = load_tool_call_json_dataset(tool_call_data_path, split="train", num_samples=tool_call_num)
+        # 测试集通常不需要采样太多，这里取全部或限制数量
+        tc_test = load_tool_call_json_dataset(tool_call_data_path, split="test", num_samples=2000) 
+    else:
+        tc_train, tc_test = [], []
+
+    # 混合
+    mixed_train = bfcl_train + math_train + code_train + search_train + tc_train
+    mixed_test = bfcl_test + math_test + code_test + search_test + tc_test
+    
+    if not mixed_train:
+        logger.error("No training data found! Please check data configuration.")
+        # 这里可以选择抛出异常，或者让 Trainer 去处理空数据
+    else:
+        random.shuffle(mixed_train)
+    
+    # 统计日志
+    logger.info(f"Prepared Data Details:")
+    logger.info(f"  Train: BFCL={len(bfcl_train)}, Math={len(math_train)}, Code={len(code_train)}, Search={len(search_train)}, Tool_Call={len(tc_train)} | Total={len(mixed_train)}")
+    logger.info(f"  Test : BFCL={len(bfcl_test)}, Math={len(math_test)}, Code={len(code_test)}, Search={len(search_test)}, Tool_Call={len(tc_test)} | Total={len(mixed_test)}")
+    
+    # 注册数据集
+    DatasetRegistry.register_dataset(dataset_name, mixed_train, split="train")
+    DatasetRegistry.register_dataset(dataset_name, mixed_test, split="test")
+    
+    return dataset_name
+
+
+# --- 主训练函数 ---
+
+@hydra.main(config_path="pkg://rllm.trainer.config", config_name="agent_ppo_trainer", version_base=None)
+def main(config):
+    # 配置读取
+    bfcl_url = config.get("bfcl_url", os.getenv("BFCL_URL", "http://localhost:8801"))
+    
+    # 读取各任务数量配置，兼容旧 config
+    math_num = config.data.get("math_num", 0)
+    code_num = config.data.get("code_num", 0)
+    bfcl_num = config.data.get("bfcl_num", 0)
+    search_num = config.data.get("search_num", 0)
+    tool_call_num = config.data.get("tool_call_num", 0)
+    tool_call_data_path = config.data.get("tool_call_data_path", "./data/toolace")
+
+    # --- Search / MCP 环境配置 ---
+    mcp_tool_map = {}
+    bright_data_token = os.getenv("BRIGHT_DATA_API_TOKEN")
+    
+    # MCP Server 设置
+    mcp_server_command = "npx"
+    mcp_server_args = ["-y", "@brightdata/mcp"]
+    mcp_server_env = {
+        "API_TOKEN": bright_data_token or "",
+        "GROUPS": "advanced_scraping",
+        "PATH": os.environ.get("PATH", ""),
+        "PRO_MODE": "true",
+        "WEB_UNLOCKER_ZONE": "web_unlocker_zkn"
+    }
+    search_cache_dir = "./search_cache_data"
+    os.makedirs(search_cache_dir, exist_ok=True)
+    
+    # 限制 Agent 可见的工具，避免 Context 污染
+    allowed_mcp_tools = ["search_engine", "scrape_as_markdown", "search_engine_batch", "scrape_batch"]
+
+    # 如果启用了 Search 任务，尝试初始化 MCP 并获取工具定义
+    if search_num > 0:
+        if not bright_data_token:
+            logger.error("⚠️ Search task enabled but BRIGHT_DATA_API_TOKEN not found! Search steps may fail.")
+        elif MCPConnectionManager is None:
+             logger.error("⚠️ MCPConnectionManager import failed. Cannot initialize MCP tools.")
+        else:
+            logger.info(f"Initializing MCP Connection to fetch tools (Filtered by: {allowed_mcp_tools})...")
+            try:
+                # 临时启动一个 Manager 来获取工具 Schema
+                temp_manager = MCPConnectionManager(
+                    mcp_server_command, 
+                    mcp_server_args, 
+                    mcp_server_env,
+                    search_cache_dir,
+                    allowed_tools=allowed_mcp_tools
+                )
+                temp_manager.start()
+                mcp_tool_map = temp_manager.tool_map
+                temp_manager.stop()
+                logger.info(f"✅ Fetched {len(mcp_tool_map)} tools from Bright Data MCP.")
+            except Exception as e:
+                logger.error(f"❌ Failed to fetch MCP tools: {e}")
+
+    # 1. 准备数据
+    dataset_name = prepare_composite_dataset(
+        bfcl_url,
+        config.data.dataset_name, 
+        math_num, 
+        code_num, 
+        bfcl_num,
+        search_num,
+        tool_call_num,
+        tool_call_data_path
+    )
+    
+    train_dataset = DatasetRegistry.load_dataset(dataset_name, "train")
+    test_dataset = DatasetRegistry.load_dataset(dataset_name, "test")
+
+    # 2. 构造 Environment 参数 (支持所有任务)
+    composite_env_args = {
+        "bfcl_args": {
+            "base_url": bfcl_url,
+            "env_type": "bfcl",
+            "max_steps": config.rllm.agent.max_steps,
+        },
+        "math_args": {
+            "tools": ["python"],
+            "reward_fn": math_reward_fn,
+        },
+        "code_args": {
+            "reward_fn": code_reward_fn
+        },
+        "search_args": {
+            "mcp_server_command": mcp_server_command,
+            "mcp_server_args": mcp_server_args,
+            "mcp_server_env": mcp_server_env,
+            "reward_fn": search_reward_fn,
+            "cache_dir": search_cache_dir,
+            "allowed_tools": allowed_mcp_tools  # 运行时过滤
+        },
+        "tool_call_args": {
+            "reward_fn": tool_call_reward_fn
+
+        }
+    }
+
+    # 3. 构造 Agent 参数 (支持所有任务)
+    composite_agent_args = {
+        "bfcl_agent_args": {
+            "parser_name": "qwen",
+            "system_prompt": "You are a helpful assistant with access to tools. Use the provided tools to fulfill the user request.",
+        },
+        "math_agent_args": {
+            "tools": ["python"], 
+            "parser_name": "qwen", 
+            "system_prompt": MATH_SYSTEM_PROMPT
+        },
+        "code_agent_args": {
+            "accumulate_thinking": True,
+        },
+        "search_agent_args": {
+            "parser_name": "qwen",
+            "system_prompt": SEARCH_SYSTEM_PROMPT,
+            "tool_map": mcp_tool_map  # 传入预获取的工具 Schema
+        },
+        "tool_call_agent_args": {
+            "parser_name": "qwen"
+        }
+    }
+
+    # 4. 初始化 Trainer
+    trainer = AgentTrainer(
+        agent_class=CompositeAgent,
+        env_class=CompositeEnvironment,
+        agent_args=composite_agent_args,
+        env_args=composite_env_args,
+        config=config,
+        train_dataset=train_dataset,
+        val_dataset=test_dataset,
+    )
+    
+    logger.info(">>> Starting Composite Training...")
+    trainer.train()
+
+if __name__ == "__main__":
+    main()

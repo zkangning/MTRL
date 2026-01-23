@@ -12,6 +12,7 @@ from rllm.engine.agent_execution_engine import AgentExecutionEngine
 from rllm.environments.tools.mcp_env import MCPConnectionManager, MCPEnvironment
 from rllm.rewards.reward_fn import search_reward_fn
 from rllm.utils import save_trajectories
+from rllm.utils.compute_pass_at_k import save_clean_trajectories
 
 
 async def main():
@@ -68,13 +69,18 @@ async def main():
 
     tasks = test_dataset.get_data()
     print(f"Running evaluation on {len(tasks)} HotpotQA tasks...")
+    
+    # 取两个任务来验证效果
+    tasks = tasks[:2]
 
     try:
         results = await engine.execute_tasks(tasks)
-        save_trajectories(results, save_dir="./trajectories/mcp_tavily", filename="trajectories.pt")
+        save_clean_trajectories(results, save_dir="./trajectories/mcp_search.json")
     finally:
         MCPEnvironment.cleanup_global_resources()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+

@@ -205,8 +205,26 @@ class AgentExecutionEngine:
         prompt_token_len = len(prompt_tokens)
         # Note, this should never happen!
         if prompt_token_len > self.max_prompt_length:
-            agent.reset()
-            raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
+            # agent.reset()
+            # raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
+            colorful_print(
+                f"Warning: Trajectory {idx} initial prompt length {prompt_token_len} exceeds max_prompt_length {self.max_prompt_length}. Truncating from left.", 
+                "yellow"
+            )
+            prompt_tokens = prompt_tokens[-self.max_prompt_length:]
+            prompt_token_len = len(prompt_tokens)
+
+            try:
+                # 将截断后的 Token 列表重新解码回字符串
+                truncated_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+                
+                # 强制覆盖 Agent 的内部消息历史。
+                # 必须这样做，因为接下来的循环是用 agent.chat_completions 生成 Prompt 的。
+                # 如果不覆盖，Agent 内部存的还是超长的旧文本，会导致后面再次报错。
+                agent.chat_completions = [{"role": "user", "content": truncated_text}]
+                
+            except Exception as e:
+                logger.error(f"Trajectory {idx}: Failed to sync truncated prompt back to agent: {e}")
 
         for step_idx in range(self.max_steps):
             # Get action from agent
@@ -228,7 +246,9 @@ class AgentExecutionEngine:
             kwargs["max_tokens"] = max_tokens
 
             start_time = time.time()
+            # import pdb; pdb.set_trace()
             response = await self.get_model_response(prompt_messages, application_id, **kwargs)
+            # import pdb; pdb.set_trace()
             delta_time = time.time() - start_time
             llm_time += delta_time
             total_time += delta_time
@@ -347,30 +367,38 @@ class AgentExecutionEngine:
                 response_masks = [0] * len(response_masks)
                 masked_out = True
 
-        if hasattr(env, "compute_final_reward") and not masked_out:
+        if hasattr(env, "compute_final_reward") and not masked_out: # Math, Code without compute_final_reward
             cur_step = agent.get_current_state()
             start_time = time.time()
             reward = await loop.run_in_executor(self.executor, env.compute_final_reward)
             reward_time = time.time() - start_time
             cur_step.reward = reward
-        # Closing environment using the executor.
+
+        # Closing environment using the executor
         await loop.run_in_executor(self.executor, env.close)
+
+        trajectory: Trajectory = agent.trajectory
+        # Aggregate final trajectory statistics
+        compute_trajectory_reward(trajectory)   # 对每一步的奖励进行加和
+        compute_mc_return(trajectory, gamma=self.gamma)
+
         if termination_reason:
             if reward > 0:
                 color = "green"
             else:
                 color = "yellow"
             colorful_print(
-                f"Trajectory {idx} completed due to: {termination_reason}. Reward is {reward}. \n",
+                f"Trajectory {idx} completed due to: {termination_reason}. Final Sum Reward is {trajectory.reward}. \n",
                 color,
             )
             if masked_out:
                 colorful_print(f"Trajectory {idx} is masked out due to overlong filter.", "red")
 
-        trajectory: Trajectory = agent.trajectory
-        # Aggregate final trajectory statistics
-        compute_trajectory_reward(trajectory)
-        compute_mc_return(trajectory, gamma=self.gamma)
+        # 前移
+        # trajectory: Trajectory = agent.trajectory
+        # # Aggregate final trajectory statistics
+        # compute_trajectory_reward(trajectory)   # 对每一步的奖励进行加和
+        # compute_mc_return(trajectory, gamma=self.gamma)
 
         if mode == "Text":
             return trajectory
@@ -509,8 +537,10 @@ class AgentExecutionEngine:
                     res = await self.run_agent_trajectory_async(index, application_id=task_id)
                     res.task = task
                     completed += 1
-                    colorful_print(f"Progress: {completed}/{total} trajectories completed", "cyan")
+                    if completed % 10 == 0: # 减少打印频率
+                        colorful_print(f"Progress: {completed}/{total} trajectories completed", "cyan")
                     return task_id, res
+                    
                 finally:
                     # Put the index back in the queue when done
                     await index_queue.put(index)

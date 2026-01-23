@@ -210,6 +210,44 @@ class QwenToolParser(ToolParser):
         tool_calls = [ToolCall(name=tc["name"], arguments=tc["arguments"]) for tc in tool_calls_dicts]
         return tool_calls
 
+    # def parse_qwen_tool_calls(self, text: str) -> list[dict[str, Any]]:
+    #     """Parse tool calls from text using a simple token format.
+
+    #     Format:
+    #     <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
+
+    #     Returns:
+    #         list[dict]: List of parsed tool calls, each containing 'name' and 'parameters'
+    #     """
+
+    #     tool_calls: list[dict[str, Any]] = []
+
+    #     # Return empty list if no tool calls found
+    #     if self.tool_call_begin not in text:
+    #         return tool_calls
+
+    #     # Process all tool calls in the text
+    #     while self.tool_call_begin in text:
+    #         start = text.find(self.tool_call_begin) + len(self.tool_call_begin)
+    #         end = text.find(self.tool_call_end)
+    #         if end == -1:
+    #             break
+
+    #         # Extract and parse the JSON content
+    #         json_content = text[start:end].strip()
+    #         try:
+    #             call_data = json.loads(json_content)
+    #             # Convert to common format matching parse_tool_calls output
+    #             tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+    #         except json.JSONDecodeError:
+    #             print(f"Error parsing tool call: {json_content}")
+    #             text = text[end + len(self.tool_call_end) :]
+    #             continue
+
+    #         # Move to next potential tool call
+    #         text = text[end + len(self.tool_call_end) :]
+
+    #     return tool_calls
     def parse_qwen_tool_calls(self, text: str) -> list[dict[str, Any]]:
         """Parse tool calls from text using a simple token format.
 
@@ -217,7 +255,7 @@ class QwenToolParser(ToolParser):
         <tool_call>{"name": "function_name", "arguments": {...}}</tool_call>
 
         Returns:
-            list[dict]: List of parsed tool calls, each containing 'name' and 'parameters'
+            list[dict]: List of parsed tool calls, each containing 'name' and 'arguments'
         """
 
         tool_calls: list[dict[str, Any]] = []
@@ -235,12 +273,38 @@ class QwenToolParser(ToolParser):
 
             # Extract and parse the JSON content
             json_content = text[start:end].strip()
+            
+            # 【核心修改部分】增加 try-except 捕获 KeyError，并做兼容处理
             try:
                 call_data = json.loads(json_content)
+                
+                # 1. 检查是否存在 'name'，如果不存在则视为无效调用
+                if "name" not in call_data:
+                    print(f"[Parser Warning] Missing 'name' in tool call: {json_content}")
+                    text = text[end + len(self.tool_call_end) :]
+                    continue
+                
+                # 2. 鲁棒地获取 'arguments'
+                # 优先级：arguments -> parameters -> args -> 默认空字典 {}
+                arguments = call_data.get("arguments")
+                if arguments is None:
+                    if "parameters" in call_data:
+                        arguments = call_data["parameters"]
+                    elif "args" in call_data:
+                        arguments = call_data["args"]
+                    else:
+                        arguments = {} # 如果都没有，默认为无参调用
+                
                 # Convert to common format matching parse_tool_calls output
-                tool_calls.append({"name": call_data["name"], "arguments": call_data["arguments"]})
+                tool_calls.append({"name": call_data["name"], "arguments": arguments})
+
             except json.JSONDecodeError:
-                print(f"Error parsing tool call: {json_content}")
+                print(f"[Parser Error] JSON Decode Error: {json_content}")
+                text = text[end + len(self.tool_call_end) :]
+                continue
+            except Exception as e:
+                # 捕获其他未知错误，防止训练进程中断
+                print(f"[Parser Critical] Unexpected error parsing tool call: {e}, content: {json_content}")
                 text = text[end + len(self.tool_call_end) :]
                 continue
 

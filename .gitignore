@@ -209,3 +209,8 @@ deepresearch_outputs/*
 examples/deepresearch/hle_outputs/*
 */hle_outputs/*
 examples/deepresearch/HLE_OUTPUT_EVOLUTION.md
+difficulty_eval/*
+search_cache_data/*
+trajectories/*
+
+

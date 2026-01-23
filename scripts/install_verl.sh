@@ -35,3 +35,6 @@ pip install opencv-fixer && \
 
 echo "5. Install verl"
 pip install --no-deps -e verl/
+
+ehco "6. Install rllm"
+pip install -e .

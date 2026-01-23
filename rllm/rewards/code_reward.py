@@ -8,16 +8,12 @@ import json
 import multiprocessing
 import re
 from multiprocessing import Manager
-from typing import Any
+from typing import Any, Dict, List, Union # 增加类型提示导入
 
 from rllm.rewards.code_utils.firejail_exec import code_exec_firejail as lc_code_exec
 from rllm.rewards.code_utils.humanevalplus import get_num_test_cases
-
-# from rllm.rewards.code_utils.swebench import swebench_check_correctness
 from rllm.rewards.code_utils.humanevalplus import run_test as humanevalplus_run_test
 from rllm.rewards.code_utils.kodcode import code_exec as kod_code_exec
-
-# from rllm.rewards.code_utils.code_contests import run_test as code_contests_run_test
 from rllm.rewards.code_utils.livecodebench import run_test as lcb_run_test
 from rllm.rewards.code_utils.taco import run_test as taco_run_test
 from rllm.rewards.reward_types import RewardConfig, RewardOutput, RewardType
@@ -405,64 +401,130 @@ class RewardCodeFn:
     def __init__(self, config: RewardConfig):
         self.config = config
 
+    # def __call__(self, task_info: dict, action: str) -> RewardOutput:
+    #     """
+    #     Calculate the reward for a code task based on the agent's action.
+
+    #     Args:
+    #         task_info: Dictionary containing problem, data_source, problem_type, and ground_truth
+    #         action: The agent's response/solution (code)
+
+    #     Returns:
+    #         RewardOutput: The calculated reward with correctness information
+    #     """
+    #     # total_start_time = time.time()
+
+    #     model_response = action
+    #     dataset_name = task_info.get("data_source", "")
+    #     tests = task_info.get("ground_truth", None)
+
+    #     if tests is None:
+    #         print("No tests found in task_info")
+    #         return RewardOutput(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No tests found in task_info"})
+
+    #     model_code = extract_code_from_model(model_response)
+    #     if model_code is None:
+    #         # print("No code found in model response")
+    #         return RewardOutput(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No code found in model response"})
+
+    #     if self.config.use_together_code_interpreter:
+    #         codetool = TogetherCodeTool()
+
+    #     # Tests: List[Dictionary] - Codeforces, LiveCodeBench
+    #     # Tests: Dictionary[Lists] - CodeContests, Taco/Apps
+    #     is_correct = False
+    #     test_details: dict[str, Any] = {}
+
+    #     if dataset_name in ["taco", "apps", "code_contests"]:
+    #         if self.config.use_together_code_interpreter:
+    #             is_correct, test_details = codetool_check_correctness(tests, model_code, codetool, is_taco_format=True)
+    #         else:
+    #             tests = taco_to_lcb_format(tests)
+    #             is_correct, test_details = lcb_check_correctness_v2(tests, model_code, debug=False)
+    #             # test_fn = taco_run_test
+    #             # is_correct, test_details = check_correctness(tests, model_code, test_fn)
+    #     elif dataset_name == "leetcode":
+    #         is_correct, test_details = leetcode_check_correctness(tests, model_code)
+    #     elif dataset_name in ["livecodebench", "codeforces", "primeintellect"]:
+    #         # Handle case where tests is a JSON string
+    #         if isinstance(tests, str):
+    #             tests = json.loads(tests)
+    #         is_correct, test_details = lcb_check_correctness_v2(tests, model_code, debug=False)
+    #     elif dataset_name == "kodcode":
+    #         is_correct, test_details = kodcode_check_correctness(tests, model_code)
+    #     elif dataset_name == "humanevalplus":
+    #         is_correct, test_details = humanevalplus_check_correctness(tests, model_code)
+    #     else:
+    #         raise NotImplementedError(f"Dataset {dataset_name} not implemented")
+
+    #     # total_time = time.time() - total_start_time
+    #     # print(f"Total reward function execution time: {total_time:.2f} seconds")
+
+    #     if is_correct:
+    #         return RewardOutput(reward=self.config.correct_reward, is_correct=True, metadata=test_details)
+    #     else:
+    #         return RewardOutput(reward=self.config.incorrect_reward, is_correct=False, metadata=test_details)
     def __call__(self, task_info: dict, action: str) -> RewardOutput:
-        """
-        Calculate the reward for a code task based on the agent's action.
-
-        Args:
-            task_info: Dictionary containing problem, data_source, problem_type, and ground_truth
-            action: The agent's response/solution (code)
-
-        Returns:
-            RewardOutput: The calculated reward with correctness information
-        """
-        # total_start_time = time.time()
-
         model_response = action
         dataset_name = task_info.get("data_source", "")
         tests = task_info.get("ground_truth", None)
 
         if tests is None:
-            print("No tests found in task_info")
+            # print("No tests found in task_info")
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No tests found in task_info"})
 
         model_code = extract_code_from_model(model_response)
         if model_code is None:
-            # print("No code found in model response")
+            # Fallback: if no markdown, maybe the whole response is code? 
+            # Or return error. For strictness, return error.
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False, metadata={"error": "No code found in model response"})
 
         if self.config.use_together_code_interpreter:
             codetool = TogetherCodeTool()
 
-        # Tests: List[Dictionary] - Codeforces, LiveCodeBench
-        # Tests: Dictionary[Lists] - CodeContests, Taco/Apps
         is_correct = False
         test_details: dict[str, Any] = {}
 
-        if dataset_name in ["taco", "apps", "code_contests"]:
-            if self.config.use_together_code_interpreter:
-                is_correct, test_details = codetool_check_correctness(tests, model_code, codetool, is_taco_format=True)
-            else:
-                tests = taco_to_lcb_format(tests)
+        try:
+            if dataset_name in ["taco", "apps", "code_contests"]:
+                if self.config.use_together_code_interpreter:
+                    is_correct, test_details = codetool_check_correctness(tests, model_code, codetool, is_taco_format=True)
+                else:
+                    tests_formatted = taco_to_lcb_format(tests)
+                    is_correct, test_details = lcb_check_correctness_v2(tests_formatted, model_code, debug=False)
+            
+            elif dataset_name == "leetcode":
+                is_correct, test_details = leetcode_check_correctness(tests, model_code)
+            
+            elif dataset_name in ["livecodebench", "codeforces", "primeintellect"]:
+                # Handle case where tests is a JSON string (double check)
+                if isinstance(tests, str):
+                    try:
+                        tests = json.loads(tests)
+                    except json.JSONDecodeError:
+                        return RewardOutput(reward=self.config.unk_error_reward, is_correct=False, metadata={"error": "Invalid JSON tests"})
                 is_correct, test_details = lcb_check_correctness_v2(tests, model_code, debug=False)
-                # test_fn = taco_run_test
-                # is_correct, test_details = check_correctness(tests, model_code, test_fn)
-        elif dataset_name == "leetcode":
-            is_correct, test_details = leetcode_check_correctness(tests, model_code)
-        elif dataset_name in ["livecodebench", "codeforces", "primeintellect"]:
-            # Handle case where tests is a JSON string
-            if isinstance(tests, str):
-                tests = json.loads(tests)
-            is_correct, test_details = lcb_check_correctness_v2(tests, model_code, debug=False)
-        elif dataset_name == "kodcode":
-            is_correct, test_details = kodcode_check_correctness(tests, model_code)
-        elif dataset_name == "humanevalplus":
-            is_correct, test_details = humanevalplus_check_correctness(tests, model_code)
-        else:
-            raise NotImplementedError(f"Dataset {dataset_name} not implemented")
-
-        # total_time = time.time() - total_start_time
-        # print(f"Total reward function execution time: {total_time:.2f} seconds")
+            
+            elif dataset_name == "kodcode":
+                is_correct, test_details = kodcode_check_correctness(tests, model_code)
+            
+            elif dataset_name == "humanevalplus":
+                is_correct, test_details = humanevalplus_check_correctness(tests, model_code)
+            
+            elif dataset_name == "code": # Generic code task fallback
+                # 尝试自动推断格式，这里简化处理，假设是 taco/lcb 格式
+                if isinstance(tests, list):
+                    is_correct, test_details = lcb_check_correctness_v2(tests, model_code, debug=False)
+                else:
+                    # 默认错误，防止乱猜
+                    pass
+            else:
+                # print(f"Warning: Dataset {dataset_name} not explicitly implemented, failing gracefully.")
+                pass
+        
+        except Exception as e:
+            print(f"Error executing reward function for {dataset_name}: {e}")
+            return RewardOutput(reward=self.config.unk_error_reward, is_correct=False, metadata={"error": str(e)})
 
         if is_correct:
             return RewardOutput(reward=self.config.correct_reward, is_correct=True, metadata=test_details)
@@ -470,50 +532,110 @@ class RewardCodeFn:
             return RewardOutput(reward=self.config.incorrect_reward, is_correct=False, metadata=test_details)
 
 
-def rllm_reward_fn_code(data_source: str, llm_solution: str, ground_truth: dict, **kwargs):
-    """Evaluate code solutions against ground truth answers
+# def rllm_reward_fn_code(data_source: str, llm_solution: str, ground_truth: dict, **kwargs):
+#     """Evaluate code solutions against ground truth answers
 
-        This function creates a reward function to evaluate code solutions by pass the test_case from groun_truth. It can optionally use a language model
-        for more sophisticated answer validation.
+#         This function creates a reward function to evaluate code solutions by pass the test_case from groun_truth. It can optionally use a language model
+#         for more sophisticated answer validation.
 
-        Args:
-            data_source: The source/dataset the problem comes from
-            llm_solution: The solution string provided by the language model to evaluate
-            ground_truth: some tests for this llm_solution
-            enable_llm: Whether to enable language model validation for complex cases (default: False)
+#         Args:
+#             data_source: The source/dataset the problem comes from
+#             llm_solution: The solution string provided by the language model to evaluate
+#             ground_truth: some tests for this llm_solution
+#             enable_llm: Whether to enable language model validation for complex cases (default: False)
 
-        Returns:
-            tuple: (bool, dict) where:
-                - bool: True if the solution passes all the test_case, False otherwise
-                - dict: Detailed test results with test cases and pass/fail status
+#         Returns:
+#             tuple: (bool, dict) where:
+#                 - bool: True if the solution passes all the test_case, False otherwise
+#                 - dict: Detailed test results with test cases and pass/fail status
 
-        Example:
-                model_response = '''
-    import sys
-    from itertools import permutations
-    def main():
-        n,m=map(int, input().split())
-        a=sum(list(map(int, input().split())))
-        if a+(n-1)*10<=m:
-            print(5)
-        else:
-            print(5)
-    if __name__ == "__main__":
-        main()
-    '''
+#         Example:
+#                 model_response = '''
+#     import sys
+#     from itertools import permutations
+#     def main():
+#         n,m=map(int, input().split())
+#         a=sum(list(map(int, input().split())))
+#         if a+(n-1)*10<=m:
+#             print(5)
+#         else:
+#             print(5)
+#     if __name__ == "__main__":
+#         main()
+#     '''
 
-        print(f"test the code_forces")
-        # tests = [ { "input": "3 30\n2 2 1", "output": "5" }, { "input": "3 10\n3 2 1", "output": "5" } ]
-        metadata = {
-             "tests": tests,
-        }
-        True, {"all_passed": True, "test_results": [...]}
+#         print(f"test the code_forces")
+#         # tests = [ { "input": "3 30\n2 2 1", "output": "5" }, { "input": "3 10\n3 2 1", "output": "5" } ]
+#         metadata = {
+#              "tests": tests,
+#         }
+#         True, {"all_passed": True, "test_results": [...]}
+#     """
+#     reward_config = RewardConfig()
+#     reward_fn = RewardCodeFn(reward_config)
+
+#     # Convert to new format
+#     task_info = {"problem": None, "problem_type": RewardType.CODE, "data_source": data_source, "ground_truth": ground_truth}
+
+#     reward_response = reward_fn(task_info, llm_solution)
+#     return reward_response
+
+def rllm_reward_fn_code(data_source: str, llm_solution: str, ground_truth: Union[Dict, List, str, Any], **kwargs):
+    """Evaluate code solutions against ground truth answers.
+    
+    Acts as an adapter to extract test cases from various ground_truth formats.
     """
     reward_config = RewardConfig()
     reward_fn = RewardCodeFn(reward_config)
+    
+    # --- [关键适配] 提取测试用例 ---
+    # 目标：找到真正的测试数据对象 (List[Dict] 或 Dict[List])
+    real_tests = None
 
-    # Convert to new format
-    task_info = {"problem": None, "problem_type": RewardType.CODE, "data_source": data_source, "ground_truth": ground_truth}
+    if isinstance(ground_truth, dict):
+        # 情况 A: ground_truth 是多任务包装器 {'response': ..., 'extra_info': ...}
+        if "extra_info" in ground_truth and isinstance(ground_truth["extra_info"], dict):
+            extra = ground_truth["extra_info"]
+            
+            # 1. 尝试常见的数据集特定的键名
+            if "tests" in extra:
+                real_tests = extra["tests"]
+            elif "test" in extra:
+                real_tests = extra["test"]
+            elif "input_output" in extra: # LiveCodeBench / CodeForces
+                real_tests = extra["input_output"]
+            
+            # 2. 尝试判断 extra_info 本身是否就是测试集 (Taco/Apps 格式: {'inputs': [], 'outputs': []})
+            elif "inputs" in extra and "outputs" in extra:
+                real_tests = extra
+            
+            # 3. 如果还没找到，且 ground_truth 也有 inputs (Legacy format compatibility)
+            elif "inputs" in ground_truth:
+                real_tests = ground_truth
+
+        # 情况 B: ground_truth 本身就是测试字典 (旧格式)
+        elif "inputs" in ground_truth or "functional" in ground_truth:
+            real_tests = ground_truth
+    
+    # 情况 C: ground_truth 是列表 (通常是 LCB 格式的 List[Dict])
+    elif isinstance(ground_truth, list):
+        real_tests = ground_truth
+        
+    # 情况 D: ground_truth 是字符串 (可能是 JSON 化的测试)
+    elif isinstance(ground_truth, str):
+        real_tests = ground_truth
+
+    # 如果实在提取不出来，且 ground_truth 是 dict 但不包含上述结构，可能它就是测试字典本身 (Fallback)
+    if real_tests is None:
+        real_tests = ground_truth
+
+    # 构造 task_info
+    task_info = {
+        "problem": None, 
+        "problem_type": RewardType.CODE, 
+        "data_source": data_source, 
+        "ground_truth": real_tests # 这里必须传入提取后的测试对象
+    }
 
     reward_response = reward_fn(task_info, llm_solution)
     return reward_response

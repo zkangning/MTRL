@@ -4,6 +4,7 @@ import multiprocessing
 import queue
 import signal
 import traceback
+import types
 
 from rllm.rewards.code_utils.livecodebench import (
     Capturing,
@@ -115,8 +116,25 @@ def execute_code(code, timeout):
 
 def _wrapper_exec_fn(sample, timeout, result_queue):
     """Helper function to execute code and put results in the queue"""
-    res = execute_code(sample, timeout=timeout)
-    result_queue.put(res)
+    # res = execute_code(sample, timeout=timeout)
+    # result_queue.put(res)
+    
+    stdout, stderr, result = execute_code(sample, timeout=timeout)
+    
+    # --- 修复代码开始 ---
+    # 检查 result 是否为生成器 (GeneratorType)，因为生成器无法被 pickle 序列化
+    # 同时也建议处理 map/filter 等不可 pickle 的迭代器
+    if isinstance(result, types.GeneratorType) or type(result).__name__ in ['map', 'filter', 'zip']:
+        try:
+            # 将生成器/迭代器消费完，转为 list
+            result = list(result)
+        except Exception as e:
+            # 如果在转 list 过程中发生错误（如生成器内部逻辑报错），捕捉它
+            stderr = f"{stderr}\nError consuming generator: {str(e)}".strip()
+            result = None
+
+    # 将处理后的结果放入队列
+    result_queue.put((stdout, stderr, result))
 
 
 def lcb_sandbox(code, timeout):

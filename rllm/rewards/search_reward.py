@@ -233,7 +233,7 @@ class RewardSearchFn:
     def __call__(self, input: RewardInput) -> RewardOutput:
         # Extract information from task_info and action
         model_response = input.action
-        ground_truth = input.task_info.get("ground_truth") or input.task_info.get("answer")
+        ground_truth = input.task_info.get("ground_truth") or input.task_info.get("answer") or input.task_info.get("response") or input.task_info.get("solution", "") 
 
         if ground_truth is None:
             return RewardOutput(reward=self.config.unk_error_reward, is_correct=False, metadata={"error": "No ground truth provided"})

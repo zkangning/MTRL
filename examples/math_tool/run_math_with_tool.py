@@ -49,7 +49,7 @@ if __name__ == "__main__":
 
         _, test_dataset = prepare_math_data()
 
-    tasks = test_dataset.repeat(n=8)  # repeat to evaluate pass@k
+    tasks = test_dataset.repeat(n=1)  # repeat to evaluate pass@k
 
     results = asyncio.run(engine.execute_tasks(tasks))
     compute_pass_at_k(results)
