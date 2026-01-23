@@ -203,12 +203,11 @@ class AgentExecutionEngine:
         messages = agent.chat_completions
         prompt_tokens, _ = convert_messages_to_tokens_and_masks(messages, tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=True, contains_generation_msg=True)
         prompt_token_len = len(prompt_tokens)
-        # Note, this should never happen!
+        
+        # 初始 prompt 长度检查：如果超出最大长度，进行截断
         if prompt_token_len > self.max_prompt_length:
-            # agent.reset()
-            # raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
             colorful_print(
-                f"Warning: Trajectory {idx} initial prompt length {prompt_token_len} exceeds max_prompt_length {self.max_prompt_length}. Truncating from left.", 
+                f"Warning: Trajectory {idx} initial prompt length {prompt_token_len} exceeds max_prompt_length {self.max_prompt_length}. Truncating from left.",
                 "yellow"
             )
             prompt_tokens = prompt_tokens[-self.max_prompt_length:]
@@ -218,10 +217,15 @@ class AgentExecutionEngine:
                 # 将截断后的 Token 列表重新解码回字符串
                 truncated_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
                 
-                # 强制覆盖 Agent 的内部消息历史。
-                # 必须这样做，因为接下来的循环是用 agent.chat_completions 生成 Prompt 的。
-                # 如果不覆盖，Agent 内部存的还是超长的旧文本，会导致后面再次报错。
-                agent.chat_completions = [{"role": "user", "content": truncated_text}]
+                # 尝试通过 setter 覆盖 Agent 的内部消息历史
+                # 如果 Agent 支持 chat_completions setter，则使用它
+                # 否则尝试直接设置 messages 属性
+                if hasattr(type(agent), 'chat_completions') and isinstance(getattr(type(agent), 'chat_completions'), property) and getattr(type(agent), 'chat_completions').fset is not None:
+                    agent.chat_completions = [{"role": "user", "content": truncated_text}]
+                elif hasattr(agent, 'messages'):
+                    agent.messages = [{"role": "user", "content": truncated_text}]
+                else:
+                    logger.warning(f"Trajectory {idx}: Agent does not support message override. Prompt will remain untruncated in agent state.")
                 
             except Exception as e:
                 logger.error(f"Trajectory {idx}: Failed to sync truncated prompt back to agent: {e}")
