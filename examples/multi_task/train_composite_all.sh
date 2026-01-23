@@ -23,7 +23,7 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=256 \
+    data.train_batch_size=128 \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
@@ -33,8 +33,10 @@ python3 -m examples.multi_task.train_composite \
     +data.dataset_name=math0_code0_tool1w_search0 \
     trainer.experiment_name='math0_code0_tool1w_search0-8b-mixed-tasks' \
     data.val_batch_size=512 \
-    data.max_prompt_length=6400 \
+    data.max_prompt_length=7680 \
     data.max_response_length=20480 \
+    data.truncation='left' \
+    data.filter_overlong_prompts=False \
     \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.hybrid_engine=True \
@@ -45,7 +47,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=26880 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=28160 \
     \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
@@ -84,7 +86,7 @@ python3 -m examples.multi_task.train_composite \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
-    trainer.save_freq=25 \
+    trainer.save_freq=100 \
     trainer.test_freq=25 \
     trainer.total_epochs=5 \
     \

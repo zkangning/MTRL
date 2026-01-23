@@ -16,9 +16,10 @@ if __name__ == "__main__":
 
     n_parallel_agents = 64
 
-    model_name = "Qwen/Qwen3-4B"
+    model_name = "Qwen3-8B"
+    model_path = "/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     agent_args = {"tools": ["python"], "parser_name": "qwen", "system_prompt": "You are a math assistant that can write python to solve math problems."}
     env_args = {
@@ -34,7 +35,7 @@ if __name__ == "__main__":
         env_class=ToolEnvironment,
         env_args=env_args,
         engine_name="openai",
-        rollout_engine_args={"base_url": "http://localhost:30000/v1", "api_key": "None"},
+        rollout_engine_args={"base_url": "http://localhost:8803/v1", "api_key": "None"},
         tokenizer=tokenizer,
         sampling_params=sampling_params,
         max_response_length=16384,

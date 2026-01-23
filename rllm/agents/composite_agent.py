@@ -3,7 +3,6 @@ from rllm.agents.agent import Action, BaseAgent, Trajectory
 
 # 引入四种具体的 Agent
 from rllm.agents.bfcl_agent import BFCLReadyAgent
-from rllm.agents.math_agent import MathAgent
 from rllm.agents.code_agent import CompetitionCodingAgent
 from rllm.agents.tool_agent import ToolAgent, MCPToolAgent, ToolCallAgent
 

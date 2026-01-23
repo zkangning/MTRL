@@ -214,17 +214,17 @@ class AgentExecutionEngine:
             prompt_tokens = prompt_tokens[-self.max_prompt_length:]
             prompt_token_len = len(prompt_tokens)
 
-            try:
-                # 将截断后的 Token 列表重新解码回字符串
-                truncated_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+            # try:
+            #     # 将截断后的 Token 列表重新解码回字符串
+            #     truncated_text = self.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
                 
-                # 强制覆盖 Agent 的内部消息历史。
-                # 必须这样做，因为接下来的循环是用 agent.chat_completions 生成 Prompt 的。
-                # 如果不覆盖，Agent 内部存的还是超长的旧文本，会导致后面再次报错。
-                agent.chat_completions = [{"role": "user", "content": truncated_text}]
+            #     # 强制覆盖 Agent 的内部消息历史。
+            #     # 必须这样做，因为接下来的循环是用 agent.chat_completions 生成 Prompt 的。
+            #     # 如果不覆盖，Agent 内部存的还是超长的旧文本，会导致后面再次报错。
+            #     agent.chat_completions = [{"role": "user", "content": truncated_text}]
                 
-            except Exception as e:
-                logger.error(f"Trajectory {idx}: Failed to sync truncated prompt back to agent: {e}")
+            # except Exception as e:
+            #     logger.error(f"Trajectory {idx}: Failed to sync truncated prompt back to agent: {e}")
 
         for step_idx in range(self.max_steps):
             # Get action from agent
