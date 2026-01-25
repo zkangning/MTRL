@@ -127,11 +127,14 @@ class AgentPPOTrainer(RayPPOTrainer):
 
     def _compute_multitask_metrics(self, batch: DataProto):
         """
-        计算多任务细分指标，包括“模型更新贡献度分析”。
+        [完善版] 计算多任务细分指标，包括"模型更新贡献度分析"和子数据源统计。
+        改进：
+        1. 添加子数据源级别的统计
+        2. 更完善的指标计算
         """
         stats = defaultdict(list)
         
-        # 1. 获取分组标签
+        # 1. 获取分组标签 - 主任务类型
         if "data_source" in batch.non_tensor_batch:
             task_types = batch.non_tensor_batch["data_source"]
         elif "extra_info" in batch.non_tensor_batch:
@@ -149,9 +152,26 @@ class AgentPPOTrainer(RayPPOTrainer):
         else:
             return {}
 
+        # 2. 获取子数据源标签
+        sub_sources = []
+        if "extra_info" in batch.non_tensor_batch:
+            for item in batch.non_tensor_batch["extra_info"]:
+                try:
+                    if isinstance(item, str):
+                        d = json.loads(item)
+                    else:
+                        d = item
+                    sub = d.get("sub_source") or d.get("source") or "default"
+                    sub_sources.append(str(sub))
+                except:
+                    sub_sources.append("unknown")
+            sub_sources = np.array(sub_sources)
+        else:
+            sub_sources = np.array(["default"] * len(task_types))
+
         batch_size = len(task_types)
         
-        # 2. 获取数据并转为 Numpy
+        # 3. 获取数据并转为 Numpy
         # Reward: (B,)
         token_scores = batch.batch.get("token_level_scores")
         if token_scores is not None:
@@ -181,7 +201,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         pad_token_id = self.tokenizer.pad_token_id
         step_nums = batch.non_tensor_batch.get("step_nums")
 
-        # 3. 遍历聚合
+        # 4. 遍历聚合 - 一级指标（主任务类型）
         unique_tasks = np.unique(task_types)
         metrics = {}
 
@@ -232,6 +252,41 @@ class AgentPPOTrainer(RayPPOTrainer):
             if step_nums is not None:
                 curr_steps = step_nums[indices]
                 metrics[f"train/steps/{t_type}"] = np.mean(curr_steps)
+
+            # === 二级指标：子数据源统计 ===
+            current_subs = np.unique(sub_sources[indices])
+            
+            for sub in current_subs:
+                # 跳过无意义的标签
+                if sub in ["default", "unknown"]:
+                    continue
+                
+                # 组合索引: task_type == t_type AND sub_source == sub
+                sub_indices = np.where((task_types == t_type) & (sub_sources == sub))[0]
+                
+                if len(sub_indices) == 0:
+                    continue
+                
+                sub_count = len(sub_indices)
+                
+                # Sub Count
+                metrics[f"train/count/{t_type}/{sub}"] = sub_count
+                
+                # Sub Reward
+                sub_rewards = seq_rewards[sub_indices]
+                metrics[f"train/reward/{t_type}/{sub}_mean"] = np.mean(sub_rewards)
+                
+                # Sub Advantage
+                if has_adv:
+                    sub_adv = np_adv[sub_indices]
+                    sub_mask = np_mask[sub_indices]
+                    sub_valid_advs = sub_adv[sub_mask > 0.5]
+                    if sub_valid_advs.size > 0:
+                        metrics[f"train/advantage/{t_type}/{sub}_mean"] = np.mean(sub_valid_advs)
+                    
+                    # Sub Mass
+                    sub_mass = sample_impact_mass[sub_indices].sum()
+                    metrics[f"train/mass_ratio/{t_type}/{sub}"] = sub_mass / total_batch_mass
 
         return metrics
 
@@ -685,16 +740,21 @@ class AgentPPOTrainer(RayPPOTrainer):
 
     def _validate_agent(self):
         """
-        [更新版] 验证循环，支持细粒度 (Sub-source) 测评结果展示。
+        [完善版] 验证循环，支持细粒度 (Sub-source) 测评结果展示。
+        改进：
+        1. 更完善的子数据源提取逻辑
+        2. 添加子数据源的 Pass@K 统计
+        3. 添加样本数量统计
+        4. 更详细的日志输出
         """
         rewards_lst = []
         data_source_lst = []
-        sub_source_lst = []  # [新增] 用于存储子数据源
+        sub_source_lst = []
         uid_lst = []
         
         # 长度统计
         response_lens_lst = []
-        prompt_lens_lst = [] 
+        prompt_lens_lst = []
 
         pad_token_id = self.tokenizer.pad_token_id
 
@@ -704,7 +764,7 @@ class AgentPPOTrainer(RayPPOTrainer):
             
             n_val_samples = self.config.actor_rollout_ref.rollout.val_kwargs.n
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_batch.pop(["input_ids", "attention_mask", "position_ids"]) 
+            test_batch.pop(["input_ids", "attention_mask", "position_ids"])
             
             test_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -738,17 +798,17 @@ class AgentPPOTrainer(RayPPOTrainer):
                 ds_list = ds_list.tolist()
             data_source_lst.extend(ds_list)
             
-            # 2. [新增] 获取 Sub Source (aime2024, polymath, etc.)
-            # extra_info 通常包含原始数据字典，我们在 load_data 时把 sub_source 放进去了
+            # 2. 获取 Sub Source (aime2024, polymath, etc.)
             curr_sub_sources = []
             extra_infos = test_batch.non_tensor_batch.get("extra_info", [])
             for item in extra_infos:
                 try:
                     # extra_info 可能是 dict 或 json str
                     d = json.loads(item) if isinstance(item, str) else item
+                    # 优先使用 sub_source，其次 source，最后 default
                     sub = d.get("sub_source") or d.get("source") or "default"
-                    curr_sub_sources.append(sub)
-                except:
+                    curr_sub_sources.append(str(sub))
+                except Exception as e:
                     curr_sub_sources.append("unknown")
             sub_source_lst.extend(curr_sub_sources)
 
@@ -765,27 +825,27 @@ class AgentPPOTrainer(RayPPOTrainer):
                 p_lens = (prompts != pad_token_id).sum(dim=1).cpu()
                 prompt_lens_lst.append(p_lens)
 
-        if not rewards_lst: 
+        if not rewards_lst:
             return {}
             
         # --- 数据聚合 ---
         reward_tensor = torch.cat(rewards_lst, dim=0)
         data_sources = np.array(data_source_lst)
-        sub_sources = np.array(sub_source_lst)  # 转为 numpy 以便筛选
+        sub_sources = np.array(sub_source_lst)
         uid_tensor = np.concatenate(uid_lst, axis=0)
         
         response_lens_tensor = torch.cat(response_lens_lst, dim=0) if response_lens_lst else torch.zeros_like(reward_tensor)
+        prompt_lens_tensor = torch.cat(prompt_lens_lst, dim=0) if prompt_lens_lst else torch.zeros_like(reward_tensor)
         
         metric_dict = {}
         
         # ---------------------------------------------------------
-        # 核心逻辑修改：双层循环计算指标
-        # 1. 先按一级分类 (Task Type) 聚合，如 val/test_score/math
-        # 2. 再按二级分类 (Sub Source) 聚合，如 val/test_score/math/aime2024
+        # 核心逻辑：双层循环计算指标
+        # 1. 一级分类 (Task Type): val/test_score/math
+        # 2. 二级分类 (Sub Source): val/test_score/math/aime2024
         # ---------------------------------------------------------
         
         # 辅助结构：{data_source: {sub_source: {uid: max_score}}}
-        # 用于计算 Pass@K (只要某一个 uid 下有一次成功即为成功)
         pass_tracker = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
         
         # 遍历所有样本填充数据
@@ -804,47 +864,86 @@ class AgentPPOTrainer(RayPPOTrainer):
         # ---------------------------
         unique_tasks = np.unique(data_sources)
         
+        print("\n" + "="*80)
+        print("📊 Validation Results by Data Source")
+        print("="*80)
+        
         for task in unique_tasks:
             # === A. 一级指标 (Overall Task) ===
             task_indices = np.where(data_sources == task)[0]
+            task_count = len(task_indices)
             
             # Mean Score
-            task_mean_score = reward_tensor[task_indices].numpy().mean()
+            task_rewards = reward_tensor[task_indices].numpy()
+            task_mean_score = task_rewards.mean()
+            task_std_score = task_rewards.std()
             metric_dict[f"val/test_score/{task}"] = task_mean_score
+            metric_dict[f"val/test_score/{task}_std"] = task_std_score
+            
+            # Sample Count
+            metric_dict[f"val/count/{task}"] = task_count
             
             # Length
-            task_mean_len = response_lens_tensor[task_indices].float().numpy().mean()
-            metric_dict[f"val/length/{task}"] = task_mean_len
+            task_mean_response_len = response_lens_tensor[task_indices].float().numpy().mean()
+            task_mean_prompt_len = prompt_lens_tensor[task_indices].float().numpy().mean()
+            metric_dict[f"val/length/response/{task}"] = task_mean_response_len
+            metric_dict[f"val/length/prompt/{task}"] = task_mean_prompt_len
 
             # Pass@K (Overall)
-            # 只要该 uid 在该 task 下任意一次尝试 >= 1.0 就算 pass
             task_uids = pass_tracker[task]["__total__"]
             if task_uids:
                 passes = [s >= 1.0 for s in task_uids.values()]
-                metric_dict[f"val/test_score/pass@k/{task}"] = np.mean(passes)
+                pass_rate = np.mean(passes)
+                metric_dict[f"val/test_score/pass@k/{task}"] = pass_rate
+                
+                print(f"\n📌 Task: {task}")
+                print(f"   Samples: {task_count} | Mean Score: {task_mean_score:.4f} ± {task_std_score:.4f} | Pass@{n_val_samples}: {pass_rate:.4f}")
 
             # === B. 二级指标 (Sub Source breakdown) ===
-            # 找到该 task 下所有的 sub_sources
             current_subs = np.unique(sub_sources[task_indices])
             
+            # 过滤掉无意义的标签，但保留统计
+            valid_subs = [sub for sub in current_subs if sub not in ["default", "unknown"]]
+            
+            if valid_subs:
+                print(f"   📂 Sub-sources breakdown:")
+            
             for sub in current_subs:
-                if sub == "default" or sub == "unknown": continue # 跳过无意义的标签
-                
                 # 组合索引: data_source == task AND sub_source == sub
                 sub_indices = np.where((data_sources == task) & (sub_sources == sub))[0]
                 
-                if len(sub_indices) == 0: continue
+                if len(sub_indices) == 0:
+                    continue
+                
+                sub_count = len(sub_indices)
                 
                 # Sub Mean Score
-                sub_mean_score = reward_tensor[sub_indices].numpy().mean()
+                sub_rewards = reward_tensor[sub_indices].numpy()
+                sub_mean_score = sub_rewards.mean()
+                sub_std_score = sub_rewards.std()
+                
+                # 使用更清晰的命名格式
                 metric_dict[f"val/test_score/{task}/{sub}"] = sub_mean_score
+                metric_dict[f"val/test_score/{task}/{sub}_std"] = sub_std_score
+                metric_dict[f"val/count/{task}/{sub}"] = sub_count
+                
+                # Sub Length
+                sub_mean_response_len = response_lens_tensor[sub_indices].float().numpy().mean()
+                metric_dict[f"val/length/response/{task}/{sub}"] = sub_mean_response_len
                 
                 # Sub Pass@K
-                # sub_uids = pass_tracker[task][sub]
-                # if sub_uids:
-                #     sub_passes = [s >= 1.0 for s in sub_uids.values()]
-                #     metric_dict[f"val/test_score/pass@k/{task}/{sub}"] = np.mean(sub_passes)
+                sub_uids = pass_tracker[task][sub]
+                if sub_uids:
+                    sub_passes = [s >= 1.0 for s in sub_uids.values()]
+                    sub_pass_rate = np.mean(sub_passes)
+                    metric_dict[f"val/test_score/pass@k/{task}/{sub}"] = sub_pass_rate
+                    
+                    # 只打印有意义的子数据源
+                    if sub not in ["default", "unknown"]:
+                        print(f"      • {sub:20s}: {sub_count:4d} samples | Score: {sub_mean_score:.4f} ± {sub_std_score:.4f} | Pass@{n_val_samples}: {sub_pass_rate:.4f}")
 
+        print("="*80 + "\n")
+        
         return metric_dict
 
 

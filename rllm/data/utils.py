@@ -120,11 +120,11 @@ def fetch_bfcl_tasks(base_url: str, split: str = "train") -> List[Dict[str, Any]
         for item in raw_list:
             t_id = item if isinstance(item, str) else item.get("task_id")
             if t_id:
-                raw_data = {"task_id": t_id, "task_type": "bfcl"}
+                raw_data = {"task_id": t_id, "task_type": "bfcl", "sub_source": "bfcl"}
                 task = create_standard_sample(
-                    prompt="", 
-                    response="", 
-                    task_type="bfcl", 
+                    prompt="",
+                    response="",
+                    task_type="bfcl",
                     raw_data=raw_data
                 )
                 tasks.append(task)
@@ -280,6 +280,8 @@ def load_and_tag_dataset(dataset_name: str, split: str, tag: str) -> List[Dict]:
             elif "solution" in d: response_text = d["solution"]
 
             d["task_type"] = tag
+            # 添加 sub_source 字段，使用 dataset_name 作为子数据源标识
+            d["sub_source"] = dataset_name
             
             clean_d = create_standard_sample(
                 prompt=prompt_text,
@@ -321,6 +323,7 @@ def load_search_data(split: str, sample_num: int) -> List[Dict]:
             response_text = d.get("answer", "")
             
             d["task_type"] = "search"
+            d["sub_source"] = "hotpotqa"  # 添加 sub_source 字段
             
             clean_d = create_standard_sample(
                 prompt=prompt_text,
@@ -364,9 +367,10 @@ def load_dapo_math_dataset(num_samples: int) -> List[Dict]:
             prompt_text = d.get("prompt", "")
             response_text = d.get("solution", "") # 用户指定 solution 字段
             
-            # 标记任务类型
+            # 标记任务类型和子数据源
             d["task_type"] = "math"
             d["source"] = "dapo_math_17k"
+            d["sub_source"] = "dapo_math_17k"  # 添加 sub_source 字段
             
             # 使用标准构建函数，保持逻辑一致
             clean_d = create_standard_sample(
@@ -510,6 +514,7 @@ def load_deepmath_dataset(num_samples: int) -> List[Dict]:
 
             d["task_type"] = "math"
             d["source"] = "deepmath_103k"
+            d["sub_source"] = "deepmath_103k"  # 添加 sub_source 字段
 
             clean_d = create_standard_sample(
                 prompt=prompt_text,
@@ -519,7 +524,7 @@ def load_deepmath_dataset(num_samples: int) -> List[Dict]:
             )
             processed_data.append(clean_d)
 
-        logger.info(f"Loaded {len(processed_data)} tasks from {dataset_path} (Stratified >= 6.0).")
+        logger.info(f"Loaded {len(processed_data)} tasks from {dataset_path} (Stratified >= 7.0).")
         return processed_data
 
     except Exception as e:
@@ -606,6 +611,7 @@ def load_deepmath_dataset_top_k(num_samples: int) -> List[Dict]:
             # 补充元数据
             d["task_type"] = "math"
             d["source"] = "deepmath_103k_top_k"
+            d["sub_source"] = "deepmath_103k_top_k"  # 添加 sub_source 字段
 
             clean_d = create_standard_sample(
                 prompt=prompt_text,
