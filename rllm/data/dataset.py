@@ -825,7 +825,7 @@ class DatasetRegistry:
                 chat_prompt = [{"role": "user", "content": str(raw_prompt)}]
 
             # 2. [核心修复] 构造 extra_info
-            # 我们把复杂的原始数据序列化后放入 'original_data' 字段
+            # 提取关键字段，避免被埋在 original_data 中
             safe_entry = entry.copy()
             
             # 尝试序列化原始数据，防止 schema 冲突
@@ -834,11 +834,28 @@ class DatasetRegistry:
             except Exception:
                 raw_json_str = str(safe_entry)
 
+            # 提取 sub_source 字段（优先级：sub_source > source > default）
+            # 如果 entry 中有 extra_info 字段且是 JSON 字符串，先解析它
+            sub_source_value = "default"
+            if "extra_info" in entry and isinstance(entry["extra_info"], str):
+                try:
+                    parsed_extra = json.loads(entry["extra_info"])
+                    sub_source_value = parsed_extra.get("sub_source") or parsed_extra.get("source") or "default"
+                except:
+                    pass
+            # 直接从 entry 中提取
+            if sub_source_value == "default":
+                sub_source_value = entry.get("sub_source") or entry.get("source") or "default"
+
             # 构造一个结构固定的字典，保证 PyArrow Schema 统一
             # 必须包含 'index'，因为 Verl 会读取它
+            # 【关键修改】：将 sub_source 和 task_type 作为独立字段提取出来
             extra_info_dict = {
                 "index": i,
                 "task_id": str(entry.get("task_id", "")),
+                "task_type": str(entry.get("task_type", "default")),
+                "sub_source": str(sub_source_value),  # 独立字段，方便验证时直接读取
+                "source": str(sub_source_value),      # 兼容字段
                 "original_data": raw_json_str
             }
 
@@ -850,10 +867,10 @@ class DatasetRegistry:
                     "ground_truth": {
                         "response": str(entry.get("response", "")),
                         # 将整理好的 extra_info_dict 放入
-                        "extra_info": extra_info_dict 
+                        "extra_info": extra_info_dict
                     },
                 },
-                "extra_info": extra_info_dict, # 这是一个结构固定的 Dict
+                "extra_info": extra_info_dict, # 这是一个结构固定的 Dict，包含 sub_source
                 "data_source": str(entry.get("data_source", "default")),
                 "task_type": str(entry.get("task_type", "default")),
             }
