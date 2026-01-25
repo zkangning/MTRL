@@ -16,6 +16,9 @@ from rllm.data.dataset_types import TestDataset, TrainDataset
 from rllm.data.dataset import DatasetRegistry
 from rllm.system_prompts import LCB_FORMATTING_MESSAGE_WITH_STARTER_CODE, LCB_FORMATTING_WITHOUT_STARTER_CODE, LCB_SYSTEM_MESSAGE_GENERIC
 
+
+random.seed(42)
+
 def create_standard_sample(prompt: str, response: str, task_type: str, raw_data: Dict) -> Dict[str, str]:
     """
     强制统一数据格式，防止 PyArrow Schema 报错。
@@ -167,30 +170,30 @@ def load_comprehensive_math_test() -> List[Dict]:
 
     # 2. 加载并筛选 AMO-Bench
     # ---------------------------------------------------------
-    amo_path = "meituan-longcat/AMO-Bench"
-    allowed_types = {"number", "set", "variable"} 
-    try:
-        logger.info(f"Fetching {amo_path}...")
-        try:
-            ds_dict = load_dataset(amo_path)
-            ds_amo = ds_dict.get('train') or ds_dict.get('test') if hasattr(ds_dict, 'keys') else ds_dict
-        except Exception:
-            ds_amo = load_dataset(amo_path, split="train")
+    # amo_path = "meituan-longcat/AMO-Bench"
+    # allowed_types = {"number", "set", "variable"} 
+    # try:
+    #     logger.info(f"Fetching {amo_path}...")
+    #     try:
+    #         ds_dict = load_dataset(amo_path)
+    #         ds_amo = ds_dict.get('train') or ds_dict.get('test') if hasattr(ds_dict, 'keys') else ds_dict
+    #     except Exception:
+    #         ds_amo = load_dataset(amo_path, split="train")
 
-        for item in ds_amo:
-            d = dict(item)
-            if str(d.get("answer_type", "")).lower().strip() not in allowed_types: continue
+    #     for item in ds_amo:
+    #         d = dict(item)
+    #         if str(d.get("answer_type", "")).lower().strip() not in allowed_types: continue
             
-            prompt_text = d.get("prompt", "")
-            response_text = str(d.get("answer", "") or "")
-            if not response_text: continue
+    #         prompt_text = d.get("prompt", "")
+    #         response_text = str(d.get("answer", "") or "")
+    #         if not response_text: continue
 
-            d["answer"] = response_text
-            d["sub_source"] = "amo_bench"
-            d["task_type"] = "math"
-            combined_samples.append(create_standard_sample(prompt_text, response_text, "math", d))
-    except Exception as e:
-        logger.error(f"Failed to load {amo_path}: {e}")
+    #         d["answer"] = response_text
+    #         d["sub_source"] = "amo_bench"
+    #         d["task_type"] = "math"
+    #         combined_samples.append(create_standard_sample(prompt_text, response_text, "math", d))
+    # except Exception as e:
+    #     logger.error(f"Failed to load {amo_path}: {e}")
 
     # 3. 加载 Qwen/PolyMath
     # ---------------------------------------------------------
@@ -517,6 +520,102 @@ def load_deepmath_dataset(num_samples: int) -> List[Dict]:
             processed_data.append(clean_d)
 
         logger.info(f"Loaded {len(processed_data)} tasks from {dataset_path} (Stratified >= 6.0).")
+        return processed_data
+
+    except Exception as e:
+        logger.error(f"Failed to load {dataset_path}: {e}", exc_info=True)
+        return []
+
+def load_deepmath_dataset_top_k(num_samples: int) -> List[Dict]:
+    """
+    加载 zwhe99/DeepMath-103K 数据集，并筛选难度最高的 num_samples 个样本。
+    逻辑：
+    1. 解析所有数据的难度。
+    2. 按难度从大到小排序。
+    3. 截取前 num_samples 个。
+    4. 标准化输出并随机打乱。
+    """
+    dataset_path = "zwhe99/DeepMath-103K"
+    logger.info(f"Loading Top-{num_samples} DeepMath Data from HuggingFace: {dataset_path}...")
+
+    # 辅助函数：解析难度
+    def parse_difficulty(val):
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return None
+
+    try:
+        ds = load_dataset(dataset_path, split="train")
+        raw_list = list(ds)
+        total_raw = len(raw_list)
+
+        # -------------------------------------------------------
+        # 1. 原始分布统计 (保留日志观察)
+        # -------------------------------------------------------
+        diff_counter = Counter()
+        items_with_diff = []
+
+        for it in raw_list:
+            v = parse_difficulty(it.get("difficulty"))
+            if v is not None:
+                diff_counter[v] += 1
+                items_with_diff.append((v, it)) # 存储 (难度, 数据内容) 元组
+            else:
+                diff_counter["UNPARSED"] += 1
+
+        logger.info("DeepMath RAW difficulty distribution:")
+        numeric_keys = sorted([k for k in diff_counter.keys() if isinstance(k, (int, float))], reverse=True)
+        for k in numeric_keys:
+            c = diff_counter[k]
+            ratio = (c / total_raw) if total_raw > 0 else 0.0
+            logger.info(f"  difficulty={k}: {c} ({ratio:.2%})")
+
+        # -------------------------------------------------------
+        # 2. 核心逻辑：按难度从高到低排序并取 Top-K
+        # -------------------------------------------------------
+        # 按难度降序排序
+        items_with_diff.sort(key=lambda x: x[0], reverse=True)
+        
+        # 截取前 num_samples 个
+        selected_pairs = items_with_diff[:num_samples]
+        actual_count = len(selected_pairs)
+        
+        if actual_count > 0:
+            min_diff_in_top = selected_pairs[-1][0]
+            max_diff_in_top = selected_pairs[0][0]
+            logger.info(f"Selected top {actual_count} samples. Difficulty range: [{min_diff_in_top} - {max_diff_in_top}]")
+        else:
+            logger.warning("No valid samples with difficulty found.")
+            return []
+
+        # -------------------------------------------------------
+        # 3. 标准化处理
+        # -------------------------------------------------------
+        selected_raw_list = [pair[1] for pair in selected_pairs]
+        
+        # 重点：虽然选的是最高的，但在返回前要打乱，避免模型在训练时按难度顺序学习导致梯度不稳定
+        random.shuffle(selected_raw_list)
+
+        processed_data = []
+        for item in selected_raw_list:
+            d = dict(item)
+            prompt_text = d.get("question", "")
+            response_text = d.get("final_answer", "")
+
+            # 补充元数据
+            d["task_type"] = "math"
+            d["source"] = "deepmath_103k_top_k"
+
+            clean_d = create_standard_sample(
+                prompt=prompt_text,
+                response=response_text,
+                task_type="math",
+                raw_data=d
+            )
+            processed_data.append(clean_d)
+
+        logger.info(f"Successfully loaded {len(processed_data)} highest difficulty samples.")
         return processed_data
 
     except Exception as e:

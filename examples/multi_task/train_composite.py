@@ -25,6 +25,7 @@ from rllm.data.utils import (
     load_and_tag_dataset, 
     load_dapo_math_dataset, 
     load_deepmath_dataset, 
+    load_deepmath_dataset_top_k,
     load_search_data,
     load_tool_call_dataset,
     load_tool_call_json_dataset
@@ -43,7 +44,6 @@ except ImportError:
 
 random.seed(42)
 logger = logging.getLogger(__name__)
-
 
 
 # --- 数据准备主逻辑 (支持 4 种任务) ---
@@ -67,7 +67,8 @@ def prepare_composite_dataset(
     if math_num > 0:
         # 假设 deepscaler_math 已在 Registry 中，或者按需替换为 load_dataset
         # math_train = load_dapo_math_dataset(math_num)
-        math_train = load_deepmath_dataset(math_num)
+        # math_train = load_deepmath_dataset(math_num)
+        math_train = load_deepmath_dataset_top_k(math_num) # 直接取难度最高的math_num个数据
         math_test = load_comprehensive_math_test()
     else:
         math_train, math_test = [], []
