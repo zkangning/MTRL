@@ -6,6 +6,7 @@ import os
 import json
 import sys
 from typing import List, Dict, Any
+import numpy as np
 
 # HF Dataset
 from datasets import load_dataset
@@ -19,12 +20,12 @@ from rllm.agents.composite_agent import CompositeAgent
 from rllm.environments.composite.composite_env import CompositeEnvironment
 
 from rllm.data.utils import (
-    create_standard_sample, 
-    fetch_bfcl_tasks, 
-    load_comprehensive_math_test, 
-    load_and_tag_dataset, 
-    load_dapo_math_dataset, 
-    load_deepmath_dataset, 
+    create_standard_sample,
+    fetch_bfcl_tasks,
+    load_comprehensive_math_test,
+    load_and_tag_dataset,
+    load_dapo_math_dataset,
+    load_deepmath_dataset,
     load_deepmath_dataset_top_k,
     load_search_data,
     load_tool_call_dataset,
@@ -42,22 +43,74 @@ try:
 except ImportError:
     MCPConnectionManager = None
 
-random.seed(42)
+
+# ============================================================
+# 全局随机种子设置 - 确保训练和测试数据的完全可重复性
+# ============================================================
+GLOBAL_SEED = 42
+
+def set_all_random_seeds(seed: int = GLOBAL_SEED):
+    """
+    设置所有相关库的随机种子，确保可重复性。
+    包括：Python random, NumPy, PyTorch, HuggingFace datasets
+    """
+    # Python 内置 random
+    random.seed(seed)
+    
+    # NumPy
+    np.random.seed(seed)
+    
+    # PyTorch (延迟导入，避免不必要的依赖)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # 多GPU情况
+        # 确保 CUDA 操作的确定性
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
+    
+    # 设置 Python 哈希种子
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+# 在模块加载时立即设置种子
+set_all_random_seeds(GLOBAL_SEED)
+
 logger = logging.getLogger(__name__)
 
 
+import hashlib
+
 # --- 数据准备主逻辑 (支持 4 种任务) ---
+def compute_dataset_hash(dataset: List[Dict]) -> str:
+    """
+    计算数据集的哈希值，用于验证数据集的一致性。
+    
+    Args:
+        dataset: 数据集列表
+        
+    Returns:
+        数据集的 SHA256 哈希值
+    """
+    # 将数据集序列化为 JSON 字符串（排序键以确保一致性）
+    content = json.dumps(dataset, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+
 def prepare_composite_dataset(
-    bfcl_url: str, 
-    dataset_name: str, 
-    math_num: int, 
-    code_num: int, 
+    bfcl_url: str,
+    dataset_name: str,
+    math_num: int,
+    code_num: int,
     bfcl_num: int,
     search_num: int,
-    tool_call_num: int,        
+    tool_call_num: int,
     tool_call_data_path: str
 ):
     logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search)...")
+    logger.info(f">>> Using Random Seed: {GLOBAL_SEED}")
     
     # 1. BFCL
     bfcl_train = fetch_bfcl_tasks(bfcl_url, "train") if bfcl_num > 0 else []

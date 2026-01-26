@@ -17,7 +17,13 @@ from rllm.data.dataset import DatasetRegistry
 from rllm.system_prompts import LCB_FORMATTING_MESSAGE_WITH_STARTER_CODE, LCB_FORMATTING_WITHOUT_STARTER_CODE, LCB_SYSTEM_MESSAGE_GENERIC
 
 
-random.seed(42)
+# 设置全局随机种子，确保数据加载的可重复性
+GLOBAL_SEED = 42
+random.seed(GLOBAL_SEED)
+np.random.seed(GLOBAL_SEED)
+os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
+
+# 注意：torch 的种子设置在 train_composite.py 中完成，因为这里不一定导入 torch
 
 def create_standard_sample(prompt: str, response: str, task_type: str, raw_data: Dict) -> Dict[str, str]:
     """

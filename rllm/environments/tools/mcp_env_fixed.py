@@ -20,7 +20,6 @@ from rllm.tools.mcp_tool import MCPTool
 logger = logging.getLogger(__name__)
 
 # --- 全局单例管理 (适配 Ray/Multiprocessing) ---
-# 每个系统进程(OS Process)只维护一个 Manager，避免启动成百上千个 Node 进程
 _PROCESS_GLOBAL_MANAGER = {}
 _PROCESS_LOCK = threading.Lock()
 
@@ -113,33 +112,26 @@ class SplitToolCache:
         # 1. 针对搜索引擎的过滤逻辑
         if tool_name == "search_engine":
             try:
-                # 尝试解析 JSON
                 data = json.loads(result)
                 
-                # 如果不是字典，可能发生了错误，不缓存
                 if not isinstance(data, dict):
                     return False
 
-                # 检查 organic 字段
                 if "organic" in data:
                     organic_results = data["organic"]
-                    # 如果 organic 存在但为空列表，视为无效结果，不缓存
                     if isinstance(organic_results, list) and len(organic_results) == 0:
                         logger.info(f"[Cache] Skipping empty search result (organic=[])")
                         return False
                 
-                # 如果返回的是空的 JSON 对象 {}，也不缓存
                 if not data:
                     return False
                     
             except json.JSONDecodeError:
-                # 如果无法解析为 JSON，可能是纯文本报错信息（如 "Error:..."），建议不缓存以便重试
                 logger.warning(f"[Cache] Search result is not valid JSON, skipping cache.")
                 return False
 
-        # 2. 针对爬虫的过滤逻辑 (可选优化)
+        # 2. 针对爬虫的过滤逻辑
         elif tool_name == "scrape_as_markdown":
-            # 如果结果太短或包含特定错误关键词，视为失败
             if len(result.strip()) < 5 or result.strip().startswith("Error:"):
                 return False
 
@@ -153,7 +145,6 @@ class SplitToolCache:
                 if keyword in result:
                     logger.info(f"[Cache] Scrape result contains error keyword '{keyword}', skipping cache.")
                     return False
-
                     
         return True
 
@@ -171,7 +162,6 @@ class SplitToolCache:
 
     def _get_category_and_key(self, tool_name: str, args: Dict[str, Any]) -> Tuple[str, str]:
         if tool_name == "search_engine":
-            # 简化 Key 生成，忽略一些无关参数
             query = args.get("query", "")
             return "search", query
         elif tool_name == "scrape_as_markdown":
@@ -196,7 +186,6 @@ class SplitToolCache:
             if key not in self.data[category]:
                 self.data[category][key] = result
                 
-        # 只有在确实写入了新数据且有效时才保存
         self._save_category(category)
 
 
@@ -206,11 +195,16 @@ class MCPConnectionManager:
     1. 运行在一个独立的 Daemon Thread 中。
     2. 维护一个 asyncio loop 处理与 Node.js MCP Server 的通信。
     3. 支持真正的并发 (Batch) 工具调用。
+    
+    【修复版本】：
+    - 追踪所有异步任务，优雅关闭
+    - 增加并发限制，防止资源耗尽
+    - 改进错误恢复机制
     """
     def __init__(
-        self,
-        mcp_server_command: str,
-        mcp_server_args: list[str] | None,
+        self, 
+        mcp_server_command: str, 
+        mcp_server_args: list[str] | None, 
         mcp_server_env: dict[str, str] | None,
         cache_dir: str | None,
         allowed_tools: list[str] | None
@@ -233,12 +227,14 @@ class MCPConnectionManager:
         self.worker_thread = None
         self.tool_map = {}
         
-        # 内部超时时间 (秒)。这必须小于 AgentExecutionEngine 的 trajectory_timeout
-        # 如果 Bright Data 120秒都没返回，我们就当做失败，让 LLM 重试或换个 Query
-        self.INTERNAL_TOOL_TIMEOUT = 120.0  # 修复1: 增加超时时间，适应 Bright Data 响应速度
+        # 【修复1】：增加工具超时时间，适应 Bright Data 的响应速度
+        self.INTERNAL_TOOL_TIMEOUT = 120.0  # 从 60 秒增加到 120 秒
         
-        # 修复6: 追踪异步任务，用于优雅关闭（恢复并发能力）
+        # 【修复2】：追踪异步任务，用于优雅关闭
         self.pending_tasks = set()
+        
+        # 【修复3】：限制并发工具调用数量，防止资源耗尽
+        self.max_concurrent_calls = 10
 
     def start(self):
         if self.running: return
@@ -246,11 +242,11 @@ class MCPConnectionManager:
         self.worker_thread = threading.Thread(target=self._run_worker, daemon=True)
         self.worker_thread.start()
 
-        # 同步等待初始化完成，确保工具列表已加载
+        # 同步等待初始化完成
         resp_q = queue.Queue()
         self.request_queue.put(("init", None, resp_q))
         try:
-            status, payload = resp_q.get(timeout=45) # 初始化给较长时间
+            status, payload = resp_q.get(timeout=45)
             if status == "error":
                 self.stop()
                 raise RuntimeError(f"MCP Init failed: {payload}")
@@ -260,42 +256,50 @@ class MCPConnectionManager:
             raise RuntimeError("MCP Init timed out. Node.js process failed to respond.")
 
     def stop(self):
+        """【修复4】：优雅关闭，等待任务完成"""
+        logger.info("[MCP] Stopping Manager...")
         self.running = False
         self.request_queue.put(("stop", None, None))
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=2)
+            self.worker_thread.join(timeout=5)  # 增加等待时间
 
     def execute_tool_calls(self, tool_calls: list[dict[str, Any]]) -> dict[str, str]:
-        """主线程调用此方法，阻塞等待后台线程的结果"""
-        # 检查 Worker Thread 是否存活，如果死亡则尝试重启
-        if not self.running or not self.worker_thread.is_alive():
-            logger.warning(f"[MCP] Worker thread is dead (PID={os.getpid()}). Attempting restart...")
-            self.running = False
-            
-            # 清理旧线程
-            try:
+        """【修复5】：增强健康检查和错误恢复"""
+        # 增强的健康检查
+        max_retries = 3
+        for retry in range(max_retries):
+            if not self.running or not self.worker_thread or not self.worker_thread.is_alive():
+                logger.warning(f"[MCP] Worker unhealthy (retry {retry+1}/{max_retries}), restarting...")
+                
+                # 清理
+                self.running = False
                 if self.worker_thread:
-                    self.worker_thread.join(timeout=1)
-            except Exception as e:
-                logger.debug(f"[MCP] Error joining old thread: {e}")
-            
-            # 重新启动
-            try:
-                self.start()
-                logger.info(f"[MCP] Successfully restarted Manager for PID={os.getpid()}")
-            except Exception as e:
-                logger.error(f"[MCP] Failed to restart Manager: {e}")
-                return {tc['id']: f"Error: MCP Manager restart failed: {e}" for tc in tool_calls}
+                    try:
+                        self.worker_thread.join(timeout=2)
+                    except:
+                        pass
+                
+                # 重启
+                try:
+                    self.start()
+                    logger.info(f"[MCP] Restart successful")
+                    break
+                except Exception as e:
+                    logger.error(f"[MCP] Restart failed: {e}")
+                    if retry == max_retries - 1:
+                        return {tc['id']: f"Error: MCP Manager restart failed after {max_retries} attempts" for tc in tool_calls}
+                    time.sleep(1)
+                    continue
+            else:
+                break
 
         resp_q = queue.Queue()
         self.request_queue.put(("execute", tool_calls, resp_q))
         
         try:
-            # 等待时间 = 内部超时 + 缓冲。如果这里触发 Empty，说明 Worker 彻底死锁了。
             status, payload = resp_q.get(timeout=self.INTERNAL_TOOL_TIMEOUT + 10)
             
             if status == "error":
-                # 返回错误信息给 LLM，而不是抛出异常导致程序崩溃
                 logger.error(f"MCP Execution Error (caught): {payload}")
                 return {tc['id']: f"Error executing tool: {payload}" for tc in tool_calls}
             
@@ -303,8 +307,8 @@ class MCPConnectionManager:
             
         except queue.Empty:
             logger.error("MCP Execution CRITICAL TIMEOUT (Queue Empty). Worker likely hung.")
-            # 修复2: 不立即关闭 Manager，避免连锁崩溃
-            # self.running = False  # 注释掉这行，让 Worker 继续运行
+            # 【修复6】：不立即关闭 Manager，而是返回错误让上层处理
+            # 避免一个超时导致整个 Manager 崩溃
             return {tc['id']: "Error: Tool execution timed out internally (System limit)." for tc in tool_calls}
 
     def _run_worker(self):
@@ -315,19 +319,20 @@ class MCPConnectionManager:
         try:
             loop.run_until_complete(self._async_main_loop())
         except Exception as e:
-            logger.error(f"MCP Worker Crashed: {e}")
+            logger.error(f"MCP Worker Crashed: {e}", exc_info=True)
         finally:
             try:
+                # 取消所有待处理任务
                 tasks = asyncio.all_tasks(loop)
-                for t in tasks: t.cancel()
+                for t in tasks: 
+                    t.cancel()
                 loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.close()
             except Exception:
                 pass
 
     async def _async_main_loop(self):
-        """异步主循环"""
-        # 1. 建立 MCP 连接
+        """【修复7】：异步主循环 - 追踪任务并优雅关闭"""
         server_params = StdioServerParameters(
             command=self.mcp_server_command,
             args=self.mcp_server_args,
@@ -346,7 +351,6 @@ class MCPConnectionManager:
                 self._build_tool_map(session, tool_list)
                 
             except Exception as e:
-                # 初始化失败，通知等待的线程
                 logger.error(f"[MCP] Failed to initialize session: {e}")
                 try:
                     cmd, _, q = self.request_queue.get_nowait()
@@ -355,10 +359,12 @@ class MCPConnectionManager:
                     pass
                 return
 
-            # 2. 循环处理请求
+            # 创建信号量限制并发
+            semaphore = asyncio.Semaphore(self.max_concurrent_calls)
+
+            # 主循环
             while self.running:
                 try:
-                    # 使用轮询方式获取 Queue，配合 sleep 让出 CPU
                     try:
                         cmd, data, resp_q = self.request_queue.get(timeout=0.05)
                     except queue.Empty:
@@ -373,24 +379,25 @@ class MCPConnectionManager:
                         break
                     
                     elif cmd == "execute":
-                        # 修复7: 恢复并发能力，但追踪任务避免崩溃
-                        task = asyncio.create_task(self._handle_execution(data, resp_q))
+                        # 【修复8】：创建任务并追踪
+                        task = asyncio.create_task(
+                            self._handle_execution_with_semaphore(data, resp_q, semaphore)
+                        )
                         self.pending_tasks.add(task)
-                        # 任务完成后自动从集合中移除
+                        # 清理已完成的任务
                         task.add_done_callback(self.pending_tasks.discard)
                 
                 except Exception as e:
-                    # 捕获异常但不退出循环，避免 Session 被意外关闭
                     logger.error(f"[MCP] Error in main loop (continuing): {e}", exc_info=True)
                     await asyncio.sleep(0.1)
             
-            # 修复8: 优雅关闭 - 等待所有待处理任务完成
+            # 【修复9】：优雅关闭 - 等待所有待处理任务完成
             if self.pending_tasks:
                 logger.info(f"[MCP] Waiting for {len(self.pending_tasks)} pending tasks to complete...")
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(*self.pending_tasks, return_exceptions=True),
-                        timeout=5.0  # 最多等待 5 秒
+                        timeout=5.0
                     )
                     logger.info("[MCP] All pending tasks completed")
                 except asyncio.TimeoutError:
@@ -413,21 +420,24 @@ class MCPConnectionManager:
                 self.tool_map[tool.name] = t
                 self.tool_map[name_norm] = t
 
+    async def _handle_execution_with_semaphore(self, tool_calls, resp_q, semaphore):
+        """【修复10】：带信号量的执行处理，限制并发"""
+        async with semaphore:
+            await self._handle_execution(tool_calls, resp_q)
+
     async def _handle_execution(self, tool_calls, resp_q):
         """执行单个 Step 的所有工具调用，包含超时保护"""
         try:
-            # 这里的 wait_for 是防止 Node.js 卡死
             result = await asyncio.wait_for(
-                self._execute_batch(tool_calls),
+                self._execute_batch(tool_calls), 
                 timeout=self.INTERNAL_TOOL_TIMEOUT
             )
             if resp_q: resp_q.put(("success", result))
         except asyncio.TimeoutError:
-            # 修复4: 更新错误消息，反映实际超时时间
-            logger.warning(f"[MCP] Tool execution timeout after {self.INTERNAL_TOOL_TIMEOUT}s, but Session remains open")
+            logger.warning(f"[MCP] Tool execution timeout after {self.INTERNAL_TOOL_TIMEOUT}s")
             if resp_q: resp_q.put(("error", f"Timeout waiting for tool response ({self.INTERNAL_TOOL_TIMEOUT}s limit)"))
         except Exception as e:
-            logger.error(f"[MCP] Tool execution error: {e}")
+            logger.error(f"[MCP] Tool execution error: {e}", exc_info=True)
             if resp_q: resp_q.put(("error", str(e)))
 
     async def _execute_batch(self, tool_calls):
@@ -436,7 +446,6 @@ class MCPConnectionManager:
         for tc in tool_calls:
             tasks.append(self._process_single_tool(tc))
         
-        # return_exceptions=True 确保一个工具失败不会导致整个 Batch 崩溃
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         output = {}
@@ -453,11 +462,10 @@ class MCPConnectionManager:
         raw_args = tool_call["function"]["arguments"]
         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         
-        # 处理 Batch 工具的内部逻辑
+        # 处理 Batch 工具
         if name == "search_engine_batch":
             queries = args.get("queries", [])
             if not queries: return "[]"
-            # 内部再次并发
             sub_tasks = [self._call_tool_impl("search_engine", q) for q in queries]
             res = await asyncio.gather(*sub_tasks, return_exceptions=True)
             return json.dumps([str(r) if isinstance(r, Exception) else json.loads(r) if isinstance(r, str) and (r.startswith('{') or r.startswith('[')) else r for r in res])
@@ -483,7 +491,6 @@ class MCPConnectionManager:
             return f"Error: Tool {name} not found or not allowed."
             
         tool = self.tool_map[name]
-        # MCPTool.async_forward 是异步的
         res_obj = await tool.async_forward(**args)
         res_str = res_obj.to_string()
         
@@ -511,8 +518,7 @@ class MCPEnvironment(BaseEnv):
         self.task = task
         self.reward_fn = reward_fn or zero_reward
         
-        # [关键修改] 使用进程级 Factory 获取单例 Manager
-        # 这避免了在同一个进程内重复启动 MCP Server (Node.js)
+        # 使用进程级 Factory 获取单例 Manager
         self.manager = None
         if mcp_server_command:
             try:
@@ -563,14 +569,12 @@ class MCPEnvironment(BaseEnv):
         # 2. 执行工具
         tool_outputs = {}
         if self.manager and isinstance(action, list):
-            # 过滤掉 finish
             real_calls = [tc for tc in action if tc.get("function", {}).get("name") != "finish"]
             if real_calls:
                 try:
                     tool_outputs = self.manager.execute_tool_calls(real_calls)
                 except Exception as e:
-                    # 捕获所有未预料到的异常，防止 Crash
-                    logger.error(f"Env Step Unexpected Error: {e}")
+                    logger.error(f"Env Step Unexpected Error: {e}", exc_info=True)
                     tool_outputs = {tc['id']: f"System Error: {str(e)}" for tc in real_calls}
 
         # 3. 构造 Observation
@@ -578,8 +582,7 @@ class MCPEnvironment(BaseEnv):
         return next_obs, 0.0, done, {"response": action, "metadata": {}}
 
     def close(self):
-        # 不再关闭 self.manager，因为它是进程级共享的
-        # 清理由 atexit 负责
+        # 不关闭 Manager，因为它是进程级共享的
         pass
 
     @staticmethod
@@ -594,9 +597,3 @@ class MCPEnvironment(BaseEnv):
             cache_dir=env_args.pop("cache_dir", "./mcp_cache"),
             allowed_tools=env_args.pop("allowed_tools", None)
         )
-
-
-
-
-
-
