@@ -8,6 +8,7 @@ from rllm.tools.web_tools import (
     TavilyExtractTool,
     TavilySearchTool,
 )
+from rllm.tools.local_retrieval_tool import LocalRetrievalTool
 
 # Define default tools dict
 DEFAULT_TOOLS = {
@@ -16,6 +17,7 @@ DEFAULT_TOOLS = {
     "firecrawl": FirecrawlTool,
     "tavily-extract": TavilyExtractTool,
     "tavily-search": TavilySearchTool,
+    "local_search": LocalRetrievalTool,
 }
 
 # Create the singleton registry instance and register all default tools

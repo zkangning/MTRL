@@ -30,8 +30,8 @@ from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT,
 # 引入数据加载函数
 from rllm.data.utils import load_local_search_data
 
-# 引入 LocalRetrievalTool
-from examples.search.local_retrieval_tool import LocalRetrievalTool
+# 引入 LocalRetrievalTool (从 rllm.tools 导入)
+from rllm.tools import LocalRetrievalTool
 
 # [新增] 引入 MCP 组件 (用于 Search/Browsing)
 try:

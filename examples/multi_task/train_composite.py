@@ -249,8 +249,8 @@ def main(config):
     if local_search_num > 0:
         logger.info(f"Initializing Local Search Tool (Server: {retrieval_server_url})...")
         try:
-            # 动态导入 LocalRetrievalTool
-            from examples.search.local_retrieval_tool import LocalRetrievalTool
+            # 从 rllm.tools 导入 LocalRetrievalTool
+            from rllm.tools import LocalRetrievalTool
             local_search_tool_map = {"local_search": LocalRetrievalTool}
             logger.info("✅ Local Search Tool initialized successfully.")
         except ImportError as e:
