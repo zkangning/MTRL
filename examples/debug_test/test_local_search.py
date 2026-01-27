@@ -44,6 +44,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+def convert_to_serializable(obj):
+    """
+    将 numpy 类型转换为 Python 原生类型，以便 JSON 序列化
+    """
+    import numpy as np
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    return obj
+
+
 def save_detailed_trajectories(results, output_path: str = "local_search_trajectories.json"):
     """
     保存详细轨迹用于分析
@@ -69,7 +87,7 @@ def save_detailed_trajectories(results, output_path: str = "local_search_traject
         
         record = {
             "uid": traj.uid,
-            "reward": traj.reward,
+            "reward": convert_to_serializable(traj.reward),  # 转换 numpy 类型
             "task_type": task_data.get("task_type", "unknown"),
             "question": question,
             "ground_truth_expected": str(ground_truth),
@@ -80,7 +98,7 @@ def save_detailed_trajectories(results, output_path: str = "local_search_traject
     try:
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(export_data, f, indent=4, ensure_ascii=False)
+            json.dump(export_data, f, indent=4, ensure_ascii=False, default=convert_to_serializable)
         print(f"\n[Saved] Detailed debug file is at: {os.path.abspath(output_path)}")
     except Exception as e:
         logger.error(f"Failed to save trajectories: {e}")
