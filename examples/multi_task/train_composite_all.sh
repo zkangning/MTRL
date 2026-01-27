@@ -12,10 +12,14 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # 防止 BFCL Server 响应慢导致 vLLM 推理超时
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=3600
 export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
-
-# Local Search 配置 - 设置本地检索服务器地址
-# 请确保在运行训练前启动检索服务器: bash examples/search/retrieval/launch_server.sh ./search_data/prebuilt_indices 8000
-export RETRIEVAL_SERVER_URL="http://127.0.0.1:8000"
+export RETRIEVAL_SERVER_URL="http://<REMOTE_IP>:8000"
+# Local Search 配置 - 设置检索服务器地址
+# 如果检索服务在本地: export RETRIEVAL_SERVER_URL="http://127.0.0.1:8000"
+# 如果检索服务在远程服务器: export RETRIEVAL_SERVER_URL="http://<REMOTE_IP>:8000"
+# 请确保在运行训练前启动检索服务器:
+#   本地: bash examples/search/retrieval/launch_server.sh ./search_data/prebuilt_indices 8000
+#   远程: python examples/search/retrieval/server.py --data_dir ./search_data/prebuilt_indices --port 8000 --host 0.0.0.0 --device cuda
+# export RETRIEVAL_SERVER_URL="${RETRIEVAL_SERVER_URL:-http://127.0.0.1:8000}"
 
 # 获取 RLLM 路径
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
