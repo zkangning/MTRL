@@ -34,6 +34,6 @@ done
 
 # Start server
 echo "Launching dense-only server..."
-python retrieval/server.py --data_dir "$DATA_DIR" --port "$PORT" --host 0.0.0.0
+python examples/search/retrieval/server.py --data_dir "$DATA_DIR" --port "$PORT" --host 0.0.0.0
 
 echo "Server stopped." 
