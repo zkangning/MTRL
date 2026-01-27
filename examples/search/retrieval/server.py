@@ -49,7 +49,12 @@ class LocalRetriever:
         query_vector = self.encoder.encode([f"query: {query}"]).astype("float32")
         scores, indices = self.dense_index.search(query_vector, k)
 
-        return [{"content": self.corpus[idx], "score": float(score)} for score, idx in zip(scores[0], indices[0], strict=False) if idx < len(self.corpus)]
+        results = []
+        for score, idx in zip(scores[0], indices[0], strict=False):
+            # FAISS returns -1 for invalid indices (not enough results)
+            if idx >= 0 and idx < len(self.corpus):
+                results.append({"content": self.corpus[idx], "score": float(score)})
+        return results
 
 
 # Flask app
@@ -81,7 +86,11 @@ def retrieve():
         return jsonify({"query": query, "method": "dense", "results": formatted_results, "num_results": len(formatted_results)})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[ERROR] Retrieve failed: {error_msg}")
+        print(traceback.format_exc())
+        return jsonify({"error": error_msg}), 500
 
 
 def main():

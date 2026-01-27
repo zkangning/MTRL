@@ -31,12 +31,12 @@ python3 -m examples.multi_task.train_composite \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
-    +data.search_num=12800 \
+    +data.search_num=0 \
     +data.tool_call_num=0 \
-    +data.local_search_num=0 \
+    +data.local_search_num=12800 \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data' \
-    +data.dataset_name=math0_code0_tool0_search1w \
-    trainer.experiment_name='math0_code0_tool0_search1w-8b-mixed-tasks' \
+    +data.dataset_name=m1_27_math0_code0_tool0_search0_localsearch1w \
+    trainer.experiment_name='m1_27_math0_code0_tool0_search0_localsearch1w-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=20480 \
@@ -71,16 +71,16 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.75 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
-    actor_rollout_ref.rollout.repetition_penalty=1.05 \
+    +actor_rollout_ref.rollout.repetition_penalty=1.05 \
     \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     \
     algorithm.kl_ctrl.kl_coef=0.000 \
