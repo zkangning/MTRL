@@ -234,8 +234,8 @@ class MCPConnectionManager:
         self.tool_map = {}
         
         # 内部超时时间 (秒)。这必须小于 AgentExecutionEngine 的 trajectory_timeout
-        # 如果 Bright Data 120秒都没返回，我们就当做失败，让 LLM 重试或换个 Query
-        self.INTERNAL_TOOL_TIMEOUT = 120.0  # 修复1: 增加超时时间，适应 Bright Data 响应速度
+        # 如果 Bright Data 秒都没返回，我们就当做失败，让 LLM 重试或换个 Query
+        self.INTERNAL_TOOL_TIMEOUT = 120.0  # 120修复1: 增加超时时间，适应 Bright Data 响应速度
         
         # 修复6: 追踪异步任务，用于优雅关闭（恢复并发能力）
         self.pending_tasks = set()

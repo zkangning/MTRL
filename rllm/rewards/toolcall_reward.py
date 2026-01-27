@@ -82,7 +82,22 @@ class ToolCallRewardFn:
         is_match = self.compare_parsed_content(gt_tools, pred_tools)
 
         if is_match:
-            return RewardOutput(reward=1.0, is_correct=True)
+            # 5. 长度惩罚：使用对数函数平滑惩罚过长输出
+            # 参考：DeepSeek-R1、OpenAI 等工作中常用的长度正则化方法
+            import math
+            base_reward = 1.0
+            if model_response:
+                resp_len = len(model_response)
+                # 基准长度：低于此长度不惩罚
+                baseline_len = 1024
+                if resp_len > baseline_len:
+                    # 对数惩罚：log(len/baseline) * coefficient
+                    # 系数 0.15 表示长度翻倍时扣约 0.1 分
+                    penalty = 0.15 * math.log(resp_len / baseline_len)
+                    # 最多扣 0.3 分
+                    penalty = min(0.3, penalty)
+                    base_reward -= penalty
+            return RewardOutput(reward=base_reward, is_correct=True)
         else:
             return RewardOutput(reward=0.0, is_correct=False)
 

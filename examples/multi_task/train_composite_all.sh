@@ -71,6 +71,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.repetition_penalty=1.05 \
     \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
