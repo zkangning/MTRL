@@ -345,6 +345,50 @@ def load_search_data(split: str, sample_num: int) -> List[Dict]:
         logger.error(f"Failed to load HotpotQA: {e}")
         return []
 
+
+def load_local_search_data(split: str, sample_num: int) -> List[Dict]:
+    """
+    加载 HotpotQA 数据 (用于 Local Search 任务)
+    与 load_search_data 类似，但 task_type 为 "local_search"
+    """
+    if sample_num <= 0:
+        return []
+
+    logger.info(f"Loading HotpotQA data for local_search ({split})...")
+    try:
+        hf_split = "train" if split == "train" else "validation"
+        # 加载 hotpot_qa distractor 配置
+        ds = load_dataset("hotpot_qa", "distractor", split=hf_split)
+        
+        raw_list = list(ds)
+        # 如果需要截断
+        if sample_num > 0 and sample_num < len(raw_list):
+            random.shuffle(raw_list)
+            raw_list = raw_list[:sample_num]
+            
+        processed_data = []
+        for item in raw_list:
+            d = dict(item)
+            prompt_text = d.get("question", "")
+            response_text = d.get("answer", "")
+            
+            d["task_type"] = "local_search"
+            d["sub_source"] = "hotpotqa"  # 添加 sub_source 字段
+            
+            clean_d = create_standard_sample(
+                prompt=prompt_text,
+                response=response_text,
+                task_type="local_search",
+                raw_data=d
+            )
+            processed_data.append(clean_d)
+            
+        logger.info(f"Loaded {len(processed_data)} Local Search tasks from HotpotQA ({split}).")
+        return processed_data
+    except Exception as e:
+        logger.error(f"Failed to load HotpotQA for local_search: {e}")
+        return []
+
 def load_dapo_math_dataset(num_samples: int) -> List[Dict]:
     """
     加载 open-r1/DAPO-Math-17k-Processed 数据集作为 Math 训练集

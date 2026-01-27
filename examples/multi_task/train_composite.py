@@ -28,12 +28,13 @@ from rllm.data.utils import (
     load_deepmath_dataset,
     load_deepmath_dataset_top_k,
     load_search_data,
+    load_local_search_data,  # [新增] Local Search 数据加载
     load_tool_call_dataset,
     load_tool_call_json_dataset
 )
 
 # 引入 System Prompts
-from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT
+from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT, LOCAL_SEARCH_SYSTEM_PROMPT
 
 
 # 引入 MCP 组件 (用于 Search/Browsing)
@@ -107,9 +108,10 @@ def prepare_composite_dataset(
     bfcl_num: int,
     search_num: int,
     tool_call_num: int,
-    tool_call_data_path: str
+    tool_call_data_path: str,
+    local_search_num: int = 0  # [新增] Local Search 数量参数
 ):
-    logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search)...")
+    logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search + LocalSearch)...")
     logger.info(f">>> Using Random Seed: {GLOBAL_SEED}")
     
     # 1. BFCL
@@ -147,13 +149,20 @@ def prepare_composite_dataset(
         # 分别加载 train 和 test parquet
         tc_train = load_tool_call_json_dataset(tool_call_data_path, split="train", num_samples=tool_call_num)
         # 测试集通常不需要采样太多，这里取全部或限制数量
-        tc_test = load_tool_call_json_dataset(tool_call_data_path, split="test", num_samples=2000) 
+        tc_test = load_tool_call_json_dataset(tool_call_data_path, split="test", num_samples=2000)
     else:
         tc_train, tc_test = [], []
 
+    # 6. Local Search [新增]
+    if local_search_num > 0:
+        local_search_train = load_local_search_data("train", local_search_num)
+        local_search_test = load_local_search_data("test", 500)  # 测试集数量可配置化
+    else:
+        local_search_train, local_search_test = [], []
+
     # 混合
-    mixed_train = bfcl_train + math_train + code_train + search_train + tc_train
-    mixed_test = bfcl_test + math_test + code_test + search_test + tc_test
+    mixed_train = bfcl_train + math_train + code_train + search_train + tc_train + local_search_train
+    mixed_test = bfcl_test + math_test + code_test + search_test + tc_test + local_search_test
     
     if not mixed_train:
         logger.error("No training data found! Please check data configuration.")
@@ -163,8 +172,8 @@ def prepare_composite_dataset(
     
     # 统计日志
     logger.info(f"Prepared Data Details:")
-    logger.info(f"  Train: BFCL={len(bfcl_train)}, Math={len(math_train)}, Code={len(code_train)}, Search={len(search_train)}, Tool_Call={len(tc_train)} | Total={len(mixed_train)}")
-    logger.info(f"  Test : BFCL={len(bfcl_test)}, Math={len(math_test)}, Code={len(code_test)}, Search={len(search_test)}, Tool_Call={len(tc_test)} | Total={len(mixed_test)}")
+    logger.info(f"  Train: BFCL={len(bfcl_train)}, Math={len(math_train)}, Code={len(code_train)}, Search={len(search_train)}, Tool_Call={len(tc_train)}, Local_Search={len(local_search_train)} | Total={len(mixed_train)}")
+    logger.info(f"  Test : BFCL={len(bfcl_test)}, Math={len(math_test)}, Code={len(code_test)}, Search={len(search_test)}, Tool_Call={len(tc_test)}, Local_Search={len(local_search_test)} | Total={len(mixed_test)}")
     
     # 注册数据集
     DatasetRegistry.register_dataset(dataset_name, mixed_train, split="train")
@@ -187,6 +196,7 @@ def main(config):
     search_num = config.data.get("search_num", 0)
     tool_call_num = config.data.get("tool_call_num", 0)
     tool_call_data_path = config.data.get("tool_call_data_path", "./data/toolace")
+    local_search_num = config.data.get("local_search_num", 0)  # [新增] Local Search 数量
 
     # --- Search / MCP 环境配置 ---
     mcp_tool_map = {}
@@ -232,16 +242,33 @@ def main(config):
             except Exception as e:
                 logger.error(f"❌ Failed to fetch MCP tools: {e}")
 
+    # --- Local Search 环境配置 [新增] ---
+    local_search_tool_map = {}
+    retrieval_server_url = os.getenv("RETRIEVAL_SERVER_URL", "http://127.0.0.1:8000")
+    
+    if local_search_num > 0:
+        logger.info(f"Initializing Local Search Tool (Server: {retrieval_server_url})...")
+        try:
+            # 动态导入 LocalRetrievalTool
+            from examples.search.local_retrieval_tool import LocalRetrievalTool
+            local_search_tool_map = {"local_search": LocalRetrievalTool}
+            logger.info("✅ Local Search Tool initialized successfully.")
+        except ImportError as e:
+            logger.error(f"❌ Failed to import LocalRetrievalTool: {e}")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Local Search Tool: {e}")
+
     # 1. 准备数据
     dataset_name = prepare_composite_dataset(
         bfcl_url,
-        config.data.dataset_name, 
-        math_num, 
-        code_num, 
+        config.data.dataset_name,
+        math_num,
+        code_num,
         bfcl_num,
         search_num,
         tool_call_num,
-        tool_call_data_path
+        tool_call_data_path,
+        local_search_num  # [新增]
     )
     
     train_dataset = DatasetRegistry.load_dataset(dataset_name, "train")
@@ -271,7 +298,12 @@ def main(config):
         },
         "tool_call_args": {
             "reward_fn": tool_call_reward_fn
-
+        },
+        # [新增] Local Search 环境参数
+        "local_search_args": {
+            "tool_map": local_search_tool_map,
+            "reward_fn": search_reward_fn,  # 复用 search_reward_fn
+            "max_steps": config.rllm.agent.get("max_steps", 20),
         }
     }
 
@@ -296,6 +328,12 @@ def main(config):
         },
         "tool_call_agent_args": {
             "parser_name": "qwen"
+        },
+        # [新增] Local Search Agent 参数
+        "local_search_agent_args": {
+            "parser_name": "qwen",
+            "system_prompt": LOCAL_SEARCH_SYSTEM_PROMPT,
+            "tool_map": local_search_tool_map
         }
     }
 

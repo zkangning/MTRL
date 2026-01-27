@@ -8,24 +8,26 @@ from rllm.agents.tool_agent import ToolAgent, MCPToolAgent, ToolCallAgent
 
 class CompositeAgent(BaseAgent):
     """
-    五合一 Agent: 动态路由到 BFCL, Math, Code, Search, 或 ToolCall Agent
+    六合一 Agent: 动态路由到 BFCL, Math, Code, Search, ToolCall, 或 LocalSearch Agent
     """
 
     def __init__(
-        self, 
-        bfcl_agent_args: Dict = {}, 
+        self,
+        bfcl_agent_args: Dict = {},
         math_agent_args: Dict = {},
         code_agent_args: Dict = {},
         search_agent_args: Dict = {},
-        tool_call_agent_args: Dict = {}  # [新增]
+        tool_call_agent_args: Dict = {},
+        local_search_agent_args: Dict = {}  # [新增] Local Search Agent 参数
     ):
         # 1. 初始化子 Agent
         self.bfcl_agent = BFCLReadyAgent(**bfcl_agent_args)
         self.math_agent = ToolAgent(**math_agent_args)
         self.code_agent = CompetitionCodingAgent(**code_agent_args)
         self.search_agent = MCPToolAgent(**search_agent_args)
-        # [新增] 初始化 Tool Call Agent
         self.tool_call_agent = ToolCallAgent(**tool_call_agent_args)
+        # [新增] 初始化 Local Search Agent (使用 ToolAgent，与 Math 类似)
+        self.local_search_agent = ToolAgent(**local_search_agent_args)
         
         # 2. 状态管理
         self.active_agent = self.math_agent # 默认值
@@ -49,9 +51,11 @@ class CompositeAgent(BaseAgent):
                     self.active_agent = self.code_agent
                 elif task_type == "search":
                     self.active_agent = self.search_agent
-                # [新增] 路由到 Tool Call Agent
                 elif task_type == "tool_call":
                     self.active_agent = self.tool_call_agent
+                # [新增] 路由到 Local Search Agent
+                elif task_type == "local_search":
+                    self.active_agent = self.local_search_agent
         
         # 将感知数据转发给当前激活的 Agent
         self.active_agent.update_from_env(observation, reward, done, info, **kwargs)
@@ -64,7 +68,8 @@ class CompositeAgent(BaseAgent):
         self.math_agent.reset()
         self.code_agent.reset()
         self.search_agent.reset()
-        self.tool_call_agent.reset() # [新增]
+        self.tool_call_agent.reset()
+        self.local_search_agent.reset()  # [新增]
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:

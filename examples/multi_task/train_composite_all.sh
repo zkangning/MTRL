@@ -13,6 +13,10 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=3600
 export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 
+# Local Search 配置 - 设置本地检索服务器地址
+# 请确保在运行训练前启动检索服务器: bash examples/search/retrieval/launch_server.sh ./search_data/prebuilt_indices 8000
+export RETRIEVAL_SERVER_URL="http://127.0.0.1:8000"
+
 # 获取 RLLM 路径
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
 
@@ -29,6 +33,7 @@ python3 -m examples.multi_task.train_composite \
     +data.bfcl_num=0 \
     +data.search_num=12800 \
     +data.tool_call_num=0 \
+    +data.local_search_num=0 \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data' \
     +data.dataset_name=math0_code0_tool0_search1w \
     trainer.experiment_name='math0_code0_tool0_search1w-8b-mixed-tasks' \

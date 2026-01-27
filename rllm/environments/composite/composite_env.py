@@ -15,17 +15,18 @@ logger = logging.getLogger(__name__)
 
 class CompositeEnvironment(BaseEnv):
     """
-    多任务组合环境: BFCL + Math + Code + Search + ToolCall
+    多任务组合环境: BFCL + Math + Code + Search + ToolCall + LocalSearch
     充当数据适配器，负责将 Dataset 中的扁平化数据解包为各子环境所需的原始格式。
     """
     
     def __init__(
-        self, 
-        bfcl_args: Dict[str, Any], 
+        self,
+        bfcl_args: Dict[str, Any],
         math_args: Dict[str, Any],
         code_args: Dict[str, Any],
         search_args: Dict[str, Any] = {},
-        tool_call_args: Dict[str, Any] = {}, # [新增]
+        tool_call_args: Dict[str, Any] = {},
+        local_search_args: Dict[str, Any] = {},  # [新增] Local Search 参数
         task: Dict[str, Any] = None
     ):
         self.task = task or {}
@@ -58,7 +59,7 @@ class CompositeEnvironment(BaseEnv):
             # 搜索环境通常需要显式初始化，这里暂时允许跳过（如果search_num=0）
             self.search_env = None
 
-        # --- 5. Tool Call Environment [新增] ---
+        # --- 5. Tool Call Environment ---
         if "reward_fn" in tool_call_args:
             r_fn = tool_call_args["reward_fn"]
             t_args = tool_call_args.copy()
@@ -66,6 +67,16 @@ class CompositeEnvironment(BaseEnv):
             self.tool_call_env = ToolCallEnvironment(reward_fn=r_fn, **t_args)
         else:
             self.tool_call_env = ToolCallEnvironment.from_dict(tool_call_args)
+
+        # --- 6. Local Search Environment [新增] ---
+        # 使用 ToolEnvironment，与 Math 类似，但使用 local_search 工具
+        if "reward_fn" in local_search_args:
+            r_fn = local_search_args["reward_fn"]
+            ls_args = local_search_args.copy()
+            ls_args.pop("reward_fn", None)
+            self.local_search_env = ToolEnvironment(reward_fn=r_fn, **ls_args)
+        else:
+            self.local_search_env = None
         
         self.active_env = None
         self.active_task_type = None
@@ -140,11 +151,19 @@ class CompositeEnvironment(BaseEnv):
                 self.active_env.task = current_task
             obs, info = self.active_env.reset()
 
-        # [新增] Tool Call 路由
+        # Tool Call 路由
         elif self.active_task_type == "tool_call":
             self.active_env = self.tool_call_env
             # ToolCallEnvironment 的 reset 签名支持传入 task 或使用 internal self.task
             # 这里我们显式传入
+            self.active_env.task = current_task
+            obs, info = self.active_env.reset()
+
+        # [新增] Local Search 路由
+        elif self.active_task_type == "local_search":
+            if not self.local_search_env:
+                raise RuntimeError("Local Search Environment not initialized via local_search_args")
+            self.active_env = self.local_search_env
             self.active_env.task = current_task
             obs, info = self.active_env.reset()
 
@@ -165,8 +184,8 @@ class CompositeEnvironment(BaseEnv):
         return obs, reward, done, info
 
     def close(self):
-        # [新增] 关闭 tool_call_env
-        for env in [self.bfcl_env, self.math_env, self.code_env, self.search_env, self.tool_call_env]:
+        # 关闭所有子环境
+        for env in [self.bfcl_env, self.math_env, self.code_env, self.search_env, self.tool_call_env, self.local_search_env]:
             if env and hasattr(env, 'close'):
                 env.close()
 
@@ -177,6 +196,7 @@ class CompositeEnvironment(BaseEnv):
             math_args=env_args.get("math_args", {}),
             code_args=env_args.get("code_args", {}),
             search_args=env_args.get("search_args", {}),
-            tool_call_args=env_args.get("tool_call_args", {}), # [新增]
-            task=env_args 
+            tool_call_args=env_args.get("tool_call_args", {}),
+            local_search_args=env_args.get("local_search_args", {}),  # [新增]
+            task=env_args
         )
