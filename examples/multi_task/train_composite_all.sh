@@ -49,7 +49,7 @@ python3 -m examples.multi_task.train_composite \
     +data.search_num=0 \
     +data.tool_call_num=12800 \
     +data.local_search_num=0 \
-    +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data' \
+    +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
     +data.dataset_name=m1_28_math0_code0_tool1w_search0_localsearch0 \
     trainer.experiment_name='m1_28_math0_code0_tool1w_search0_localsearch0-8b-mixed-tasks' \
     data.val_batch_size=512 \
