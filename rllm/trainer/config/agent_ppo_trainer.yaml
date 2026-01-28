@@ -60,6 +60,12 @@ rllm:
   rejection_sample:
     enable: False
     multiplier: 1
+  # Kimi K1.5 style length penalty for tool_call tasks
+  # Reference: Kimi K1.5 Technical Report
+  length_penalty:
+    enable: True  # Set to True to enable length penalty
+    weight: 0.5    # Weight for length penalty (0-1)
+    warmup_steps: 100  # Number of steps before applying length penalty
 
 fireworks:
   deployment_id: null

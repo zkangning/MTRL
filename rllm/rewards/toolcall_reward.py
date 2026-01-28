@@ -2,17 +2,22 @@ import json
 import re
 import logging
 from collections import Counter
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any
 
 from rllm.rewards.reward_types import RewardConfig, RewardOutput
 
 logger = logging.getLogger(__name__)
+
 
 class ToolCallRewardFn:
     """
     Reward function for Tool Call tasks.
     It extracts <tool_call> blocks, parses the JSON arguments, 
     and compares them against the ground truth ignoring order.
+    
+    Note: Kimi K1.5 style length penalty is applied at the trainer level
+    (in AgentPPOTrainer._apply_toolcall_length_penalty) to properly handle
+    batch-level min/max length computation across rollouts.
     """
 
     def __init__(self, config: RewardConfig = None):
@@ -55,6 +60,22 @@ class ToolCallRewardFn:
         return counter1 == counter2
 
     def __call__(self, task_info: dict, action: str) -> RewardOutput:
+        """
+        Compute reward for a single response.
+        
+        Base reward:
+        - 1.0 if tool calls match ground truth
+        - 0.0 otherwise
+        
+        Note: Length penalty is applied at trainer level for proper batch handling.
+        
+        Args:
+            task_info: Task information containing ground truth
+            action: Model's response
+            
+        Returns:
+            RewardOutput with computed reward
+        """
         model_response = action
         ground_truth_str = task_info.get("ground_truth", "") or task_info.get("output", "")
 
@@ -82,23 +103,52 @@ class ToolCallRewardFn:
         is_match = self.compare_parsed_content(gt_tools, pred_tools)
 
         if is_match:
-            # 5. 长度惩罚：使用对数函数平滑惩罚过长输出
-            # 参考：DeepSeek-R1、OpenAI 等工作中常用的长度正则化方法
-            import math
-            base_reward = 1.0
-            if model_response:
-                resp_len = len(model_response)
-                # 基准长度：低于此长度不惩罚
-                baseline_len = 1024
-                if resp_len > baseline_len:
-                    # 对数惩罚：log(len/baseline) * coefficient
-                    # 系数 0.15 表示长度翻倍时扣约 0.1 分
-                    penalty = 0.15 * math.log(resp_len / baseline_len)
-                    # 最多扣 0.3 分
-                    penalty = min(0.3, penalty)
-                    base_reward -= penalty
-            return RewardOutput(reward=base_reward, is_correct=True)
+            return RewardOutput(reward=1.0, is_correct=True)
         else:
             return RewardOutput(reward=0.0, is_correct=False)
 
 
+def compute_length_reward_kimi(
+    response_len: int,
+    is_correct: bool,
+    min_len: int,
+    max_len: int
+) -> float:
+    """
+    Compute length reward following Kimi K1.5's approach.
+    
+    Formula:
+        λ = 0.5 - (len(i) - min_len) / (max_len - min_len)
+        
+        If correct (r=1): len_reward = λ
+        If incorrect (r=0): len_reward = min(0, λ)
+    
+    This promotes shorter responses among correct ones,
+    and explicitly penalizes long responses with incorrect answers.
+    
+    Args:
+        response_len: Length of the current response
+        is_correct: Whether the response is correct
+        min_len: Minimum length among all sampled responses for this problem
+        max_len: Maximum length among all sampled responses for this problem
+        
+    Returns:
+        Length reward value in range [-0.5, 0.5]
+    """
+    # If all responses have the same length, no length reward
+    if max_len == min_len:
+        return 0.0
+    
+    # Compute λ = 0.5 - (len(i) - min_len) / (max_len - min_len)
+    # λ ranges from 0.5 (shortest) to -0.5 (longest)
+    normalized_len = (response_len - min_len) / (max_len - min_len)
+    lambda_val = 0.5 - normalized_len
+    
+    if is_correct:
+        # For correct answers: use λ directly
+        # Shorter responses get positive reward, longer get negative
+        return lambda_val
+    else:
+        # For incorrect answers: only penalize if λ < 0 (i.e., longer responses)
+        # Shorter incorrect responses don't get extra penalty
+        return min(0.0, lambda_val)

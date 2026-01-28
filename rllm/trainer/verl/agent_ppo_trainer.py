@@ -14,6 +14,8 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 
+from rllm.rewards.toolcall_reward import ToolCallRewardFn
+
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
@@ -124,6 +126,147 @@ class AgentPPOTrainer(RayPPOTrainer):
                 agents[idx] = agent
         self.agent_execution_engine.update_envs_and_agents(envs, agents)
         return envs
+
+    def _apply_toolcall_length_penalty(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        metrics: dict
+    ) -> torch.Tensor:
+        """
+        Apply Kimi K1.5 style length penalty to tool_call tasks only.
+        
+        For each uid group (same problem, multiple rollouts):
+        - Compute min_len and max_len of response lengths
+        - Apply length reward: λ = 0.5 - (len - min_len) / (max_len - min_len)
+        - For correct answers (reward > 0): add λ
+        - For incorrect answers (reward <= 0): add min(0, λ)
+        
+        Args:
+            batch: DataProto containing batch data
+            reward_tensor: Current token-level reward tensor (B, T)
+            metrics: Dict to log metrics
+            
+        Returns:
+            Modified reward_tensor with length penalty applied to tool_call tasks
+        """
+        # Check if length penalty is enabled in config
+        length_penalty_config = self.config.rllm.get("length_penalty", {})
+        if not length_penalty_config.get("enable", False):
+            return reward_tensor
+        
+        # Get warmup steps (no penalty during warmup)
+        warmup_steps = length_penalty_config.get("warmup_steps", 0)
+        if self.global_steps < warmup_steps:
+            return reward_tensor
+        
+        # Get length penalty weight
+        length_penalty_weight = length_penalty_config.get("weight", 1.0)
+        
+        # Get task types from batch
+        task_types = None
+        if "data_source" in batch.non_tensor_batch:
+            task_types = batch.non_tensor_batch["data_source"]
+        elif "extra_info" in batch.non_tensor_batch:
+            task_types = []
+            for item in batch.non_tensor_batch["extra_info"]:
+                try:
+                    if isinstance(item, str):
+                        t = json.loads(item).get("task_type", "unknown")
+                    else:
+                        t = item.get("task_type", "unknown")
+                except:
+                    t = "unknown"
+                task_types.append(t)
+            task_types = np.array(task_types)
+        
+        if task_types is None:
+            return reward_tensor
+        
+        # Get uids for grouping
+        uids = batch.non_tensor_batch["uid"]
+        
+        # Get response lengths (number of non-pad tokens)
+        responses = batch.batch.get("responses")
+        if responses is None:
+            return reward_tensor
+        
+        pad_token_id = self.tokenizer.pad_token_id
+        response_lengths = (responses != pad_token_id).sum(dim=1).cpu().numpy()
+        
+        # Get sequence-level rewards (sum over tokens)
+        seq_rewards = reward_tensor.sum(dim=-1).cpu().numpy()
+        
+        # Create a copy of reward_tensor to modify
+        modified_reward = reward_tensor.clone()
+        
+        # Track metrics
+        total_length_penalty_applied = 0
+        tool_call_count = 0
+        length_rewards_sum = 0.0
+        
+        # Find tool_call samples
+        tool_call_mask = (task_types == "tool_call")
+        if not tool_call_mask.any():
+            return reward_tensor
+        
+        # Group by uid and apply length penalty
+        unique_uids = np.unique(uids[tool_call_mask])
+        
+        for uid in unique_uids:
+            # Get indices for this uid that are tool_call
+            uid_mask = (uids == uid) & tool_call_mask
+            uid_indices = np.where(uid_mask)[0]
+            
+            if len(uid_indices) == 0:
+                continue
+            
+            # Get lengths and rewards for this group
+            group_lengths = response_lengths[uid_indices]
+            group_rewards = seq_rewards[uid_indices]
+            
+            min_len = group_lengths.min()
+            max_len = group_lengths.max()
+            
+            # If all same length, no penalty
+            if max_len == min_len:
+                continue
+            
+            # Apply Kimi K1.5 length penalty to each sample in the group
+            for idx in uid_indices:
+                resp_len = response_lengths[idx]
+                is_correct = seq_rewards[idx] > 0
+                
+                # λ = 0.5 - (len - min_len) / (max_len - min_len)
+                normalized_len = (resp_len - min_len) / (max_len - min_len)
+                lambda_val = 0.5 - normalized_len
+                
+                if is_correct:
+                    length_reward = lambda_val
+                else:
+                    length_reward = min(0.0, lambda_val)
+                
+                length_reward *= length_penalty_weight
+                
+                # Find the last non-zero position in the reward tensor to add length reward
+                # (rewards are typically placed at the last token)
+                resp_mask = (responses[idx] != pad_token_id)
+                if resp_mask.any():
+                    last_token_idx = resp_mask.sum().item() - 1
+                    if last_token_idx >= 0 and last_token_idx < modified_reward.shape[1]:
+                        modified_reward[idx, last_token_idx] += length_reward
+                        length_rewards_sum += length_reward
+                        total_length_penalty_applied += 1
+            
+            tool_call_count += len(uid_indices)
+        
+        # Log metrics
+        if tool_call_count > 0:
+            metrics["train/length_penalty/tool_call_count"] = tool_call_count
+            metrics["train/length_penalty/avg_length_reward"] = length_rewards_sum / max(total_length_penalty_applied, 1)
+            metrics["train/length_penalty/applied_count"] = total_length_penalty_applied
+        
+        return modified_reward
 
     def _compute_multitask_metrics(self, batch: DataProto):
         """
@@ -373,6 +516,10 @@ class AgentPPOTrainer(RayPPOTrainer):
                             batch.batch["token_level_scores"] = reward_tensor
                         else:
                             reward_tensor = batch.batch["token_level_scores"]  # filled in by environment collected trajectory transformation
+
+                        # Apply Kimi K1.5 length penalty for tool_call tasks only
+                        reward_tensor = self._apply_toolcall_length_penalty(batch, reward_tensor, metrics)
+                        batch.batch["token_level_scores"] = reward_tensor
 
                         # Rejection sampling based on rewards
                         # Group rewards by uid
