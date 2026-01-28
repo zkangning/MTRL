@@ -37,23 +37,26 @@ class LocalRetriever:
     def __init__(
         self,
         data_dir: str,
-        max_concurrent_gpu: int = 1,
+        max_concurrent_gpu: int = 4,
         cleanup_interval: int = 100,
         gpu_id: int | None = None,
+        queue_timeout: float = 120.0,
     ):
         """
         Initialize the retriever.
         
         Args:
             data_dir: Directory containing corpus and index files
-            max_concurrent_gpu: Maximum concurrent GPU inference requests (key for memory control)
+            max_concurrent_gpu: Maximum concurrent GPU inference requests (default: 4)
             cleanup_interval: Number of requests between forced memory cleanup
             gpu_id: Specific GPU to use (None = use CUDA_VISIBLE_DEVICES or default)
+            queue_timeout: Timeout in seconds for waiting in GPU queue (default: 120s)
         """
         self.data_dir = Path(data_dir)
         self.corpus = []
         self.dense_index = None
         self.gpu_id = gpu_id
+        self.queue_timeout = queue_timeout
         
         # 设置使用的 GPU
         if gpu_id is not None:
@@ -63,8 +66,10 @@ class LocalRetriever:
         
         print(f"Using device: {self.device}")
         
-        # GPU 并发控制 - 这是解决显存问题的关键
+        # GPU 并发控制 - 允许更多并发以提高吞吐量
+        # 80GB 显存的 GPU 可以安全地处理 4-8 个并发的 E5 编码请求
         self._gpu_semaphore = threading.Semaphore(max_concurrent_gpu)
+        self._max_concurrent = max_concurrent_gpu
         
         # 显存管理
         self._request_count = 0
@@ -123,10 +128,10 @@ class LocalRetriever:
         
         使用信号量限制并发 GPU 推理，防止显存溢出。
         """
-        # 使用信号量限制并发 GPU 访问
-        acquired = self._gpu_semaphore.acquire(timeout=30.0)
+        # 使用信号量限制并发 GPU 访问，使用更长的超时时间
+        acquired = self._gpu_semaphore.acquire(timeout=self.queue_timeout)
         if not acquired:
-            raise TimeoutError("GPU inference queue timeout")
+            raise TimeoutError(f"GPU inference queue timeout after {self.queue_timeout}s (max_concurrent={self._max_concurrent})")
         
         try:
             # 使用 no_grad 和 inference_mode 避免保留计算图
@@ -260,8 +265,9 @@ def main():
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--gpu_id", type=int, default=None, help="GPU device ID to use (default: use CUDA_VISIBLE_DEVICES or 0)")
-    parser.add_argument("--max_concurrent_gpu", type=int, default=1, help="Maximum concurrent GPU inference requests (lower = less memory)")
+    parser.add_argument("--max_concurrent_gpu", type=int, default=4, help="Maximum concurrent GPU inference requests (default: 4, for 80GB GPU)")
     parser.add_argument("--cleanup_interval", type=int, default=100, help="Number of requests between memory cleanup")
+    parser.add_argument("--queue_timeout", type=float, default=120.0, help="Timeout in seconds for waiting in GPU queue (default: 120)")
 
     args = parser.parse_args()
 
@@ -274,6 +280,7 @@ def main():
             max_concurrent_gpu=args.max_concurrent_gpu,
             cleanup_interval=args.cleanup_interval,
             gpu_id=args.gpu_id,
+            queue_timeout=args.queue_timeout,
         )
         print(f"Dense retrieval server initialized with {len(retriever.corpus)} documents")
         print(f"Max concurrent GPU requests: {args.max_concurrent_gpu}")

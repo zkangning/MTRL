@@ -2,13 +2,16 @@
 # Multi-GPU retrieval server launcher with load balancing
 #
 # Usage:
-#   ./launch_multi_gpu.sh <data_dir> <base_port> <num_gpus>
+#   ./launch_multi_gpu.sh <data_dir> <base_port> <num_gpus> [host] [max_concurrent_per_gpu]
 #
 # Example:
 #   ./launch_multi_gpu.sh ./search_data/prebuilt_indices 8000 4
+#   ./launch_multi_gpu.sh ./search_data/prebuilt_indices 8000 4 0.0.0.0 8
 #
 # This will start 4 server instances on ports 8000, 8001, 8002, 8003
 # using GPU 0, 1, 2, 3 respectively.
+#
+# With max_concurrent_per_gpu=8 and 4 GPUs, total concurrent capacity = 32 requests
 
 set -e
 
@@ -16,6 +19,8 @@ DATA_DIR=${1:-"./search_data/prebuilt_indices"}
 BASE_PORT=${2:-8000}
 NUM_GPUS=${3:-$(nvidia-smi -L | wc -l)}
 HOST=${4:-"0.0.0.0"}
+MAX_CONCURRENT=${5:-4}  # 每个 GPU 的最大并发数，80GB 显存建议 4-8
+QUEUE_TIMEOUT=${6:-120}  # 队列超时时间（秒）
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_SCRIPT="${SCRIPT_DIR}/server.py"
@@ -27,6 +32,9 @@ echo "Data directory: ${DATA_DIR}"
 echo "Base port: ${BASE_PORT}"
 echo "Number of GPUs: ${NUM_GPUS}"
 echo "Host: ${HOST}"
+echo "Max concurrent per GPU: ${MAX_CONCURRENT}"
+echo "Queue timeout: ${QUEUE_TIMEOUT}s"
+echo "Total concurrent capacity: $((NUM_GPUS * MAX_CONCURRENT))"
 echo "=========================================="
 
 # 创建日志目录
@@ -65,8 +73,9 @@ for ((i=0; i<NUM_GPUS; i++)); do
         --host "${HOST}" \
         --port "${PORT}" \
         --gpu_id "${i}" \
-        --max_concurrent_gpu 4 \
+        --max_concurrent_gpu "${MAX_CONCURRENT}" \
         --cleanup_interval 50 \
+        --queue_timeout "${QUEUE_TIMEOUT}" \
         > "${LOG_FILE}" 2>&1 &
     
     PIDS+=($!)
