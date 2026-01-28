@@ -24,7 +24,7 @@ from sentence_transformers import SentenceTransformer
 class LocalRetriever:
     """Dense-only retrieval system using FAISS."""
 
-    def __init__(self, data_dir: str, cleanup_interval: int = 50):
+    def __init__(self, data_dir: str, cleanup_interval: int = 1000):
         self.data_dir = Path(data_dir)
         self.corpus = []
         self.dense_index = None
