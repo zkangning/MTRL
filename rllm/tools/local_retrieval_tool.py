@@ -117,17 +117,21 @@ class LocalRetrievalTool(Tool):
 
         return "\n".join(formatted_results)
 
-    def forward(self, query: str, top_k: int | None = None) -> ToolOutput:
+    def forward(self, query: str, top_k: int | None = None, _retry_count: int = 0) -> ToolOutput:
         """
         Execute a search query using the dense retrieval server.
 
         Args:
             query: Search query
             top_k: Number of results to return
+            _retry_count: Internal retry counter (do not set manually)
 
         Returns:
             ToolOutput: Search results or error message
         """
+        max_retries = 3
+        retry_delay = 0.5  # seconds
+        
         try:
             # Use provided parameters or defaults
             top_k = top_k or self.max_results
@@ -142,6 +146,17 @@ class LocalRetrievalTool(Tool):
             response = self.client.post(f"{self.server_url}/retrieve", json=payload)
 
             if not response.is_success:
+                # 检查是否是可重试的错误 (503 - GPU 显存问题)
+                if response.status_code == 503 and _retry_count < max_retries:
+                    try:
+                        error_data = response.json()
+                        if error_data.get("retry"):
+                            import time
+                            time.sleep(retry_delay * (2 ** _retry_count))  # 指数退避
+                            return self.forward(query, top_k, _retry_count + 1)
+                    except Exception:
+                        pass
+                
                 error_msg = f"Retrieval server error: {response.status_code}"
                 if response.content:
                     try:

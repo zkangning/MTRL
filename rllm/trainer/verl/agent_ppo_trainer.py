@@ -740,15 +740,15 @@ class AgentPPOTrainer(RayPPOTrainer):
 
     def _validate_agent(self):
         """
-        [简化版] 验证循环，支持细粒度 (Sub-source) 测评结果展示。
-        改进：
-        1. 只输出平均 test_score，移除 std 和 pass@k
-        2. 保留子数据源的详细统计
-        3. 简化日志输出
+        验证循环，支持细粒度 (Sub-source) 测评结果展示。
+        指标记录规则：
+        1. 子任务 (task_type): 记录 test_score 和 pass@k
+        2. 子数据源 (sub_source): 仅记录 test_score
         """
         rewards_lst = []
         data_source_lst = []
         sub_source_lst = []
+        uid_lst = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -784,6 +784,9 @@ class AgentPPOTrainer(RayPPOTrainer):
             reward_tensor = test_batch.batch["token_level_scores"]
             rewards_lst.append(reward_tensor.sum(-1).cpu())
             
+            # 收集 uid 用于 pass@k 计算
+            uid_lst.append(test_batch.non_tensor_batch["uid"])
+            
             # 1. 获取主 Task 类型 (math, code, etc.)
             ds_list = test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
             if isinstance(ds_list, np.ndarray):
@@ -811,14 +814,19 @@ class AgentPPOTrainer(RayPPOTrainer):
         reward_tensor = torch.cat(rewards_lst, dim=0)
         data_sources = np.array(data_source_lst)
         sub_sources = np.array(sub_source_lst)
+        uid_tensor = np.concatenate(uid_lst, axis=0)
         
         metric_dict = {}
         
         # ---------------------------------------------------------
-        # 核心逻辑：双层循环计算指标
-        # 1. 一级分类 (Task Type): val/test_score/math
-        # 2. 二级分类 (Sub Source): val/test_score/math/aime2024
+        # Pass@K 计算：按 task_type 和 uid 分组，取每个 uid 的最大 reward
         # ---------------------------------------------------------
+        task_uid_max_rewards = defaultdict(lambda: defaultdict(float))
+        for i in range(reward_tensor.shape[0]):
+            task = data_sources[i]
+            uid = uid_tensor[i]
+            r = reward_tensor[i].item()
+            task_uid_max_rewards[task][uid] = max(task_uid_max_rewards[task][uid], r)
         
         unique_tasks = np.unique(data_sources)
         
@@ -827,22 +835,28 @@ class AgentPPOTrainer(RayPPOTrainer):
         print("="*80)
         
         for task in unique_tasks:
-            # === A. 一级指标 (Overall Task) ===
+            # === A. 一级指标 (Overall Task): test_score + pass@k ===
             task_indices = np.where(data_sources == task)[0]
             task_count = len(task_indices)
             
-            # Mean Score (只保留平均分)
+            # Mean Score
             task_rewards = reward_tensor[task_indices].numpy()
             task_mean_score = task_rewards.mean()
             metric_dict[f"val/test_score/{task}"] = task_mean_score
+            
+            # Pass@K: 每个 uid 的最大 reward >= 1.0 视为通过
+            uid_max_rewards = task_uid_max_rewards[task]
+            pass_k_list = [score >= 1.0 for score in uid_max_rewards.values()]
+            pass_k_rate = np.mean(pass_k_list) if pass_k_list else 0.0
+            metric_dict[f"val/test_score/pass@k/{task}"] = pass_k_rate
             
             # Sample Count
             metric_dict[f"val/count/{task}"] = task_count
             
             print(f"\n📌 Task: {task}")
-            print(f"   Samples: {task_count} | Mean Score: {task_mean_score:.4f}")
+            print(f"   Samples: {task_count} | Mean Score: {task_mean_score:.4f} | Pass@K: {pass_k_rate:.4f}")
 
-            # === B. 二级指标 (Sub Source breakdown) ===
+            # === B. 二级指标 (Sub Source): 仅 test_score ===
             current_subs = np.unique(sub_sources[task_indices])
             
             # 过滤掉无意义的标签
@@ -864,11 +878,10 @@ class AgentPPOTrainer(RayPPOTrainer):
                 
                 sub_count = len(sub_indices)
                 
-                # Sub Mean Score (只保留平均分)
+                # Sub Mean Score (仅记录 test_score，不记录 pass@k)
                 sub_rewards = reward_tensor[sub_indices].numpy()
                 sub_mean_score = sub_rewards.mean()
                 
-                # 使用更清晰的命名格式
                 metric_dict[f"val/test_score/{task}/{sub}"] = sub_mean_score
                 metric_dict[f"val/count/{task}/{sub}"] = sub_count
                 

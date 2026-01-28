@@ -12,7 +12,7 @@ export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 # 防止 BFCL Server 响应慢导致 vLLM 推理超时
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=3600
 export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
-export RETRIEVAL_SERVER_URL="http://<REMOTE_IP>:8000"
+export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000"
 # Local Search 配置 - 设置检索服务器地址
 # 如果检索服务在本地: export RETRIEVAL_SERVER_URL="http://127.0.0.1:8000"
 # 如果检索服务在远程服务器: export RETRIEVAL_SERVER_URL="http://<REMOTE_IP>:8000"

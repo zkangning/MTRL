@@ -8,12 +8,15 @@ Usage:
 """
 
 import argparse
+import gc
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import faiss
+import torch
 from flask import Flask, jsonify, request
 from sentence_transformers import SentenceTransformer
 
@@ -21,11 +24,17 @@ from sentence_transformers import SentenceTransformer
 class LocalRetriever:
     """Dense-only retrieval system using FAISS."""
 
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, cleanup_interval: int = 50):
         self.data_dir = Path(data_dir)
         self.corpus = []
         self.dense_index = None
         self.encoder = SentenceTransformer("intfloat/e5-base-v2")
+        self.encoder.eval()  # 设置为评估模式
+        
+        # 显存管理
+        self._request_count = 0
+        self._cleanup_interval = cleanup_interval
+        self._lock = threading.Lock()
 
         self._load_data()
 
@@ -44,17 +53,40 @@ class LocalRetriever:
         self.dense_index = faiss.read_index(str(dense_index_file))
         print(f"Loaded dense index with {self.dense_index.ntotal} vectors")
 
+    def _maybe_cleanup(self):
+        """定期清理 CUDA 缓存以防止显存累积。"""
+        with self._lock:
+            self._request_count += 1
+            should_cleanup = self._request_count >= self._cleanup_interval
+            if should_cleanup:
+                self._request_count = 0
+        
+        if should_cleanup:
+            torch.cuda.empty_cache()
+            gc.collect()
+
     def search(self, query: str, k: int = 10) -> list[dict[str, Any]]:
         """Dense retrieval using FAISS."""
-        query_vector = self.encoder.encode([f"query: {query}"]).astype("float32")
-        scores, indices = self.dense_index.search(query_vector, k)
+        try:
+            # 使用 no_grad 避免保留计算图，防止显存泄漏
+            with torch.no_grad():
+                query_vector = self.encoder.encode(
+                    [f"query: {query}"],
+                    convert_to_numpy=True,
+                    show_progress_bar=False
+                ).astype("float32")
+            
+            scores, indices = self.dense_index.search(query_vector, k)
 
-        results = []
-        for score, idx in zip(scores[0], indices[0], strict=False):
-            # FAISS returns -1 for invalid indices (not enough results)
-            if idx >= 0 and idx < len(self.corpus):
-                results.append({"content": self.corpus[idx], "score": float(score)})
-        return results
+            results = []
+            for score, idx in zip(scores[0], indices[0], strict=False):
+                # FAISS returns -1 for invalid indices (not enough results)
+                if idx >= 0 and idx < len(self.corpus):
+                    results.append({"content": self.corpus[idx], "score": float(score)})
+            return results
+        finally:
+            # 每次请求后检查是否需要清理
+            self._maybe_cleanup()
 
 
 # Flask app
@@ -84,6 +116,17 @@ def retrieve():
         formatted_results = [{"id": f"doc_{i}", "content": result["content"], "score": result["score"]} for i, result in enumerate(results, 1)]
 
         return jsonify({"query": query, "method": "dense", "results": formatted_results, "num_results": len(formatted_results)})
+
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        # 处理 CUDA OOM 和相关错误
+        error_str = str(e)
+        if "CUDA" in error_str or "cublas" in error_str.lower() or "out of memory" in error_str.lower():
+            print(f"[ERROR] CUDA memory error: {e}")
+            # 强制清理显存
+            torch.cuda.empty_cache()
+            gc.collect()
+            return jsonify({"error": "GPU memory exhausted, please retry", "retry": True}), 503
+        raise
 
     except Exception as e:
         import traceback
