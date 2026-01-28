@@ -65,7 +65,7 @@ for ((i=0; i<NUM_GPUS; i++)); do
         --host "${HOST}" \
         --port "${PORT}" \
         --gpu_id "${i}" \
-        --max_concurrent_gpu 1 \
+        --max_concurrent_gpu 4 \
         --cleanup_interval 50 \
         > "${LOG_FILE}" 2>&1 &
     
