@@ -136,11 +136,21 @@ class AgentPPOTrainer(RayPPOTrainer):
         """
         Apply Kimi K1.5 style length penalty to tool_call tasks only.
         
+        Kimi K1.5 Length Reward Formula:
+            λ = 0.5 - (len(i) - min_len) / (max_len - min_len)
+            
+            If correct (r=1): len_reward = λ           # Range: [-0.5, 0.5]
+            If incorrect (r=0): len_reward = min(0, λ) # Range: [-0.5, 0]
+        
+        Design principles:
+        - Correct + Short → Reward (positive λ)
+        - Correct + Long → Penalize (negative λ)
+        - Incorrect + Short → No change (λ > 0 but min(0, λ) = 0)
+        - Incorrect + Long → Penalize (negative λ)
+        
         For each uid group (same problem, multiple rollouts):
-        - Compute min_len and max_len of response lengths
-        - Apply length reward: λ = 0.5 - (len - min_len) / (max_len - min_len)
-        - For correct answers (reward > 0): add λ
-        - For incorrect answers (reward <= 0): add min(0, λ)
+        - Compute min_len and max_len across ALL responses (not just correct ones)
+        - Apply length reward based on correctness
         
         Args:
             batch: DataProto containing batch data
@@ -160,8 +170,11 @@ class AgentPPOTrainer(RayPPOTrainer):
         if self.global_steps < warmup_steps:
             return reward_tensor
         
-        # Get length penalty weight
-        length_penalty_weight = length_penalty_config.get("weight", 1.0)
+        # Get length penalty weight (default to 0.1 for safety)
+        length_penalty_weight = length_penalty_config.get("weight", 0.1)
+        
+        # Minimum response length threshold (responses shorter than this are skipped entirely)
+        min_response_threshold = length_penalty_config.get("min_response_length", 50)
         
         # Get task types from batch
         task_types = None
@@ -201,9 +214,12 @@ class AgentPPOTrainer(RayPPOTrainer):
         modified_reward = reward_tensor.clone()
         
         # Track metrics
-        total_length_penalty_applied = 0
+        total_applied = 0
+        correct_applied = 0
+        incorrect_applied = 0
         tool_call_count = 0
         length_rewards_sum = 0.0
+        skipped_short = 0
         
         # Find tool_call samples
         tool_call_mask = (task_types == "tool_call")
@@ -221,15 +237,17 @@ class AgentPPOTrainer(RayPPOTrainer):
             if len(uid_indices) == 0:
                 continue
             
-            # Get lengths and rewards for this group
+            # Get lengths and rewards for this group (ALL responses, not just correct)
             group_lengths = response_lengths[uid_indices]
             group_rewards = seq_rewards[uid_indices]
             
+            # Compute min/max across ALL responses in this group
             min_len = group_lengths.min()
             max_len = group_lengths.max()
             
-            # If all same length, no penalty
+            # If all responses have same length, no penalty needed
             if max_len == min_len:
+                tool_call_count += len(uid_indices)
                 continue
             
             # Apply Kimi K1.5 length penalty to each sample in the group
@@ -237,34 +255,56 @@ class AgentPPOTrainer(RayPPOTrainer):
                 resp_len = response_lengths[idx]
                 is_correct = seq_rewards[idx] > 0
                 
+                # Skip if response is too short (prevent degenerate outputs)
+                if resp_len < min_response_threshold:
+                    skipped_short += 1
+                    continue
+                
                 # λ = 0.5 - (len - min_len) / (max_len - min_len)
+                # Range: [0.5 (shortest), -0.5 (longest)]
                 normalized_len = (resp_len - min_len) / (max_len - min_len)
                 lambda_val = 0.5 - normalized_len
                 
+                # Apply Kimi K1.5 formula
                 if is_correct:
+                    # Correct answers: use λ directly
+                    # Short correct → positive reward, Long correct → negative reward
                     length_reward = lambda_val
                 else:
+                    # Incorrect answers: min(0, λ)
+                    # Short incorrect → 0 (no reward), Long incorrect → negative (penalize)
                     length_reward = min(0.0, lambda_val)
                 
+                # Apply weight
                 length_reward *= length_penalty_weight
                 
-                # Find the last non-zero position in the reward tensor to add length reward
-                # (rewards are typically placed at the last token)
+                # Skip if no adjustment needed
+                if length_reward == 0.0:
+                    continue
+                
+                # Find the last token position to add length reward
                 resp_mask = (responses[idx] != pad_token_id)
                 if resp_mask.any():
                     last_token_idx = resp_mask.sum().item() - 1
                     if last_token_idx >= 0 and last_token_idx < modified_reward.shape[1]:
                         modified_reward[idx, last_token_idx] += length_reward
                         length_rewards_sum += length_reward
-                        total_length_penalty_applied += 1
+                        total_applied += 1
+                        if is_correct:
+                            correct_applied += 1
+                        else:
+                            incorrect_applied += 1
             
             tool_call_count += len(uid_indices)
         
         # Log metrics
         if tool_call_count > 0:
             metrics["train/length_penalty/tool_call_count"] = tool_call_count
-            metrics["train/length_penalty/avg_length_reward"] = length_rewards_sum / max(total_length_penalty_applied, 1)
-            metrics["train/length_penalty/applied_count"] = total_length_penalty_applied
+            metrics["train/length_penalty/avg_length_reward"] = length_rewards_sum / max(total_applied, 1)
+            metrics["train/length_penalty/total_applied"] = total_applied
+            metrics["train/length_penalty/correct_applied"] = correct_applied
+            metrics["train/length_penalty/incorrect_applied"] = incorrect_applied
+            metrics["train/length_penalty/skipped_short"] = skipped_short
         
         return modified_reward
 

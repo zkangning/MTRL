@@ -62,10 +62,17 @@ rllm:
     multiplier: 1
   # Kimi K1.5 style length penalty for tool_call tasks
   # Reference: Kimi K1.5 Technical Report
+  #
+  # IMPORTANT: This penalty is ONLY applied to CORRECT answers to encourage
+  # shorter correct responses. Incorrect answers are NOT affected.
   length_penalty:
-    enable: True  # Set to True to enable length penalty
-    weight: 0.5    # Weight for length penalty (0-1)
-    warmup_steps: 100  # Number of steps before applying length penalty
+    enable: True           # Set to True to enable length penalty
+    weight: 0.1             # Weight for length penalty (recommended: 0.05-0.2)
+                            # Final length reward = λ * weight, where λ ∈ [-0.5, 0.5]
+                            # With weight=0.1, actual reward adjustment is [-0.05, +0.05]
+    warmup_steps: 0         # Number of steps before applying length penalty
+    min_response_length: 50 # Minimum response length (tokens) to receive length bonus
+                            # Responses shorter than this get no length bonus (prevents degenerate outputs)
 
 fireworks:
   deployment_id: null
