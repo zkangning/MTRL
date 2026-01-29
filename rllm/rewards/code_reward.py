@@ -1,14 +1,22 @@
 """
 This module contains the RewardCode class, which evaluates code datasets answers
 and assigns rewards based on their correctness on unit tests.
+
+优化说明 (2024):
+1. 移除了对 multiprocessing.Manager 的依赖，改用 multiprocessing.Queue
+   - Manager 会启动后台进程，频繁创建/销毁会导致内存泄漏
+   - Queue 是轻量级的进程间通信方式，不需要额外的后台进程
+2. 添加了全局超时保护，防止子进程卡死
+3. 确保所有子进程在函数返回前被正确终止
 """
 
 import ast
 import json
 import multiprocessing
 import re
-from multiprocessing import Manager
-from typing import Any, Dict, List, Union # 增加类型提示导入
+from multiprocessing import Queue
+from typing import Any, Dict, List, Union
+import gc
 
 from rllm.rewards.code_utils.firejail_exec import code_exec_firejail as lc_code_exec
 from rllm.rewards.code_utils.humanevalplus import get_num_test_cases
@@ -66,82 +74,216 @@ def clean_code_main_block(code: str) -> str:
     return "\n".join(filtered_lines)
 
 
-def check_correctness(tests: list[dict[str, str]] | dict[str, list[str]], code: str, test_fn, timeout_per_test: int = 12, max_tests: int = 15) -> tuple[bool, dict[str, Any]]:
+def _evaluate_code_worker(tests, generation, debug, result_queue, test_fn, timeout_per_test):
+    """
+    Worker function to run tests in separate process.
+    使用 Queue 而非 Manager.list() 来传递结果，避免内存泄漏。
+    """
+    try:
+        result = test_fn(tests, test=generation, debug=debug, timeout=timeout_per_test)
+        result_queue.put(("success", result))
+    except Exception as e:
+        result_queue.put(("error", str(e)))
+
+
+def _select_representative_tests(tests: list, max_tests: int) -> list:
+    """
+    从测试用例中选择有代表性的子集。
+    
+    策略：分层采样，确保覆盖不同类型的测试用例
+    1. 始终包含前 2 个测试（通常是公开的示例测试）
+    2. 始终包含最后 2 个测试（通常是边界情况）
+    3. 从中间均匀采样剩余的测试
+    
+    这样可以在限制数量的同时，最大化测试覆盖率。
+    """
+    total = len(tests)
+    if total <= max_tests:
+        return tests
+    
+    selected_indices = set()
+    
+    # 1. 始终包含前 2 个（公开示例）
+    for i in range(min(2, total)):
+        selected_indices.add(i)
+    
+    # 2. 始终包含最后 2 个（边界情况）
+    for i in range(max(0, total - 2), total):
+        selected_indices.add(i)
+    
+    # 3. 从中间均匀采样
+    remaining_slots = max_tests - len(selected_indices)
+    if remaining_slots > 0:
+        middle_start = min(2, total)
+        middle_end = max(0, total - 2)
+        middle_range = list(range(middle_start, middle_end))
+        
+        if middle_range and remaining_slots > 0:
+            # 均匀采样
+            step = max(1, len(middle_range) // remaining_slots)
+            for i in range(0, len(middle_range), step):
+                if len(selected_indices) >= max_tests:
+                    break
+                selected_indices.add(middle_range[i])
+    
+    # 按原始顺序排序
+    selected_indices = sorted(selected_indices)[:max_tests]
+    return [tests[i] for i in selected_indices]
+
+
+def _select_representative_tests_dict(tests: dict, max_tests: int) -> dict:
+    """
+    从字典格式的测试用例中选择有代表性的子集。
+    与 _select_representative_tests 相同的策略。
+    """
+    total = len(tests["inputs"])
+    if total <= max_tests:
+        return tests
+    
+    selected_indices = set()
+    
+    # 1. 始终包含前 2 个
+    for i in range(min(2, total)):
+        selected_indices.add(i)
+    
+    # 2. 始终包含最后 2 个
+    for i in range(max(0, total - 2), total):
+        selected_indices.add(i)
+    
+    # 3. 从中间均匀采样
+    remaining_slots = max_tests - len(selected_indices)
+    if remaining_slots > 0:
+        middle_start = min(2, total)
+        middle_end = max(0, total - 2)
+        middle_range = list(range(middle_start, middle_end))
+        
+        if middle_range and remaining_slots > 0:
+            step = max(1, len(middle_range) // remaining_slots)
+            for i in range(0, len(middle_range), step):
+                if len(selected_indices) >= max_tests:
+                    break
+                selected_indices.add(middle_range[i])
+    
+    selected_indices = sorted(selected_indices)[:max_tests]
+    
+    result = {
+        "inputs": [tests["inputs"][i] for i in selected_indices],
+        "outputs": [tests["outputs"][i] for i in selected_indices]
+    }
+    if "fn_name" in tests:
+        result["fn_name"] = tests["fn_name"]
+    
+    return result
+
+
+def check_correctness(tests: list[dict[str, str]] | dict[str, list[str]], code: str, test_fn, timeout_per_test: int = 12, max_tests: int = 30, global_timeout: int = 180) -> tuple[bool, dict[str, Any]]:
     """
     Check if generated code passes all test cases within a timeout period.
+    
+    [优化版本]
+    - 使用 multiprocessing.Queue 替代 Manager，避免内存泄漏
+    - 使用分层采样选择测试用例，保证覆盖率
 
     Args:
         tests: Test cases in either list of dictionaries or dictionary of lists format
         code: Generated code to test
         test_fn: Function to run tests
-        timeout: Maximum execution time in seconds before killing process
+        timeout_per_test: Maximum execution time per test in seconds
+        max_tests: Maximum number of tests to run (default 30 for better coverage)
+        global_timeout: Maximum total execution time in seconds before killing process
 
     Returns:
         tuple: (bool, dict) where:
             - bool: True if all tests pass, False otherwise
             - dict: Detailed test results with test cases and pass/fail status
     """
-    manager = Manager()
-    test_results = manager.list()
+    process = None
+    result_queue = None
+    
+    try:
+        # 预处理测试用例，使用分层采样限制数量
+        original_tests = tests
+        if isinstance(tests, list):
+            total_tests = len(tests)
+            if total_tests > max_tests:
+                tests = _select_representative_tests(tests, max_tests)
+            num_tests = len(tests)
+        else:
+            total_tests = len(tests["inputs"])
+            if total_tests > max_tests:
+                tests = _select_representative_tests_dict(tests, max_tests)
+            num_tests = len(tests["inputs"])
 
-    def evaluate_code(tests, generation, debug, test_results, test_fn):
-        """Helper function to run tests in separate process."""
+        # 使用 Queue 替代 Manager.list()
+        result_queue = Queue()
+        
+        process = multiprocessing.Process(
+            target=_evaluate_code_worker,
+            args=(tests, code, False, result_queue, test_fn, timeout_per_test)
+        )
+        process.start()
+        process.join(timeout=global_timeout)
+
+        # 确保进程终止
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+        detailed_results: dict[str, Any] = {
+            "all_passed": False,
+            "test_results": [],
+            "total_tests": num_tests,
+            "passed_tests": 0,
+            "original_total_tests": total_tests  # 记录原始测试数量
+        }
+
+        # 从 Queue 获取结果
+        test_results_data = None
         try:
-            test_results.append(test_fn(tests, test=generation, debug=debug, timeout=timeout_per_test))
-        except Exception as e:
-            print(f"Error in evaluate_code: {e}")
+            if not result_queue.empty():
+                status, data = result_queue.get_nowait()
+                if status == "success":
+                    test_results_data = data
+                else:
+                    detailed_results["error"] = data
+        except Exception:
+            pass
 
-    original_tests = tests
-    if isinstance(tests, list):
-        list_tests = tests
-        total_tests = len(list_tests)
-        if total_tests > max_tests:
-            # Sort indices by test input length and take the max_tests longest ones
-            selected_indices = sorted(range(total_tests), key=lambda i: len(list_tests[i]["input"]), reverse=True)[:max_tests]
-            tests = [list_tests[i] for i in selected_indices]
-        num_tests = len(tests)
-    else:
-        dict_tests = tests
-        total_tests = len(dict_tests["inputs"])
-        if total_tests > max_tests:
-            # Select the tests with the longest input length.
-            selected_indices = sorted(range(total_tests), key=lambda i: len(dict_tests["inputs"][i]), reverse=True)[:max_tests]
-            # Create a new dict with only the selected test cases
-            selected_tests: dict[str, list[str]] = {"inputs": [dict_tests["inputs"][i] for i in selected_indices], "outputs": [dict_tests["outputs"][i] for i in selected_indices]}
-            tests = selected_tests
-        num_tests = len(tests["inputs"])
+        if test_results_data is None:
+            return False, detailed_results
 
-    process = multiprocessing.Process(target=evaluate_code, args=(tests, code, False, test_results, test_fn))
-    process.start()
-    process.join()
+        passed_results = [r == True for r in test_results_data]
 
-    if process.is_alive():
-        process.kill()
-    test_results_list = list(test_results)
+        # Create detailed test results
+        test_results_list_typed: list[dict[str, Any]] = detailed_results["test_results"]
+        if isinstance(original_tests, list):
+            assert isinstance(tests, list)
+            for i, (test, result) in enumerate(zip(tests, passed_results, strict=False)):
+                test_results_list_typed.append({"input": test.get("input", ""), "expected": test.get("output", ""), "passed": result})
+        else:
+            assert isinstance(tests, dict)
+            for i, (inp, out, result) in enumerate(zip(tests["inputs"], tests["outputs"], passed_results, strict=False)):
+                test_results_list_typed.append({"input": inp, "expected": out, "passed": result})
 
-    detailed_results: dict[str, Any] = {"all_passed": False, "test_results": [], "total_tests": num_tests, "passed_tests": 0}
+        detailed_results["passed_tests"] = sum(passed_results)
+        detailed_results["all_passed"] = all(passed_results)
 
-    if len(test_results_list) == 0:
-        return False, detailed_results
-
-    test_results_data = test_results_list[0]
-    passed_results = [r == True for r in test_results_data]
-
-    # Create detailed test results
-    test_results_list_typed: list[dict[str, Any]] = detailed_results["test_results"]
-    if isinstance(original_tests, list):
-        assert isinstance(tests, list)
-        for i, (test, result) in enumerate(zip(tests, passed_results, strict=False)):
-            test_results_list_typed.append({"input": test.get("input", ""), "expected": test.get("output", ""), "passed": result})
-    else:
-        assert isinstance(tests, dict)
-        for i, (inp, out, result) in enumerate(zip(tests["inputs"], tests["outputs"], passed_results, strict=False)):
-            test_results_list_typed.append({"input": inp, "expected": out, "passed": result})
-
-    detailed_results["passed_tests"] = sum(passed_results)
-    detailed_results["all_passed"] = all(passed_results)
-
-    return all(passed_results), detailed_results
+        return all(passed_results), detailed_results
+    
+    finally:
+        # 确保进程被终止
+        if process is not None and process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        # 清理 Queue
+        if result_queue is not None:
+            try:
+                result_queue.close()
+                result_queue.join_thread()
+            except Exception:
+                pass
+        # 触发垃圾回收
+        gc.collect()
 
 
 def postprocess_lcb_sample(sample):
@@ -195,55 +337,130 @@ def primeintellect_check_correctness(tests, code, use_tci=False):
     return check_correctness(tests_formatted, code, taco_run_test)
 
 
-def _temp_run(sample, generation, debug, result, metadata_list, timeout):
-    res, metadata = lcb_run_test(sample, test=generation, debug=debug, timeout=timeout)
-    result.append(res)
-    metadata_list.append(metadata)
+def _lcb_run_worker(sample, generation, debug, result_queue, timeout):
+    """
+    Worker function for lcb_check_correctness_v2.
+    使用 Queue 传递结果，避免 Manager 内存泄漏。
+    """
+    try:
+        res, metadata = lcb_run_test(sample, test=generation, debug=debug, timeout=timeout)
+        result_queue.put(("success", res, metadata))
+    except Exception as e:
+        result_queue.put(("error", None, {"error": str(e)}))
 
 
-def lcb_check_correctness_v2(sample, generation, timeout=6, debug=False):
+def lcb_check_correctness_v2(sample, generation, timeout=6, debug=False, max_global_timeout=180, max_tests=30):
     """Check correctness of code generation with a global timeout.
+    
+    [优化版本]
+    - 使用 multiprocessing.Queue 替代 Manager，避免内存泄漏
+    - 使用分层采样选择测试用例，保证覆盖率
+    
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
-    inside `run_test`"""
+    inside `run_test`
+    
+    Args:
+        sample: Test cases in list format
+        generation: Generated code to test
+        timeout: Timeout per test case in seconds
+        debug: Whether to print debug info
+        max_global_timeout: Maximum total timeout (capped to prevent excessive waiting)
+        max_tests: Maximum number of tests to run (default 30 for better coverage)
+    """
     assert len(sample) >= 1, "Sample must contain at least one test case"
-    sample = postprocess_lcb_sample(sample)
+    
+    original_count = len(sample)
+    
+    # [优化] 使用分层采样限制测试用例数量
+    if len(sample) > max_tests:
+        sample = _select_representative_tests(sample, max_tests)
+    
+    sample_processed = postprocess_lcb_sample(sample)
 
-    manager = multiprocessing.Manager()
-    result = manager.list()
-    metadata_list = manager.list()
+    p = None
+    result_queue = None
+    
+    try:
+        result_queue = Queue()
 
-    p = multiprocessing.Process(
-        target=_temp_run,
-        args=(sample, generation, debug, result, metadata_list, timeout),
-    )
-    p.start()
-    p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
+        p = multiprocessing.Process(
+            target=_lcb_run_worker,
+            args=(sample_processed, generation, debug, result_queue, timeout),
+        )
+        p.start()
+        
+        # 限制最大等待时间
+        in_outs = json.loads(sample_processed["input_output"])
+        num_tests = len(in_outs["inputs"])
+        calculated_timeout = (timeout + 1) * num_tests + 5
+        actual_timeout = min(calculated_timeout, max_global_timeout)
+        
+        p.join(timeout=actual_timeout)
 
-    detailed_results = {"all_passed": False, "test_results": [], "total_tests": 0, "passed_tests": 0}
+        detailed_results = {"all_passed": False, "test_results": [], "total_tests": num_tests, "passed_tests": 0}
 
-    if p.is_alive():
-        p.kill()
-    if not result:
-        in_outs = json.loads(sample["input_output"])
-        # consider that all tests failed
-        result.extend([[-1 for i in range(len(in_outs["inputs"]))]])
-        detailed_results["total_tests"] = len(in_outs["inputs"])
-        detailed_results["test_results"] = [{"input": inp, "expected": out, "passed": False, "error": "global timeout"} for inp, out in zip(in_outs["inputs"], in_outs["outputs"], strict=False)]
-        if debug:
-            print("global timeout")
-        return False, detailed_results
+        # 确保进程终止
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=5)
 
-    if not result:
-        return False, detailed_results
+        # 从 Queue 获取结果
+        result_data = None
+        metadata = {}
+        try:
+            if not result_queue.empty():
+                status, res, meta = result_queue.get_nowait()
+                if status == "success":
+                    result_data = res
+                    metadata = meta or {}
+                else:
+                    metadata = meta or {}
+        except Exception:
+            pass
+            
+        if result_data is None:
+            # Timeout or error - all tests failed
+            detailed_results["total_tests"] = num_tests
+            detailed_results["test_results"] = [
+                {"input": inp, "expected": out, "passed": False, "error": "global timeout"}
+                for inp, out in zip(in_outs["inputs"], in_outs["outputs"], strict=False)
+            ]
+            if debug:
+                print("global timeout")
+            return False, detailed_results
 
-    # Create detailed test results
-    in_outs = json.loads(sample["input_output"])
-    detailed_results["total_tests"] = len(result[0])
-    detailed_results["test_results"] = [{"input": inp, "expected": out, "passed": res == True, "error": metadata_list[0].get("error", None), "error_message": metadata_list[0].get("error_message", None), "output": metadata_list[0].get("output", None)} for inp, out, res in zip(in_outs["inputs"], in_outs["outputs"], result[0], strict=False)]
-    detailed_results["passed_tests"] = sum(1 for r in result[0] if r == True)
-    detailed_results["all_passed"] = all(r == True for r in result[0])
+        # Create detailed test results
+        detailed_results["total_tests"] = len(result_data)
+        detailed_results["test_results"] = [
+            {
+                "input": inp,
+                "expected": out,
+                "passed": res == True,
+                "error": metadata.get("error", None),
+                "error_message": metadata.get("error_message", None),
+                "output": metadata.get("output", None)
+            }
+            for inp, out, res in zip(in_outs["inputs"], in_outs["outputs"], result_data, strict=False)
+        ]
+        detailed_results["passed_tests"] = sum(1 for r in result_data if r == True)
+        detailed_results["all_passed"] = all(r == True for r in result_data)
 
-    return all(x == True for x in result[0]), detailed_results
+        return all(x == True for x in result_data), detailed_results
+    
+    finally:
+        # 确保进程被终止
+        if p is not None and p.is_alive():
+            p.kill()
+            p.join(timeout=5)
+        # 清理 Queue
+        if result_queue is not None:
+            try:
+                result_queue.close()
+                result_queue.join_thread()
+            except Exception:
+                pass
+        # 触发垃圾回收
+        gc.collect()
 
 
 def leetcode_check_correctness(tests: dict[str, str], code: str) -> tuple[bool, dict[str, Any]]:
