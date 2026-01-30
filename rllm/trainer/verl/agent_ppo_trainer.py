@@ -265,15 +265,17 @@ class AgentPPOTrainer(RayPPOTrainer):
                 normalized_len = (resp_len - min_len) / (max_len - min_len)
                 lambda_val = 0.5 - normalized_len
                 
-                # Apply Kimi K1.5 formula
+                # Apply modified Kimi K1.5 formula
+                # Key insight: Length penalty should ONLY differentiate among CORRECT answers
+                # Incorrect answers should NOT be affected by length to avoid reward hacking
                 if is_correct:
                     # Correct answers: use λ directly
                     # Short correct → positive reward, Long correct → negative reward
                     length_reward = lambda_val
                 else:
-                    # Incorrect answers: min(0, λ)
-                    # Short incorrect → 0 (no reward), Long incorrect → negative (penalize)
-                    length_reward = min(0.0, lambda_val)
+                    # Incorrect answers: NO length reward/penalty
+                    # This prevents the model from learning "short wrong is better than long wrong"
+                    length_reward = 0.0
                 
                 # Apply weight
                 length_reward *= length_penalty_weight

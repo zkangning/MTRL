@@ -115,16 +115,18 @@ def compute_length_reward_kimi(
     max_len: int
 ) -> float:
     """
-    Compute length reward following Kimi K1.5's approach.
+    Compute length reward following modified Kimi K1.5's approach.
     
     Formula:
         λ = 0.5 - (len(i) - min_len) / (max_len - min_len)
         
         If correct (r=1): len_reward = λ
-        If incorrect (r=0): len_reward = min(0, λ)
+        If incorrect (r=0): len_reward = 0  # No length penalty for incorrect answers
     
-    This promotes shorter responses among correct ones,
-    and explicitly penalizes long responses with incorrect answers.
+    Key insight: Length penalty should ONLY differentiate among CORRECT answers.
+    Applying length penalty to incorrect answers causes reward hacking where
+    the model learns "short wrong is better than long wrong", leading to
+    degenerate short outputs.
     
     Args:
         response_len: Length of the current response
@@ -133,7 +135,7 @@ def compute_length_reward_kimi(
         max_len: Maximum length among all sampled responses for this problem
         
     Returns:
-        Length reward value in range [-0.5, 0.5]
+        Length reward value in range [-0.5, 0.5] for correct, 0 for incorrect
     """
     # If all responses have the same length, no length reward
     if max_len == min_len:
@@ -149,6 +151,6 @@ def compute_length_reward_kimi(
         # Shorter responses get positive reward, longer get negative
         return lambda_val
     else:
-        # For incorrect answers: only penalize if λ < 0 (i.e., longer responses)
-        # Shorter incorrect responses don't get extra penalty
-        return min(0.0, lambda_val)
+        # For incorrect answers: NO length reward/penalty
+        # This prevents reward hacking where model learns to output short wrong answers
+        return 0.0
