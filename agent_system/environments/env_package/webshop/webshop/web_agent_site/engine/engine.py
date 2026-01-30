@@ -193,6 +193,16 @@ def generate_product_prices(all_products):
 
 
 def init_search_engine(num_products=None):
+    """
+    初始化搜索引擎
+    
+    支持通过环境变量 WEBSHOP_INDEX_DIR 自定义索引目录路径。
+    如果未设置，则使用默认的相对路径 ../search_engine/{indexes}
+    
+    环境变量:
+        WEBSHOP_INDEX_DIR: 索引目录的基础路径
+                          例如: /path/to/rllm/data/datasets/webshop/search_engine
+    """
     if num_products == 100:
         indexes = 'indexes_100'
     elif num_products == 1000:
@@ -203,7 +213,15 @@ def init_search_engine(num_products=None):
         indexes = 'indexes'
     else:
         raise NotImplementedError(f'num_products being {num_products} is not supported yet.')
-    search_engine = LuceneSearcher(os.path.join(BASE_DIR, f'../search_engine/{indexes}'))
+    
+    # 支持通过环境变量自定义索引路径
+    custom_index_dir = os.environ.get('WEBSHOP_INDEX_DIR', None)
+    if custom_index_dir and os.path.exists(custom_index_dir):
+        index_path = os.path.join(custom_index_dir, indexes)
+    else:
+        index_path = os.path.join(BASE_DIR, f'../search_engine/{indexes}')
+    
+    search_engine = LuceneSearcher(index_path)
     return search_engine
 
 
