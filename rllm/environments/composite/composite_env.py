@@ -8,6 +8,8 @@ from rllm.environments.tools.tool_env import ToolEnvironment
 from rllm.environments.tools.mcp_env import MCPEnvironment
 # [新增] 引入 ToolCallEnvironment
 from rllm.environments.tools.toolcall_env import ToolCallEnvironment
+# [新增] 引入 WebshopEnvironment
+from rllm.environments.webshop.webshop_env import WebshopEnvironment
 
 # 确保 Logger 级别为 INFO，否则看不到 Log
 logging.basicConfig(level=logging.INFO)
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class CompositeEnvironment(BaseEnv):
     """
-    多任务组合环境: BFCL + Math + Code + Search + ToolCall + LocalSearch
+    多任务组合环境: BFCL + Math + Code + Search + ToolCall + LocalSearch + Webshop
     充当数据适配器，负责将 Dataset 中的扁平化数据解包为各子环境所需的原始格式。
     """
     
@@ -27,6 +29,7 @@ class CompositeEnvironment(BaseEnv):
         search_args: Dict[str, Any] = {},
         tool_call_args: Dict[str, Any] = {},
         local_search_args: Dict[str, Any] = {},  # [新增] Local Search 参数
+        webshop_args: Dict[str, Any] = {},  # [新增] Webshop 参数
         task: Dict[str, Any] = None
     ):
         self.task = task or {}
@@ -77,6 +80,15 @@ class CompositeEnvironment(BaseEnv):
             self.local_search_env = ToolEnvironment(reward_fn=r_fn, **ls_args)
         else:
             self.local_search_env = None
+
+        # --- 7. Webshop Environment [新增] ---
+        if "reward_fn" in webshop_args:
+            r_fn = webshop_args["reward_fn"]
+            ws_args = webshop_args.copy()
+            ws_args.pop("reward_fn", None)
+            self.webshop_env = WebshopEnvironment(reward_fn=r_fn, **ws_args)
+        else:
+            self.webshop_env = None
         
         self.active_env = None
         self.active_task_type = None
@@ -167,6 +179,14 @@ class CompositeEnvironment(BaseEnv):
             self.active_env.task = current_task
             obs, info = self.active_env.reset()
 
+        # [新增] Webshop 路由
+        elif self.active_task_type == "webshop":
+            if not self.webshop_env:
+                raise RuntimeError("Webshop Environment not initialized via webshop_args")
+            self.active_env = self.webshop_env
+            self.active_env.task = current_task
+            obs, info = self.active_env.reset(task=current_task)
+
         else:
             logger.warning(f"Unknown task_type: {self.active_task_type}, falling back to Math")
             self.active_env = self.math_env
@@ -185,7 +205,7 @@ class CompositeEnvironment(BaseEnv):
 
     def close(self):
         # 关闭所有子环境
-        for env in [self.bfcl_env, self.math_env, self.code_env, self.search_env, self.tool_call_env, self.local_search_env]:
+        for env in [self.bfcl_env, self.math_env, self.code_env, self.search_env, self.tool_call_env, self.local_search_env, self.webshop_env]:
             if env and hasattr(env, 'close'):
                 env.close()
 
@@ -197,6 +217,7 @@ class CompositeEnvironment(BaseEnv):
             code_args=env_args.get("code_args", {}),
             search_args=env_args.get("search_args", {}),
             tool_call_args=env_args.get("tool_call_args", {}),
-            local_search_args=env_args.get("local_search_args", {}),  # [新增]
+            local_search_args=env_args.get("local_search_args", {}),
+            webshop_args=env_args.get("webshop_args", {}),  # [新增]
             task=env_args
         )

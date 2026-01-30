@@ -1,14 +1,16 @@
 from typing import Any, Dict, List
 from rllm.agents.agent import Action, BaseAgent, Trajectory
 
-# 引入四种具体的 Agent
+# 引入具体的 Agent
 from rllm.agents.bfcl_agent import BFCLReadyAgent
 from rllm.agents.code_agent import CompetitionCodingAgent
 from rllm.agents.tool_agent import ToolAgent, MCPToolAgent, ToolCallAgent
+# [新增] 引入 WebshopAgent
+from rllm.agents.webshop_agent import WebshopAgent
 
 class CompositeAgent(BaseAgent):
     """
-    六合一 Agent: 动态路由到 BFCL, Math, Code, Search, ToolCall, 或 LocalSearch Agent
+    七合一 Agent: 动态路由到 BFCL, Math, Code, Search, ToolCall, LocalSearch, 或 Webshop Agent
     """
 
     def __init__(
@@ -18,7 +20,8 @@ class CompositeAgent(BaseAgent):
         code_agent_args: Dict = {},
         search_agent_args: Dict = {},
         tool_call_agent_args: Dict = {},
-        local_search_agent_args: Dict = {}  # [新增] Local Search Agent 参数
+        local_search_agent_args: Dict = {},  # [新增] Local Search Agent 参数
+        webshop_agent_args: Dict = {}  # [新增] Webshop Agent 参数
     ):
         # 1. 初始化子 Agent
         self.bfcl_agent = BFCLReadyAgent(**bfcl_agent_args)
@@ -28,6 +31,8 @@ class CompositeAgent(BaseAgent):
         self.tool_call_agent = ToolCallAgent(**tool_call_agent_args)
         # [新增] 初始化 Local Search Agent (使用 ToolAgent，与 Math 类似)
         self.local_search_agent = ToolAgent(**local_search_agent_args)
+        # [新增] 初始化 Webshop Agent
+        self.webshop_agent = WebshopAgent(**webshop_agent_args)
         
         # 2. 状态管理
         self.active_agent = self.math_agent # 默认值
@@ -56,6 +61,9 @@ class CompositeAgent(BaseAgent):
                 # [新增] 路由到 Local Search Agent
                 elif task_type == "local_search":
                     self.active_agent = self.local_search_agent
+                # [新增] 路由到 Webshop Agent
+                elif task_type == "webshop":
+                    self.active_agent = self.webshop_agent
         
         # 将感知数据转发给当前激活的 Agent
         self.active_agent.update_from_env(observation, reward, done, info, **kwargs)
@@ -69,7 +77,8 @@ class CompositeAgent(BaseAgent):
         self.code_agent.reset()
         self.search_agent.reset()
         self.tool_call_agent.reset()
-        self.local_search_agent.reset()  # [新增]
+        self.local_search_agent.reset()
+        self.webshop_agent.reset()  # [新增]
 
     @property
     def chat_completions(self) -> List[Dict[str, str]]:

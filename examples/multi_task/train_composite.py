@@ -15,7 +15,7 @@ from datasets import load_dataset
 from rllm.data.dataset import DatasetRegistry
 from rllm.trainer.agent_trainer import AgentTrainer
 # 引入所有任务的 Reward Function
-from rllm.rewards.reward_fn import math_reward_fn, code_reward_fn, search_reward_fn, tool_call_reward_fn
+from rllm.rewards.reward_fn import math_reward_fn, code_reward_fn, search_reward_fn, tool_call_reward_fn, webshop_reward_fn
 from rllm.agents.composite_agent import CompositeAgent
 from rllm.environments.composite.composite_env import CompositeEnvironment
 
@@ -30,11 +30,13 @@ from rllm.data.utils import (
     load_search_data,
     load_local_search_data,  # [新增] Local Search 数据加载
     load_tool_call_dataset,
-    load_tool_call_json_dataset
+    load_tool_call_json_dataset,
+    load_webshop_data,  # [新增] Webshop 数据加载
 )
 
 # 引入 System Prompts
 from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT, LOCAL_SEARCH_SYSTEM_PROMPT
+from rllm.agents.webshop_agent import WEBSHOP_SYSTEM_PROMPT  # [新增] Webshop System Prompt
 
 
 # 引入 MCP 组件 (用于 Search/Browsing)
@@ -109,9 +111,10 @@ def prepare_composite_dataset(
     search_num: int,
     tool_call_num: int,
     tool_call_data_path: str,
-    local_search_num: int = 0  # [新增] Local Search 数量参数
+    local_search_num: int = 0,  # [新增] Local Search 数量参数
+    webshop_num: int = 0  # [新增] Webshop 数量参数
 ):
-    logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search + LocalSearch)...")
+    logger.info(">>> Start preparing Composite Dataset (BFCL + Math + Code + Search + LocalSearch + Webshop)...")
     logger.info(f">>> Using Random Seed: {GLOBAL_SEED}")
     
     # 1. BFCL
@@ -160,9 +163,16 @@ def prepare_composite_dataset(
     else:
         local_search_train, local_search_test = [], []
 
+    # 7. Webshop [新增]
+    if webshop_num > 0:
+        webshop_train = load_webshop_data("train", webshop_num)
+        webshop_test = load_webshop_data("test", 100)  # 测试集数量可配置化
+    else:
+        webshop_train, webshop_test = [], []
+
     # 混合
-    mixed_train = bfcl_train + math_train + code_train + search_train + tc_train + local_search_train
-    mixed_test = bfcl_test + math_test + code_test + search_test + tc_test + local_search_test
+    mixed_train = bfcl_train + math_train + code_train + search_train + tc_train + local_search_train + webshop_train
+    mixed_test = bfcl_test + math_test + code_test + search_test + tc_test + local_search_test + webshop_test
     
     if not mixed_train:
         logger.error("No training data found! Please check data configuration.")
@@ -172,8 +182,8 @@ def prepare_composite_dataset(
     
     # 统计日志
     logger.info(f"Prepared Data Details:")
-    logger.info(f"  Train: BFCL={len(bfcl_train)}, Math={len(math_train)}, Code={len(code_train)}, Search={len(search_train)}, Tool_Call={len(tc_train)}, Local_Search={len(local_search_train)} | Total={len(mixed_train)}")
-    logger.info(f"  Test : BFCL={len(bfcl_test)}, Math={len(math_test)}, Code={len(code_test)}, Search={len(search_test)}, Tool_Call={len(tc_test)}, Local_Search={len(local_search_test)} | Total={len(mixed_test)}")
+    logger.info(f"  Train: BFCL={len(bfcl_train)}, Math={len(math_train)}, Code={len(code_train)}, Search={len(search_train)}, Tool_Call={len(tc_train)}, Local_Search={len(local_search_train)}, Webshop={len(webshop_train)} | Total={len(mixed_train)}")
+    logger.info(f"  Test : BFCL={len(bfcl_test)}, Math={len(math_test)}, Code={len(code_test)}, Search={len(search_test)}, Tool_Call={len(tc_test)}, Local_Search={len(local_search_test)}, Webshop={len(webshop_test)} | Total={len(mixed_test)}")
     
     # 注册数据集
     DatasetRegistry.register_dataset(dataset_name, mixed_train, split="train")
@@ -197,6 +207,8 @@ def main(config):
     tool_call_num = config.data.get("tool_call_num", 0)
     tool_call_data_path = config.data.get("tool_call_data_path", "./data/toolace")
     local_search_num = config.data.get("local_search_num", 0)  # [新增] Local Search 数量
+    webshop_num = config.data.get("webshop_num", 0)  # [新增] Webshop 数量
+    webshop_path = config.data.get("webshop_path", None)  # [新增] Webshop 环境路径
 
     # --- Search / MCP 环境配置 ---
     mcp_tool_map = {}
@@ -268,7 +280,8 @@ def main(config):
         search_num,
         tool_call_num,
         tool_call_data_path,
-        local_search_num  # [新增]
+        local_search_num,
+        webshop_num  # [新增]
     )
     
     train_dataset = DatasetRegistry.load_dataset(dataset_name, "train")
@@ -304,6 +317,13 @@ def main(config):
             "tool_map": local_search_tool_map,
             "reward_fn": search_reward_fn,  # 复用 search_reward_fn
             "max_steps": config.rllm.agent.get("max_steps", 20),
+        },
+        # [新增] Webshop 环境参数
+        "webshop_args": {
+            "reward_fn": webshop_reward_fn,
+            "max_steps": config.rllm.agent.get("max_steps", 15),
+            "webshop_path": webshop_path,
+            "observation_mode": "text",
         }
     }
 
@@ -334,6 +354,10 @@ def main(config):
             "parser_name": "qwen",
             "system_prompt": LOCAL_SEARCH_SYSTEM_PROMPT,
             "tool_map": local_search_tool_map
+        },
+        # [新增] Webshop Agent 参数
+        "webshop_agent_args": {
+            "system_prompt": WEBSHOP_SYSTEM_PROMPT,
         }
     }
 

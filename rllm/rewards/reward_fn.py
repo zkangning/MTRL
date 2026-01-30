@@ -6,6 +6,7 @@ from rllm.rewards.math_reward import RewardMathFn
 from rllm.rewards.reward_types import RewardConfig, RewardInput, RewardOutput
 from rllm.rewards.search_reward import RewardSearchFn
 from rllm.rewards.toolcall_reward import ToolCallRewardFn
+from rllm.rewards.webshop_reward import RewardWebshopFn, WebshopRewardConfig  # [新增]
 
 
 @runtime_checkable
@@ -104,6 +105,24 @@ def tool_call_reward_fn(task_info: dict, action: str) -> RewardOutput:
     # 确保兼容性，如果 task_info 中包含 'task' 键，则展开
     reward_config = RewardConfig()
     reward_fn = ToolCallRewardFn(reward_config)
+    if isinstance(action, Action):
+        action = action.action
+    return reward_fn(task_info, action)
+
+
+def webshop_reward_fn(task_info: dict, action: str) -> RewardOutput:
+    """
+    A reward function for Webshop shopping tasks that implements the RewardFunction protocol.
+
+    Args:
+        task_info: The task dictionary containing done, won, task_score and other metadata
+        action: The agent's response/action
+
+    Returns:
+        RewardOutput: The calculated reward value based on shopping task completion
+    """
+    reward_config = WebshopRewardConfig()
+    reward_fn = RewardWebshopFn(reward_config)
     if isinstance(action, Action):
         action = action.action
     return reward_fn(task_info, action)

@@ -849,6 +849,100 @@ def load_tool_call_json_dataset(data_dir: str, split: str = "train", num_samples
         traceback.print_exc()
         return []
 
+
+def load_webshop_data(split: str, num_samples: int) -> List[Dict]:
+    """
+    加载 Webshop 数据 (用于 Webshop 购物任务)
+    
+    【重要说明】
+    Webshop 任务的数据与其他任务不同：
+    1. 产品数据和目标指令存储在 webshop 环境的 data/ 目录下
+    2. 目标(goals)是在环境初始化时从产品数据动态生成的
+    3. 这里只需要生成 goal_idx 索引，实际的 instruction 会在环境 reset 时获取
+    
+    【数据来源】
+    原始数据需要通过 webshop 的 setup.sh 脚本下载：
+    - items_shuffle.json: 产品信息 (118万个产品)
+    - items_ins_v2.json: 产品属性
+    - items_human_ins.json: 人工标注的购物指令 (12,087条)
+    
+    【数据划分】
+    - 测试集: goal_idx 范围 [0, 500) - 500 个目标
+    - 训练集: goal_idx 范围 [500, total_goals) - 约 11,500+ 个目标
+    
+    【奖励范围】
+    环境返回的 task_score 在 [0.0, 1.0] 范围内，与其他任务一致。
+    
+    Args:
+        split: 数据集划分 ("train" 或 "test")
+        num_samples: 需要的样本数量
+        
+    Returns:
+        List[Dict]: 标准化的数据样本列表，包含 goal_idx 用于环境 reset
+    """
+    if num_samples <= 0:
+        return []
+    
+    logger.info(f"Generating Webshop task indices ({split}, num={num_samples})...")
+    
+    try:
+        # Webshop 的目标索引范围（与原始 webshop 环境保持一致）
+        # 参考: agent_system/environments/env_package/webshop/envs.py
+        if split == "test":
+            goal_idx_start = 0
+            goal_idx_end = 500
+        else:  # train
+            goal_idx_start = 500
+            # 人工标注的目标约有 12,087 个
+            # 实际可用数量取决于 webshop 环境加载的数据
+            goal_idx_end = 12087
+        
+        # 生成可用的 goal 索引列表
+        available_indices = list(range(goal_idx_start, goal_idx_end))
+        
+        # 如果请求的数量超过可用数量
+        if num_samples > len(available_indices):
+            logger.warning(
+                f"Requested {num_samples} samples but only {len(available_indices)} "
+                f"available for {split}. Using all available."
+            )
+            selected_indices = available_indices
+        else:
+            # 随机选择指定数量的索引（使用全局种子保证可重复性）
+            random.shuffle(available_indices)
+            selected_indices = available_indices[:num_samples]
+        
+        processed_data = []
+        for goal_idx in selected_indices:
+            # 构建任务数据
+            # goal_idx 会在 WebshopEnvironment.reset() 时传递给底层环境
+            d = {
+                "goal_idx": goal_idx,
+                "session_idx": goal_idx,  # 兼容字段
+                "task_type": "webshop",
+                "sub_source": "webshop",
+            }
+            
+            # 使用标准化函数创建样本
+            # prompt 是占位符，实际的购物指令会在环境 reset 时从 webshop 获取
+            clean_d = create_standard_sample(
+                prompt=f"[Webshop Task #{goal_idx}]",
+                response="",  # 购物任务没有预定义的 response
+                task_type="webshop",
+                raw_data=d
+            )
+            processed_data.append(clean_d)
+        
+        logger.info(f"Generated {len(processed_data)} Webshop task indices for {split}.")
+        return processed_data
+        
+    except Exception as e:
+        logger.error(f"Failed to generate Webshop data: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
