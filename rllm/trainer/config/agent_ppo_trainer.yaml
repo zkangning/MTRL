@@ -79,7 +79,7 @@ rllm:
                             # Final length reward = λ * weight, where λ ∈ [-0.5, 0.5]
                             # With weight=0.1, actual reward adjustment is [-0.05, +0.05]
     warmup_steps: 0         # Number of steps before applying length penalty (0 = apply from start)
-    min_response_length: 200 # Minimum response length (tokens) to receive length bonus
+    min_response_length: 1024 # Minimum response length (tokens) to receive length bonus
                             # Responses shorter than this get no length bonus (prevents degenerate outputs)
 
 fireworks:
