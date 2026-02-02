@@ -56,6 +56,19 @@ class WebAgentTextEnv(gym.Env):
         show_attrs
         """
         super(WebAgentTextEnv, self).__init__()
+        
+        # Define action_space and observation_space for gym compatibility
+        # Since this is a text-based environment, we use a simple Text space
+        # or a placeholder that satisfies gym's requirements
+        try:
+            # gym >= 0.25.0 has Text space
+            self.action_space = gym.spaces.Text(max_length=1024)
+            self.observation_space = gym.spaces.Text(max_length=65536)
+        except AttributeError:
+            # Fallback for older gym versions - use Discrete as placeholder
+            self.action_space = gym.spaces.Discrete(1)
+            self.observation_space = gym.spaces.Discrete(1)
+        
         self.observation_mode = observation_mode
         self.kwargs = kwargs
 
