@@ -39,11 +39,20 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     """
     Parse the action from model response.
     Expected format: <think>...</think><action>...</action>
+    Also supports direct search[...] or click[...] format.
     
     Returns:
         Tuple of (action_string, is_valid)
     """
     response_lower = response.lower()
+    
+    # Check for <think>...</think> tags
+    think_start = response_lower.find("<think>")
+    think_end = response_lower.find("</think>")
+    has_think = think_start != -1 and think_end != -1
+    
+    # Check for Chinese characters (invalid)
+    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', response))
     
     # Try to extract action from <action>...</action> tags
     start_tag = "<action>"
@@ -53,20 +62,25 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
         action = response[start_idx + len(start_tag):end_idx].strip()
-        
-        # Check for <think>...</think> tags
-        think_start = response_lower.find("<think>")
-        think_end = response_lower.find("</think>")
-        has_think = think_start != -1 and think_end != -1
-        
-        # Check for Chinese characters (invalid)
-        has_chinese = bool(re.search(r'[\u4e00-\u9fff]', response))
-        
         is_valid = has_think and not has_chinese
         return action, is_valid
     
-    # Fallback: return last 50 chars as action (invalid format)
-    return response[-50:] if len(response) > 50 else response, False
+    # Fallback: try to find search[...] or click[...] patterns directly
+    # This handles cases where model outputs action without <action> tags
+    search_match = re.search(r'search\[([^\]]+)\]', response, re.IGNORECASE)
+    if search_match:
+        action = f"search[{search_match.group(1)}]"
+        is_valid = has_think and not has_chinese
+        return action, is_valid
+    
+    click_match = re.search(r'click\[([^\]]+)\]', response, re.IGNORECASE)
+    if click_match:
+        action = f"click[{click_match.group(1)}]"
+        is_valid = has_think and not has_chinese
+        return action, is_valid
+    
+    # Last resort: return the last part of response (invalid format)
+    return response[-100:] if len(response) > 100 else response, False
 
 
 class WebshopEnvironment(BaseEnv):
