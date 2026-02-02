@@ -263,8 +263,11 @@ class WebAgentTextEnv(gym.Env):
                 observation += processed_t + '\n'
             return observation
     
-    def reset(self, session=None, instruction_text=None):
-        """Create a new session and reset environment variables"""
+    def reset(self, session=None, instruction_text=None, **kwargs):
+        """Create a new session and reset environment variables
+        
+        Note: **kwargs added for gym >= 0.25.0 compatibility (seed, options parameters)
+        """
         session_int = None
         if session is not None:
             self.session = str(session)
@@ -283,7 +286,13 @@ class WebAgentTextEnv(gym.Env):
         obs = self.observation
         self.prev_obs = [obs]
         self.prev_actions = []
-        return obs, None
+        
+        # Return info as dict for gym >= 0.25.0 compatibility
+        info = {
+            'session': self.session,
+            'instruction_text': self.instruction_text,
+        }
+        return obs, info
 
     def render(self, mode='human'):
         pass
