@@ -319,14 +319,16 @@ class AgentPPOTrainer(RayPPOTrainer):
         """
         Apply simple length penalty to tool_call tasks using token length.
         
-        Formula:
+        Only applies penalty when response length exceeds baseline_len.
+        
+        Formula (when resp_len > baseline_len):
             penalty = coefficient * log(response_token_len / baseline_len)
             penalty = min(max_penalty, penalty)
             final_reward = base_reward - penalty
         
         Effect:
-            - Short responses (< baseline): penalty < 0, reward increases
-            - Long responses (> baseline): penalty > 0, reward decreases
+            - Responses <= baseline_len: No penalty applied
+            - Responses > baseline_len: penalty > 0, reward decreases
         
         Args:
             batch: DataProto containing batch data
@@ -347,7 +349,9 @@ class AgentPPOTrainer(RayPPOTrainer):
             return reward_tensor
         
         # Get config values
-        baseline_len = simple_penalty_config.get("baseline_len", 1024)
+        # baseline_len serves as both the baseline for penalty calculation AND the threshold
+        # No penalty is applied for responses shorter than baseline_len
+        baseline_len = simple_penalty_config.get("baseline_len", 2048)
         coefficient = simple_penalty_config.get("coefficient", 0.15)
         max_penalty = simple_penalty_config.get("max_penalty", 0.3)
         
@@ -384,6 +388,7 @@ class AgentPPOTrainer(RayPPOTrainer):
         
         # Track metrics
         total_applied = 0
+        skipped_short = 0
         penalty_sum = 0.0
         avg_response_len = 0.0
         
@@ -400,7 +405,13 @@ class AgentPPOTrainer(RayPPOTrainer):
             if resp_len <= 0:
                 continue
             
+            # Skip if response is shorter than or equal to baseline_len (no penalty needed)
+            if resp_len <= baseline_len:
+                skipped_short += 1
+                continue
+            
             # Compute penalty: penalty = coefficient * log(resp_len / baseline_len)
+            # Since resp_len > baseline_len, penalty is always positive
             penalty = coefficient * math.log(resp_len / baseline_len)
             penalty = min(max_penalty, penalty)
             
@@ -409,13 +420,14 @@ class AgentPPOTrainer(RayPPOTrainer):
             if resp_mask.any():
                 last_token_idx = resp_mask.sum().item() - 1
                 if last_token_idx >= 0 and last_token_idx < modified_reward.shape[1]:
-                    # Subtract penalty from reward (negative penalty = bonus for short responses)
+                    # Subtract penalty from reward
                     modified_reward[idx, last_token_idx] -= penalty
                     penalty_sum += penalty
                     avg_response_len += resp_len
                     total_applied += 1
         
         # Log metrics
+        metrics["train/simple_length_penalty/skipped_short"] = skipped_short
         if total_applied > 0:
             metrics["train/simple_length_penalty/count"] = total_applied
             metrics["train/simple_length_penalty/avg_penalty"] = penalty_sum / total_applied

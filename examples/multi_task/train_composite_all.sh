@@ -44,14 +44,14 @@ python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=128 \
     +data.math_num=0 \
-    +data.code_num=3200 \
+    +data.code_num=0 \
     +data.bfcl_num=0 \
     +data.search_num=0\
-    +data.tool_call_num=0 \
+    +data.tool_call_num=3200 \
     +data.local_search_num=0 \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m1_29_math0_code3k_tool0_search0_localsearch0 \
-    trainer.experiment_name='m1_29_math0_code3k_tool0_search0_localsearch0-8b-mixed-tasks' \
+    +data.dataset_name=m2_2_math0_code0_tool3k_search0_localsearch0 \
+    trainer.experiment_name='m2_2_math0_code0_tool3k_search0_localsearch0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=20480 \
@@ -108,7 +108,7 @@ python3 -m examples.multi_task.train_composite \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=25 \
-    trainer.test_freq=5 \
+    trainer.test_freq=25 \
     trainer.total_epochs=10 \
     \
     rllm.agent.max_steps=10 \
@@ -120,7 +120,7 @@ python3 -m examples.multi_task.train_composite \
     rllm.length_penalty.min_response_length=200 \
     \
     rllm.simple_length_penalty.enable=True \
-    rllm.simple_length_penalty.baseline_len=1024 \
-    rllm.simple_length_penalty.coefficient=0.15 \
-    rllm.simple_length_penalty.max_penalty=0.3 \
-    rllm.simple_length_penalty.warmup_steps=5
+    rllm.simple_length_penalty.baseline_len=2048 \
+    rllm.simple_length_penalty.coefficient=0.1 \
+    rllm.simple_length_penalty.max_penalty=0.2 \
+    rllm.simple_length_penalty.warmup_steps=25
