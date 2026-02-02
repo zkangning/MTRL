@@ -82,6 +82,17 @@ rllm:
     min_response_length: 1024 # Minimum response length (tokens) to receive length bonus
                             # Responses shorter than this get no length bonus (prevents degenerate outputs)
 
+  # Simple length penalty: penalizes responses longer than baseline_len
+  # Formula: penalty = coefficient * log(resp_len / baseline_len), capped at max_penalty
+  # Only applied when resp_len > baseline_len
+  simple_length_penalty:
+    enable: False           # Set to True to enable simple length penalty
+    baseline_len: 2048      # Threshold AND baseline for penalty calculation
+                            # Responses <= baseline_len receive no penalty
+    coefficient: 0.15       # Coefficient for log penalty (recommended: 0.1-0.2)
+    max_penalty: 0.3        # Maximum penalty cap (recommended: 0.2-0.5)
+    warmup_steps: 0         # Number of steps before applying penalty (0 = apply from start)
+
 fireworks:
   deployment_id: null
   model_id_prefix: test-model
