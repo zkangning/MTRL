@@ -114,7 +114,13 @@ python3 -m examples.multi_task.train_composite \
     rllm.agent.max_steps=10 \
     rllm.stepwise_advantage.enable=False \
     \
-    rllm.length_penalty.enable=True \
+    rllm.length_penalty.enable=False \
     rllm.length_penalty.weight=0.1 \
     rllm.length_penalty.warmup_steps=0 \
-    rllm.length_penalty.min_response_length=200
+    rllm.length_penalty.min_response_length=200 \
+    \
+    rllm.simple_length_penalty.enable=True \
+    rllm.simple_length_penalty.baseline_len=1024 \
+    rllm.simple_length_penalty.coefficient=0.15 \
+    rllm.simple_length_penalty.max_penalty=0.3 \
+    rllm.simple_length_penalty.warmup_steps=5

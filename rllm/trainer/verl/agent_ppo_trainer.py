@@ -310,6 +310,120 @@ class AgentPPOTrainer(RayPPOTrainer):
         
         return modified_reward
 
+    def _apply_simple_length_penalty(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        metrics: dict
+    ) -> torch.Tensor:
+        """
+        Apply simple length penalty to tool_call tasks using token length.
+        
+        Formula:
+            penalty = coefficient * log(response_token_len / baseline_len)
+            penalty = min(max_penalty, penalty)
+            final_reward = base_reward - penalty
+        
+        Effect:
+            - Short responses (< baseline): penalty < 0, reward increases
+            - Long responses (> baseline): penalty > 0, reward decreases
+        
+        Args:
+            batch: DataProto containing batch data
+            reward_tensor: Current token-level reward tensor (B, T)
+            metrics: Dict to log metrics
+            
+        Returns:
+            Modified reward_tensor with simple length penalty applied
+        """
+        # Check if simple length penalty is enabled
+        simple_penalty_config = self.config.rllm.get("simple_length_penalty", {})
+        if not simple_penalty_config.get("enable", False):
+            return reward_tensor
+        
+        # Get warmup steps (no penalty during warmup)
+        warmup_steps = simple_penalty_config.get("warmup_steps", 0)
+        if self.global_steps < warmup_steps:
+            return reward_tensor
+        
+        # Get config values
+        baseline_len = simple_penalty_config.get("baseline_len", 1024)
+        coefficient = simple_penalty_config.get("coefficient", 0.15)
+        max_penalty = simple_penalty_config.get("max_penalty", 0.3)
+        
+        # Get task types
+        task_types = None
+        if "data_source" in batch.non_tensor_batch:
+            task_types = batch.non_tensor_batch["data_source"]
+        elif "extra_info" in batch.non_tensor_batch:
+            task_types = []
+            for item in batch.non_tensor_batch["extra_info"]:
+                try:
+                    if isinstance(item, str):
+                        t = json.loads(item).get("task_type", "unknown")
+                    else:
+                        t = item.get("task_type", "unknown")
+                except:
+                    t = "unknown"
+                task_types.append(t)
+            task_types = np.array(task_types)
+        
+        if task_types is None:
+            return reward_tensor
+        
+        # Get response lengths in tokens (number of non-pad tokens)
+        responses = batch.batch.get("responses")
+        if responses is None:
+            return reward_tensor
+        
+        pad_token_id = self.tokenizer.pad_token_id
+        response_lengths = (responses != pad_token_id).sum(dim=1).cpu().numpy()
+        
+        # Create a copy of reward_tensor to modify
+        modified_reward = reward_tensor.clone()
+        
+        # Track metrics
+        total_applied = 0
+        penalty_sum = 0.0
+        avg_response_len = 0.0
+        
+        # Find tool_call samples
+        tool_call_mask = (task_types == "tool_call")
+        if not tool_call_mask.any():
+            return reward_tensor
+        
+        tool_call_indices = np.where(tool_call_mask)[0]
+        
+        for idx in tool_call_indices:
+            resp_len = response_lengths[idx]
+            
+            if resp_len <= 0:
+                continue
+            
+            # Compute penalty: penalty = coefficient * log(resp_len / baseline_len)
+            penalty = coefficient * math.log(resp_len / baseline_len)
+            penalty = min(max_penalty, penalty)
+            
+            # Find the last token position to subtract penalty
+            resp_mask = (responses[idx] != pad_token_id)
+            if resp_mask.any():
+                last_token_idx = resp_mask.sum().item() - 1
+                if last_token_idx >= 0 and last_token_idx < modified_reward.shape[1]:
+                    # Subtract penalty from reward (negative penalty = bonus for short responses)
+                    modified_reward[idx, last_token_idx] -= penalty
+                    penalty_sum += penalty
+                    avg_response_len += resp_len
+                    total_applied += 1
+        
+        # Log metrics
+        if total_applied > 0:
+            metrics["train/simple_length_penalty/count"] = total_applied
+            metrics["train/simple_length_penalty/avg_penalty"] = penalty_sum / total_applied
+            metrics["train/simple_length_penalty/avg_response_len"] = avg_response_len / total_applied
+            metrics["train/simple_length_penalty/baseline_len"] = baseline_len
+        
+        return modified_reward
+
     def _compute_multitask_metrics(self, batch: DataProto):
         """
         [完善版] 计算多任务细分指标，包括"模型更新贡献度分析"和子数据源统计。
@@ -559,8 +673,12 @@ class AgentPPOTrainer(RayPPOTrainer):
                         else:
                             reward_tensor = batch.batch["token_level_scores"]  # filled in by environment collected trajectory transformation
 
-                        # Apply Kimi K1.5 length penalty for tool_call tasks only
+                        # Apply Kimi K1.5 length penalty for tool_call tasks only (controlled by rllm.length_penalty.enable)
                         reward_tensor = self._apply_toolcall_length_penalty(batch, reward_tensor, metrics)
+                        
+                        # Apply simple length penalty for tool_call tasks (controlled by rllm.simple_length_penalty.enable)
+                        reward_tensor = self._apply_simple_length_penalty(batch, reward_tensor, metrics)
+                        
                         batch.batch["token_level_scores"] = reward_tensor
 
                         # Rejection sampling based on rewards

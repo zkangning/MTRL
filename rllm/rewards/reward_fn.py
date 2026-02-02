@@ -102,7 +102,20 @@ def code_reward_fn(task_info: dict, action: str) -> RewardOutput:
 
 # 包装函数，适配 Trainer 调用约定
 def tool_call_reward_fn(task_info: dict, action: str) -> RewardOutput:
-    # 确保兼容性，如果 task_info 中包含 'task' 键，则展开
+    """
+    A reward function for tool call tasks.
+    
+    Note: Length penalty is handled at trainer level (AgentPPOTrainer):
+    - Kimi K1.5 style: rllm.length_penalty.enable=True
+    - Simple length penalty: rllm.simple_length_penalty.enable=True
+    
+    Args:
+        task_info: The task dictionary containing ground_truth and other metadata
+        action: The agent's response
+    
+    Returns:
+        RewardOutput: The calculated reward value
+    """
     reward_config = RewardConfig()
     reward_fn = ToolCallRewardFn(reward_config)
     if isinstance(action, Action):

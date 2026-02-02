@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import logging
 from collections import Counter
@@ -12,12 +13,12 @@ logger = logging.getLogger(__name__)
 class ToolCallRewardFn:
     """
     Reward function for Tool Call tasks.
-    It extracts <tool_call> blocks, parses the JSON arguments, 
+    It extracts <tool_call> blocks, parses the JSON arguments,
     and compares them against the ground truth ignoring order.
     
-    Note: Kimi K1.5 style length penalty is applied at the trainer level
-    (in AgentPPOTrainer._apply_toolcall_length_penalty) to properly handle
-    batch-level min/max length computation across rollouts.
+    Note: Length penalty is applied at trainer level:
+    - Kimi K1.5 style: rllm.length_penalty.enable=True
+    - Simple length penalty: rllm.simple_length_penalty.enable=True
     """
 
     def __init__(self, config: RewardConfig = None):
@@ -87,12 +88,11 @@ class ToolCallRewardFn:
 
         # 3. 如果 GT 为空 (纯文本回复)，检查 Model 是否也为空
         if not gt_tools:
-            # 如果 GT 没有工具调用，而模型输出了工具调用 -> 0分
             if pred_tools:
+                # GT 没有工具调用，而模型输出了工具调用 -> 0分
                 return RewardOutput(reward=0.0, is_correct=False)
             else:
-                # 都是纯文本，此处简单处理为1.0，或者你可以加入文本相似度匹配
-                # 根据任务描述，重点是 Tool Call，这里假设 GT 为空时不需要 Call
+                # 都是纯文本，此处简单处理为1.0
                 return RewardOutput(reward=1.0, is_correct=True)
 
         # 4. 比较工具调用是否一致
@@ -154,3 +154,43 @@ def compute_length_reward_kimi(
         # For incorrect answers: NO length reward/penalty
         # This prevents reward hacking where model learns to output short wrong answers
         return 0.0
+
+
+def compute_simple_length_penalty(
+    response_len: int,
+    baseline_len: int = 1024,
+    coefficient: float = 0.15,
+    max_penalty: float = 0.3
+) -> float:
+    """
+    Compute simple length penalty based on log ratio.
+    
+    Formula:
+        penalty = coefficient * log(response_len / baseline_len)
+        penalty = min(max_penalty, penalty)
+    
+    This penalty should be SUBTRACTED from the reward:
+        final_reward = base_reward - penalty
+    
+    Effect:
+        - Short responses (< baseline): penalty < 0, so reward increases
+        - Long responses (> baseline): penalty > 0, so reward decreases
+    
+    Args:
+        response_len: Length of the response
+        baseline_len: Baseline length for comparison (default: 1024)
+        coefficient: Scaling coefficient (default: 0.15)
+        max_penalty: Maximum penalty value (default: 0.3)
+        
+    Returns:
+        Length penalty value (can be negative for short responses)
+    """
+    import math
+    
+    if response_len <= 0:
+        return 0.0
+    
+    penalty = coefficient * math.log(response_len / baseline_len)
+    penalty = min(max_penalty, penalty)
+    
+    return penalty
