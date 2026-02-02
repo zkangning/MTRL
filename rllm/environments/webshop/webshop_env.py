@@ -324,6 +324,11 @@ class WebshopEnvironment(BaseEnv):
     @staticmethod
     def from_dict(env_args: dict) -> "WebshopEnvironment":
         """Create environment from dictionary configuration."""
+        # 提取已知参数
+        known_keys = {"reward_fn", "max_steps", "observation_mode", "seed", "webshop_path", "task"}
+        # 其余参数作为 kwargs 传递给底层环境（如 num_products, file_path, attr_path 等）
+        extra_kwargs = {k: v for k, v in env_args.items() if k not in known_keys}
+        
         return WebshopEnvironment(
             reward_fn=env_args.get("reward_fn"),
             max_steps=env_args.get("max_steps", 15),
@@ -331,6 +336,7 @@ class WebshopEnvironment(BaseEnv):
             seed=env_args.get("seed", 42),
             webshop_path=env_args.get("webshop_path"),
             task=env_args.get("task"),
+            **extra_kwargs
         )
     
     @staticmethod

@@ -153,6 +153,9 @@ if __name__ == "__main__":
             "observation_mode": "text",
             "webshop_path": webshop_path,
             "reward_fn": webshop_reward_fn,
+            # 使用 1000 个商品的小数据集（需要先构建 indexes_1k）
+            # 如果使用完整数据集，设为 None
+            "num_products": 1000,
         }
     }
 
