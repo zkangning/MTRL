@@ -117,19 +117,18 @@ class WebAgentTextEnv(gym.Env):
           - click[value]
         If action not valid, perform nothing.
         """
-        info = None
         self.get_available_actions()
 
         # Determine action type (click, search) and argument
         action_name, action_arg = parse_action(action)
         if action_arg is not None:
             action_arg = action_arg.lower()
-        if (action_name == 'search' and 
-            action_arg is not None and 
+        if (action_name == 'search' and
+            action_arg is not None and
             action_arg != ''):
             status = self.browser.search(action_arg)
-        elif (action_name == 'click' and 
-              action_arg in self.text_to_clickable.keys() and 
+        elif (action_name == 'click' and
+              action_arg in self.text_to_clickable.keys() and
               action_arg != 'search'):
             status = self.browser.click(action_arg, self.text_to_clickable)
         else:
@@ -146,9 +145,20 @@ class WebAgentTextEnv(gym.Env):
                 text_list.append(self.prev_obs[-i])
         state = ' [SEP] '.join(text_list[::-1])
         self.prev_obs.append(ob)
-        if status['done']:
+        
+        done = status['done']
+        if done:
             self.reset()
-        return state, status['reward'], status['done'], info
+        
+        # Return info as dict for gym >= 0.25.0 compatibility
+        info = {
+            'reward': status['reward'],
+            'done': done,
+            'action': action,
+            'action_name': action_name,
+            'action_arg': action_arg,
+        }
+        return state, status['reward'], done, info
 
     def get_available_actions(self):
         """Returns list of available actions at the current step"""
