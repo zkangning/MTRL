@@ -174,6 +174,7 @@ if __name__ == "__main__":
         max_response_length=32768,
         max_prompt_length=32768,
         n_parallel_agents=n_parallel_agents,
+        max_steps=webshop_max_steps,  # 传递给 Engine，控制最大交互步数
     )
 
     # --- 4. 加载 Webshop 数据 ---
