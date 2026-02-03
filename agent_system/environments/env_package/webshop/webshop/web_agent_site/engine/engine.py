@@ -272,135 +272,187 @@ def clean_product_keys(products):
 
 
 def load_products(filepath, attrpath, num_products=None, human_goals=True):
-    # TODO: move to preprocessing step -> enforce single source of truth
+    """
+    加载产品数据并处理属性。
+    
+    性能优化版本：
+    1. 确保 attributes 和 human_attributes 是字典类型（O(1) 查找）
+    2. 移除重复的文件加载
+    3. 预编译正则表达式
+    4. 添加详细的进度日志
+    """
+    import time as _time
+    
+    # ========== 1. 加载产品 JSON ==========
+    _start = _time.time()
+    print(f'[load_products] Loading products from {filepath}...')
     with open(filepath) as f:
         products = json.load(f)
-    print('Products loaded.')
-    products = clean_product_keys(products)
+    print(f'[load_products] Products JSON loaded in {_time.time() - _start:.1f}s. Count: {len(products)}')
     
-    # with open(DEFAULT_REVIEW_PATH) as f:
-    #     reviews = json.load(f)
+    _start = _time.time()
+    products = clean_product_keys(products)
+    print(f'[load_products] Keys cleaned in {_time.time() - _start:.1f}s')
+    
     all_reviews = dict()
     all_ratings = dict()
-    # for r in reviews:
-    #     all_reviews[r['asin']] = r['reviews']
-    #     all_ratings[r['asin']] = r['average_rating']
 
-    if human_goals:
-        with open(HUMAN_ATTR_PATH) as f:
-            human_attributes = json.load(f)
+    # ========== 2. 加载 attributes ==========
+    _start = _time.time()
+    print(f'[load_products] Loading attributes from {attrpath}...')
     with open(attrpath) as f:
-        attributes = json.load(f)
+        attributes_raw = json.load(f)
+    
+    # 关键优化：确保 attributes 是字典类型，以实现 O(1) 查找
+    if isinstance(attributes_raw, list):
+        print(f'[load_products] WARNING: attributes is a list with {len(attributes_raw)} items. Converting to dict...')
+        attributes = {}
+        for item in attributes_raw:
+            if isinstance(item, dict) and 'asin' in item:
+                attributes[item['asin']] = item
+        print(f'[load_products] Converted to dict with {len(attributes)} entries')
+    else:
+        attributes = attributes_raw
+    print(f'[load_products] Attributes loaded in {_time.time() - _start:.1f}s. Type: {type(attributes).__name__}, Size: {len(attributes)}')
+    
+    # ========== 3. 加载 human_attributes（只加载一次！）==========
+    _start = _time.time()
+    print(f'[load_products] Loading human attributes from {HUMAN_ATTR_PATH}...')
     with open(HUMAN_ATTR_PATH) as f:
-        human_attributes = json.load(f)
-    print('Attributes loaded.')
+        human_attributes_raw = json.load(f)
+    
+    # 同样确保 human_attributes 是字典类型
+    if isinstance(human_attributes_raw, list):
+        print(f'[load_products] WARNING: human_attributes is a list. Converting to dict...')
+        human_attributes = {}
+        for item in human_attributes_raw:
+            if isinstance(item, dict) and 'asin' in item:
+                human_attributes[item['asin']] = item
+    else:
+        human_attributes = human_attributes_raw
+    print(f'[load_products] Human attributes loaded in {_time.time() - _start:.1f}s. Size: {len(human_attributes)}')
 
+    # ========== 4. 处理产品数据 ==========
     asins = set()
     all_products = []
     attribute_to_asins = defaultdict(set)
+    
     if num_products is not None:
-        # using item_shuffle.json, we assume products already shuffled
         products = products[:num_products]
-    for i, p in tqdm(enumerate(products), total=len(products)):
-        asin = p['asin']
-        if asin == 'nan' or len(asin) > 10:
+    
+    # 预编译正则表达式以提高性能
+    price_pattern = re.compile(r'[^\d.]')
+    
+    _start = _time.time()
+    print(f'[load_products] Processing {len(products)} products...')
+    
+    for i, p in tqdm(enumerate(products), total=len(products), desc="Processing products"):
+        asin = p.get('asin')
+        if not asin or asin == 'nan' or len(asin) > 10:
             continue
 
         if asin in asins:
             continue
-        else:
-            asins.add(asin)
+        asins.add(asin)
 
-        products[i]['category'] = p['category']
-        products[i]['query'] = p['query']
-        products[i]['product_category'] = p['product_category']
+        products[i]['category'] = p.get('category', '')
+        products[i]['query'] = p.get('query', '')
+        products[i]['product_category'] = p.get('product_category', '')
 
-        products[i]['Title'] = p['name']
-        products[i]['Description'] = p['full_description']
+        products[i]['Title'] = p.get('name', '')
+        products[i]['Description'] = p.get('full_description', '')
         products[i]['Reviews'] = all_reviews.get(asin, [])
         products[i]['Rating'] = all_ratings.get(asin, 'N.A.')
+        
         for r in products[i]['Reviews']:
             if 'score' not in r:
-                r['score'] = r.pop('stars')
+                r['score'] = r.pop('stars', 0)
             if 'review' not in r:
                 r['body'] = ''
             else:
-                r['body'] = r.pop('review')
-        products[i]['BulletPoints'] = p['small_description'] \
-            if isinstance(p['small_description'], list) else [p['small_description']]
+                r['body'] = r.pop('review', '')
+        
+        small_desc = p.get('small_description')
+        products[i]['BulletPoints'] = small_desc if isinstance(small_desc, list) else [small_desc or '']
 
+        # 价格处理（使用预编译的正则表达式）
         pricing = p.get('pricing')
         if pricing is None or not pricing:
             pricing = [100.0]
             price_tag = '$100.0'
         else:
-            pricing = [
-                float(Decimal(re.sub(r'[^\d.]', '', price)))
-                for price in pricing.split('$')[1:]
-            ]
-            if len(pricing) == 1:
-                price_tag = f"${pricing[0]}"
-            else:
-                price_tag = f"${pricing[0]} to ${pricing[1]}"
-                pricing = pricing[:2]
+            try:
+                pricing = [
+                    float(price_pattern.sub('', price) or '0')
+                    for price in pricing.split('$')[1:]
+                ]
+                if len(pricing) == 0:
+                    pricing = [100.0]
+                    price_tag = '$100.0'
+                elif len(pricing) == 1:
+                    price_tag = f"${pricing[0]}"
+                else:
+                    price_tag = f"${pricing[0]} to ${pricing[1]}"
+                    pricing = pricing[:2]
+            except (ValueError, AttributeError):
+                pricing = [100.0]
+                price_tag = '$100.0'
         products[i]['pricing'] = pricing
         products[i]['Price'] = price_tag
 
+        # 选项处理
         options = dict()
-        customization_options = p['customization_options']
+        customization_options = p.get('customization_options')
         option_to_image = dict()
         if customization_options:
             for option_name, option_contents in customization_options.items():
                 if option_contents is None:
                     continue
                 option_name = option_name.lower()
-
                 option_values = []
                 for option_content in option_contents:
-                    option_value = option_content['value'].strip().replace('/', ' | ').lower()
-                    option_image = option_content.get('image', None)
-
-                    option_values.append(option_value)
-                    option_to_image[option_value] = option_image
+                    if isinstance(option_content, dict):
+                        option_value = option_content.get('value', '').strip().replace('/', ' | ').lower()
+                        option_image = option_content.get('image', None)
+                        option_values.append(option_value)
+                        option_to_image[option_value] = option_image
                 options[option_name] = option_values
         products[i]['options'] = options
         products[i]['option_to_image'] = option_to_image
 
-        # without color, size, price, availability
-        # if asin in attributes and 'attributes' in attributes[asin]:
-        #     products[i]['Attributes'] = attributes[asin]['attributes']
-        # else:
-        #     products[i]['Attributes'] = ['DUMMY_ATTR']
-        # products[i]['instruction_text'] = \
-        #     attributes[asin].get('instruction', None)
-        # products[i]['instruction_attributes'] = \
-        #     attributes[asin].get('instruction_attributes', None)
-
-        # without color, size, price, availability
-        if asin in attributes and 'attributes' in attributes[asin]:
-            products[i]['Attributes'] = attributes[asin]['attributes']
+        # 属性处理（使用字典的 O(1) 查找）
+        attr_data = attributes.get(asin)
+        if attr_data and isinstance(attr_data, dict) and 'attributes' in attr_data:
+            products[i]['Attributes'] = attr_data['attributes']
         else:
             products[i]['Attributes'] = ['DUMMY_ATTR']
             
         if human_goals:
-            if asin in human_attributes:
-                products[i]['instructions'] = human_attributes[asin]
+            human_attr = human_attributes.get(asin)
+            if human_attr:
+                products[i]['instructions'] = human_attr
         else:
-            products[i]['instruction_text'] = \
-                attributes[asin].get('instruction', None)
+            if attr_data:
+                products[i]['instruction_text'] = attr_data.get('instruction', None)
+                products[i]['instruction_attributes'] = attr_data.get('instruction_attributes', None)
 
-            products[i]['instruction_attributes'] = \
-                attributes[asin].get('instruction_attributes', None)
-
-        products[i]['MainImage'] = p['images'][0]
-        products[i]['query'] = p['query'].lower().strip()
+        images = p.get('images', [])
+        products[i]['MainImage'] = images[0] if images else ''
+        products[i]['query'] = p.get('query', '').lower().strip()
 
         all_products.append(products[i])
 
+    print(f'[load_products] Products processed in {_time.time() - _start:.1f}s. Valid products: {len(all_products)}')
+
+    # ========== 5. 构建索引 ==========
+    _start = _time.time()
     for p in all_products:
         for a in p['Attributes']:
             attribute_to_asins[a].add(p['asin'])
+    print(f'[load_products] Attribute index built in {_time.time() - _start:.1f}s')
 
     product_item_dict = {p['asin']: p for p in all_products}
     product_prices = generate_product_prices(all_products)
+    
+    print(f'[load_products] Done. Total products: {len(all_products)}')
     return all_products, product_item_dict, product_prices, attribute_to_asins
