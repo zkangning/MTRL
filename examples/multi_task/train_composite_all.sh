@@ -19,13 +19,11 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
 export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000,http://10.217.65.160:8001,http://10.217.65.160:8002,http://10.217.65.160:8003,http://10.217.65.160:8004,http://10.217.65.160:8005"
 
-# 单服务器模式（如果只用一个 GPU）:
-# export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000"
 
-# 请确保在运行训练前启动检索服务器:
-#   多 GPU 模式（推荐）:
-#     chmod +x examples/search/retrieval/launch_multi_gpu.sh
-#     ./examples/search/retrieval/launch_multi_gpu.sh ./search_data/prebuilt_indices 8000 4
+# Web Shop 任务配置
+export WEBSHOP_DATA_DIR=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/webshop
+export WEBSHOP_INDEX_DIR=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/webshop/search_engine
+export WEBSHOP_USE_FULL_DATA=true
 
 # 获取 RLLM 路径
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
@@ -34,10 +32,12 @@ RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dir
 # 这里请替换为你实际的 Qwen3-32B 或其他 Base Model 路径
 MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
 
+
 # ================= Webshop 数据配置 =================
 # 全量训练数据: 约 11,587 个目标 (goal_idx 500-12087)
 # 测试集: 500 个目标 (goal_idx 0-500)
 # 如果需要使用子集进行调试，可以减小 WEBSHOP_TRAIN_NUM 的值
+
 
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
