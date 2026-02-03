@@ -45,6 +45,7 @@ The instruction asks for red shoes under $50. I see a search bar is available.
 1. ALWAYS use click[element] format for ALL clicks - never just write the element name
 2. Use simple search keywords (2-4 words work best)
 3. Click on product ASINs to view details, select options, then click[buy now]
+4. If no matching products after browsing 3 pages, click[back to search] and try different keywords
 """
 
 

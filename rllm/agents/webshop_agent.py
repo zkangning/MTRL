@@ -71,6 +71,7 @@ Size is selected. Now I can purchase.
 4. Select required options (size, color) BEFORE clicking "buy now"
 5. Only click "buy now" when the product matches ALL requirements in the instruction
 6. Check price, size, color, and other attributes carefully before purchasing
+7. If no matching products after browsing 3 pages, click[back to search] and try different keywords
 """
 
 

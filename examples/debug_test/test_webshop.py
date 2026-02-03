@@ -92,7 +92,7 @@ if __name__ == "__main__":
     model_path = "/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
     
     api_base_url = "http://localhost:8803/v1"
-    debug_subset_size = 5  # 调试样本数
+    debug_subset_size = 30  # 调试样本数
     
     # Webshop 环境配置
     webshop_max_steps = 15  # 每个 episode 最大步数
