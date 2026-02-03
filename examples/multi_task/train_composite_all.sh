@@ -51,7 +51,7 @@ python3 -m examples.multi_task.train_composite \
     +data.local_search_num=0 \
     +data.webshop_num=3200 \
     +data.webshop_path=null \
-    +data.tool_call_data_path='' \
+    +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
     +data.dataset_name=m2_3_code0_tool0_localsearch0_webshop3k \
     trainer.experiment_name='m2_3_code0_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=256 \
