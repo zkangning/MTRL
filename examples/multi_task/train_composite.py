@@ -166,7 +166,8 @@ def prepare_composite_dataset(
     # 7. Webshop [新增]
     if webshop_num > 0:
         webshop_train = load_webshop_data("train", webshop_num)
-        webshop_test = load_webshop_data("test", 100)  # 测试集数量可配置化
+        # 测试集数量：默认 500，会根据实际可用的 goals 数量自动调整
+        webshop_test = load_webshop_data("test", 500)
     else:
         webshop_train, webshop_test = [], []
 
