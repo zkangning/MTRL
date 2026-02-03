@@ -38,7 +38,6 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # 测试集: 500 个目标 (goal_idx 0-500)
 # 如果需要使用子集进行调试，可以减小 WEBSHOP_TRAIN_NUM 的值
 
-
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
@@ -52,9 +51,9 @@ python3 -m examples.multi_task.train_composite \
     +data.webshop_num=3200 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_3_code0_tool0_localsearch0_webshop3k \
-    trainer.experiment_name='m2_3_code0_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
-    data.val_batch_size=256 \
+    +data.dataset_name=m2_3_code3k_tool0_localsearch0_webshop3k \
+    trainer.experiment_name='m2_3_code3k_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
+    data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=20480 \
     data.truncation='left' \
