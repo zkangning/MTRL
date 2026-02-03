@@ -26,12 +26,6 @@ export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000,http://10.217.65.160:8001
 #   多 GPU 模式（推荐）:
 #     chmod +x examples/search/retrieval/launch_multi_gpu.sh
 #     ./examples/search/retrieval/launch_multi_gpu.sh ./search_data/prebuilt_indices 8000 4
-#
-#   或手动启动每个 GPU:
-#     python examples/search/retrieval/server.py --data_dir ./search_data/prebuilt_indices --port 8000 --host 0.0.0.0 --gpu_id 0 &
-#     python examples/search/retrieval/server.py --data_dir ./search_data/prebuilt_indices --port 8001 --host 0.0.0.0 --gpu_id 1 &
-#     python examples/search/retrieval/server.py --data_dir ./search_data/prebuilt_indices --port 8002 --host 0.0.0.0 --gpu_id 2 &
-#     python examples/search/retrieval/server.py --data_dir ./search_data/prebuilt_indices --port 8003 --host 0.0.0.0 --gpu_id 3 &
 
 # 获取 RLLM 路径
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
@@ -61,8 +55,8 @@ python3 -m examples.multi_task.train_composite \
     +data.dataset_name=m2_3_code0_tool0_localsearch0_webshop3k \
     trainer.experiment_name='m2_3_code0_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=256 \
-    data.max_prompt_length=8192 \
-    data.max_response_length=16384 \
+    data.max_prompt_length=6400 \
+    data.max_response_length=20480 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     \
@@ -97,7 +91,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.001 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     +actor_rollout_ref.rollout.repetition_penalty=1.05 \
     \
