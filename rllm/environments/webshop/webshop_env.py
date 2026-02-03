@@ -13,26 +13,91 @@ from rllm.rewards.reward_types import RewardOutput
 logger = logging.getLogger(__name__)
 
 
-# System prompt for Webshop task
-WEBSHOP_SYSTEM_PROMPT = """You are a shopping assistant helping users find and purchase products on a web shopping platform.
+# System prompt for Webshop task (kept for backward compatibility)
+# The main system prompt is now in rllm/agents/webshop_agent.py
+WEBSHOP_SYSTEM_PROMPT = """You are an expert autonomous agent operating in the WebShop e-commerce environment.
 
-You will be given a shopping task with specific requirements (e.g., product type, price range, features).
-You need to navigate the website by searching for products and clicking on items to find the best match.
+Your goal is to find and purchase a product that matches ALL the requirements specified in the instruction.
 
-Available actions:
-- search[keywords]: Search for products using keywords
-- click[element]: Click on a button or link (e.g., click[Buy Now], click[< Prev], click[item_name])
+## Available Actions (MUST use exact format)
+1. search[keywords]: Search for products using keywords
+   - Example: search[red running shoes]
+   - Use simple, relevant keywords (2-4 words work best)
+   
+2. click[element]: Click on any button, link, or option
+   - Navigation: click[next >], click[< prev], click[back to search]
+   - Products: click[B07HRFSNL4] (use the product ASIN code)
+   - Options: click[large], click[red], click[size: medium]
+   - Purchase: click[buy now]
 
-You must respond in the following format:
-<think>Your reasoning about what action to take next</think>
-<action>Your action (e.g., search[red shoes] or click[Buy Now])</action>
+## Response Format
+You MUST follow this exact format:
+1. First, reason about the current situation inside <think> </think> tags
+2. Then, provide your action inside <action> </action> tags
 
-Important:
-- Read the instruction carefully to understand what product features are required
-- Use search to find relevant products
-- Click on products to view details and select options
-- Click "Buy Now" when you find a product that matches all requirements
+## Example
+<think>
+The instruction asks for red shoes under $50. I see a search bar is available.
+</think>
+<action>search[red shoes]</action>
+
+## Important Rules
+1. ALWAYS use click[element] format for ALL clicks - never just write the element name
+2. Use simple search keywords (2-4 words work best)
+3. Click on product ASINs to view details, select options, then click[buy now]
 """
+
+
+# Common navigation button patterns that should be converted to click[...] format
+NAVIGATION_BUTTONS = {
+    "next >": "next >",
+    "next>": "next >",
+    "next": "next >",
+    "< prev": "< prev",
+    "<prev": "< prev",
+    "prev": "< prev",
+    "previous": "< prev",
+    "back to search": "back to search",
+    "back": "back to search",
+    "buy now": "buy now",
+    "buy": "buy now",
+    "purchase": "buy now",
+    "add to cart": "buy now",
+    "description": "description",
+    "features": "features",
+    "reviews": "reviews",
+}
+
+
+def normalize_action_to_click(action: str) -> str:
+    """
+    Normalize common navigation commands to click[...] format.
+    
+    For example:
+    - "next >" -> "click[next >]"
+    - "< prev" -> "click[< prev]"
+    - "back to search" -> "click[back to search]"
+    """
+    action_lower = action.strip().lower()
+    
+    # Check if it's already in click[...] or search[...] format
+    if action_lower.startswith("click[") or action_lower.startswith("search["):
+        return action
+    
+    # Check if it matches a known navigation button
+    for pattern, normalized in NAVIGATION_BUTTONS.items():
+        if action_lower == pattern or action_lower == pattern.replace(" ", ""):
+            return f"click[{normalized}]"
+    
+    # Check if it looks like a product ASIN (e.g., B07HRFSNL4)
+    if re.match(r'^[Bb]\d{2}[A-Za-z0-9]{7}$', action.strip()):
+        return f"click[{action.strip().lower()}]"
+    
+    # If it's a short string without brackets, assume it's a click target
+    if len(action) < 50 and "[" not in action:
+        return f"click[{action.strip()}]"
+    
+    return action
 
 
 def parse_webshop_action(response: str) -> Tuple[str, bool]:
@@ -41,9 +106,17 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     Expected format: <think>...</think><action>...</action>
     Also supports direct search[...] or click[...] format.
     
+    This function also normalizes common navigation commands:
+    - "next >" -> "click[next >]"
+    - "< prev" -> "click[< prev]"
+    - "back to search" -> "click[back to search]"
+    
     Returns:
         Tuple of (action_string, is_valid)
     """
+    if not response:
+        return "", False
+    
     response_lower = response.lower()
     
     # Check for <think>...</think> tags
@@ -51,7 +124,7 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     think_end = response_lower.find("</think>")
     has_think = think_start != -1 and think_end != -1
     
-    # Check for Chinese characters (invalid)
+    # Check for Chinese characters (invalid for webshop which uses English)
     has_chinese = bool(re.search(r'[\u4e00-\u9fff]', response))
     
     # Try to extract action from <action>...</action> tags
@@ -60,24 +133,46 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     start_idx = response_lower.find(start_tag)
     end_idx = response_lower.find(end_tag)
     
+    action = None
+    
     if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+        # Extract action content using original case
         action = response[start_idx + len(start_tag):end_idx].strip()
-        is_valid = has_think and not has_chinese
-        return action, is_valid
     
-    # Fallback: try to find search[...] or click[...] patterns directly
-    # This handles cases where model outputs action without <action> tags
-    search_match = re.search(r'search\[([^\]]+)\]', response, re.IGNORECASE)
-    if search_match:
-        action = f"search[{search_match.group(1)}]"
-        is_valid = has_think and not has_chinese
-        return action, is_valid
+    # If no action tag found, try to find search[...] or click[...] patterns
+    if not action:
+        search_match = re.search(r'search\[([^\]]+)\]', response, re.IGNORECASE)
+        if search_match:
+            action = f"search[{search_match.group(1)}]"
+        else:
+            click_match = re.search(r'click\[([^\]]+)\]', response, re.IGNORECASE)
+            if click_match:
+                action = f"click[{click_match.group(1)}]"
     
-    click_match = re.search(r'click\[([^\]]+)\]', response, re.IGNORECASE)
-    if click_match:
-        action = f"click[{click_match.group(1)}]"
+    if action:
+        # Normalize the action format
+        action = action.strip()
+        
+        # First, try to normalize navigation commands to click[...] format
+        action = normalize_action_to_click(action)
+        
+        # Ensure proper format: search[...] or click[...]
+        search_match = re.search(r'search\[([^\]]+)\]', action, re.IGNORECASE)
+        if search_match:
+            # Return normalized search action
+            is_valid = has_think and not has_chinese
+            return f"search[{search_match.group(1)}]", is_valid
+        
+        click_match = re.search(r'click\[([^\]]+)\]', action, re.IGNORECASE)
+        if click_match:
+            # Return normalized click action
+            is_valid = has_think and not has_chinese
+            return f"click[{click_match.group(1)}]", is_valid
+        
+        # Action found but not in expected format - try to normalize it
+        normalized = normalize_action_to_click(action)
         is_valid = has_think and not has_chinese
-        return action, is_valid
+        return normalized, is_valid
     
     # Last resort: return the last part of response (invalid format)
     return response[-100:] if len(response) > 100 else response, False
@@ -316,15 +411,58 @@ class WebshopEnvironment(BaseEnv):
         # Add current page observation
         parts.append(f"\nCurrent Page:\n{obs}")
         
-        # Add available actions hint
+        # Add available actions hint - this is CRITICAL for the agent
         if available_actions:
             clickables = available_actions.get("clickables", [])
             if clickables:
-                parts.append(f"\nAvailable clickable elements: {', '.join(clickables[:20])}")
-                if len(clickables) > 20:
-                    parts.append(f"... and {len(clickables) - 20} more")
+                # Categorize clickables for better understanding
+                navigation_buttons = []
+                product_asins = []
+                options = []
+                other_buttons = []
+                
+                for item in clickables:
+                    item_lower = item.lower()
+                    if item_lower in ['next >', '< prev', 'back to search', 'buy now']:
+                        navigation_buttons.append(item)
+                    elif re.match(r'^b\d{2}[a-z0-9]{7}$', item_lower):
+                        product_asins.append(item)
+                    elif any(x in item_lower for x in ['size', 'color', 'small', 'medium', 'large', 'xl', 'xxl']):
+                        options.append(item)
+                    else:
+                        other_buttons.append(item)
+                
+                parts.append("\n--- Available Actions ---")
+                
+                # Show navigation buttons first (most important)
+                if navigation_buttons:
+                    nav_formatted = [f"click[{b}]" for b in navigation_buttons]
+                    parts.append(f"Navigation: {', '.join(nav_formatted)}")
+                
+                # Show product ASINs (important for product selection)
+                if product_asins:
+                    # Show up to 10 products
+                    displayed_products = product_asins[:10]
+                    asin_formatted = [f"click[{a}]" for a in displayed_products]
+                    parts.append(f"Products ({len(product_asins)} total): {', '.join(asin_formatted)}")
+                    if len(product_asins) > 10:
+                        parts.append(f"  ... and {len(product_asins) - 10} more products")
+                
+                # Show options (size, color, etc.)
+                if options:
+                    opt_formatted = [f"click[{o}]" for o in options[:20]]
+                    parts.append(f"Options: {', '.join(opt_formatted)}")
+                
+                # Show other buttons
+                if other_buttons:
+                    other_formatted = [f"click[{b}]" for b in other_buttons[:10]]
+                    parts.append(f"Other: {', '.join(other_formatted)}")
+            
             if available_actions.get("has_search_bar"):
-                parts.append("\nSearch bar is available. Use search[keywords] to search.")
+                parts.append("\nSearch bar available: Use search[keywords] to search.")
+        
+        # Add action format reminder
+        parts.append("\nRemember: Use search[keywords] or click[element] format for your action.")
         
         return "\n".join(parts)
     

@@ -117,20 +117,45 @@ class WebAgentTextEnv(gym.Env):
           - click[value]
         If action not valid, perform nothing.
         """
-        self.get_available_actions()
+        available_actions = self.get_available_actions()
 
         # Determine action type (click, search) and argument
         action_name, action_arg = parse_action(action)
+        
+        # Normalize action_arg to lowercase for matching
         if action_arg is not None:
-            action_arg = action_arg.lower()
+            action_arg = action_arg.strip().lower()
+        
+        # Normalize action_name to lowercase
+        if action_name is not None:
+            action_name = action_name.strip().lower()
+        
+        # Debug logging (can be disabled in production)
+        # print(f"[WebShop DEBUG] action={action}, parsed: name={action_name}, arg={action_arg}")
+        # print(f"[WebShop DEBUG] available clickables: {list(self.text_to_clickable.keys())[:10]}...")
+        
         if (action_name == 'search' and
             action_arg is not None and
             action_arg != ''):
             status = self.browser.search(action_arg)
-        elif (action_name == 'click' and
-              action_arg in self.text_to_clickable.keys() and
-              action_arg != 'search'):
-            status = self.browser.click(action_arg, self.text_to_clickable)
+        elif action_name == 'click' and action_arg is not None:
+            # Try exact match first
+            if action_arg in self.text_to_clickable:
+                status = self.browser.click(action_arg, self.text_to_clickable)
+            else:
+                # Try case-insensitive matching for clickables
+                matched_key = None
+                for key in self.text_to_clickable.keys():
+                    if key.lower() == action_arg.lower():
+                        matched_key = key
+                        break
+                
+                if matched_key is not None:
+                    status = self.browser.click(matched_key, self.text_to_clickable)
+                else:
+                    # No match found
+                    # print(f"[WebShop DEBUG] No match for click[{action_arg}] in available actions")
+                    status = dict(reward=0, done=False)
         else:
             status = dict(reward=0, done=False)
 
@@ -168,16 +193,31 @@ class WebAgentTextEnv(gym.Env):
         search_bar = html_obj.find(id='search_input')
         has_search_bar = True if search_bar is not None else False
         buttons = html_obj.find_all(class_='btn')
-        product_links  = html_obj.find_all(class_='product-link')
+        product_links = html_obj.find_all(class_='product-link')
         buying_options = html_obj.select('input[type="radio"]')
 
-        self.text_to_clickable = {
-            f'{b.get_text()}'.lower(): b
-            for b in buttons + product_links
-        }
+        self.text_to_clickable = {}
+        
+        # Add buttons (e.g., "Back to Search", "Next >", "< Prev", "Buy Now")
+        for b in buttons:
+            text = b.get_text().strip().lower()
+            if text:
+                self.text_to_clickable[text] = b
+        
+        # Add product links (ASINs)
+        for link in product_links:
+            # Product links contain ASIN codes
+            text = link.get_text().strip().lower()
+            if text:
+                self.text_to_clickable[text] = link
+        
+        # Add buying options (size, color, etc.)
         for opt in buying_options:
             opt_value = opt.get('value')
-            self.text_to_clickable[f'{opt_value}'] = opt
+            if opt_value:
+                # Store both original and lowercase versions for matching
+                self.text_to_clickable[opt_value.lower()] = opt
+        
         return dict(
             has_search_bar=has_search_bar,
             clickables=list(self.text_to_clickable.keys()),
@@ -592,8 +632,19 @@ class SimServer:
                     status['reward'] = reward
                     status['done'] = True
                 elif clickable_name == BACK_TO_SEARCH.lower():
-                    # If "back to search" clicked, recursively reset the session back to search page
-                    html, url, status = self.receive(session_id, current_url)
+                    # If "back to search" clicked, return to the previous search results page
+                    # (preserving keywords and page number)
+                    if session.get("keywords"):
+                        # If we have previous search keywords, return to search results
+                        html, url, status = self.receive(
+                            session_id,
+                            current_url,
+                            keywords=session["keywords"],
+                            page=session.get("page", 1),
+                        )
+                    else:
+                        # If no previous search, reset to initial search page
+                        html, url, status = self.receive(session_id, current_url)
                 elif (clickable_name == NEXT_PAGE.lower() and 
                       self.get_page_name(current_url) == 'search_results'):
                     # If "next page" clicked from search results, re-render with `page` enumerated

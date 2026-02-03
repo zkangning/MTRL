@@ -117,15 +117,41 @@ def read_html_template(path):
 def parse_action(action):
     """
     Parse action string to action name and its arguments.
+    
+    Supports formats:
+    - search[keywords]
+    - click[element]
+    
+    The function is robust to:
+    - Leading/trailing whitespace
+    - Case variations in action name
+    - Extra text before/after the action
     """
-    pattern = re.compile(r'(.+)\[(.+)\]')
-    m = re.match(pattern, action)
-    if m is None:
-        action_name = action
-        action_arg = None
-    else:
+    if action is None:
+        return None, None
+    
+    # Strip whitespace
+    action = action.strip()
+    
+    # Try to find search[...] or click[...] pattern anywhere in the string
+    # This handles cases where model outputs extra text
+    search_match = re.search(r'search\[([^\]]+)\]', action, re.IGNORECASE)
+    if search_match:
+        return 'search', search_match.group(1)
+    
+    click_match = re.search(r'click\[([^\]]+)\]', action, re.IGNORECASE)
+    if click_match:
+        return 'click', click_match.group(1)
+    
+    # Fallback: try the original pattern for backwards compatibility
+    pattern = re.compile(r'(\w+)\[([^\]]+)\]')
+    m = re.search(pattern, action)
+    if m is not None:
         action_name, action_arg = m.groups()
-    return action_name, action_arg
+        return action_name.lower(), action_arg
+    
+    # If no pattern matched, return the action as-is
+    return action, None
 
 
 def convert_web_app_string_to_var(name, string):
