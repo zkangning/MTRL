@@ -80,7 +80,7 @@ class CompositeAgent(BaseAgent):
             return self._agent_cache[task_type]
         
         # 否则，按需创建
-        logger.info(f"[CompositeAgent] Lazy-loading agent for task_type='{task_type}'...")
+        # logger.info(f"[CompositeAgent] Lazy-loading agent for task_type='{task_type}'...")
         
         agent = None
         
@@ -118,7 +118,7 @@ class CompositeAgent(BaseAgent):
         # 缓存并返回
         self._agent_cache[task_type] = agent
         self._initialized_agents.add(task_type)
-        logger.info(f"[CompositeAgent] ✅ Agent '{task_type}' initialized successfully.")
+        # logger.info(f"[CompositeAgent] ✅ Agent '{task_type}' initialized successfully.")
         
         return agent
 

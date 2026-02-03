@@ -92,7 +92,7 @@ if __name__ == "__main__":
     model_path = "/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
     
     api_base_url = "http://localhost:8803/v1"
-    debug_subset_size = 30  # 调试样本数
+    debug_subset_size = 10  # 调试样本数
     
     # Webshop 环境配置
     webshop_max_steps = 15  # 每个 episode 最大步数
@@ -173,7 +173,14 @@ if __name__ == "__main__":
         env_class=CompositeEnvironment,
         env_args=env_args,
         engine_name="openai",
-        rollout_engine_args={"base_url": api_base_url, "api_key": "None", "model_name": model_name},
+        rollout_engine_args={
+            "base_url": api_base_url,
+            "api_key": "None",
+            "model_name": model_name,
+            # 启用 accumulate_reasoning，保留历史消息中的 <think> 内容
+            # 这样模型在后续步骤中能看到之前的思考过程，也会继续输出思考内容
+            "accumulate_reasoning": True,
+        },
         tokenizer=tokenizer,
         sampling_params=sampling_params,
         max_response_length=32768,

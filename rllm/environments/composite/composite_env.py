@@ -128,7 +128,7 @@ class CompositeEnvironment(BaseEnv):
                 return env
         
         # 否则，按需创建新实例
-        logger.info(f"[CompositeEnv] Lazy-loading environment for task_type='{task_type}'...")
+        # logger.info(f"[CompositeEnv] Lazy-loading environment for task_type='{task_type}'...")
         
         env = None
         
@@ -189,7 +189,7 @@ class CompositeEnvironment(BaseEnv):
         # 缓存并返回
         self._env_cache[task_type] = env
         self._initialized_envs.add(task_type)
-        logger.info(f"[CompositeEnv] ✅ Environment '{task_type}' initialized successfully.")
+        # logger.info(f"[CompositeEnv] ✅ Environment '{task_type}' initialized successfully.")
         
         return env
     
@@ -216,7 +216,7 @@ class CompositeEnvironment(BaseEnv):
                 env_class=WebshopEnvironment,
                 env_args=self._webshop_args
             )
-            logger.info(f"[CompositeEnv] ✅ Using shared environment for '{task_type}'.")
+            # logger.info(f"[CompositeEnv] ✅ Using shared environment for '{task_type}'.")
             return env
         
         # 其他类型暂不支持共享
