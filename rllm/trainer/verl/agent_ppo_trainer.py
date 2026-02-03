@@ -67,6 +67,10 @@ class AgentPPOTrainer(RayPPOTrainer):
     def init_workers(self):
         super().init_workers()
 
+        # 预初始化共享环境（在 Ray worker 进程中）
+        # 这确保 Webshop 等重型环境只在每个 worker 中初始化一次
+        self._pre_initialize_shared_envs()
+
         engine_args = OmegaConf.to_container(self.config.rllm.agent.get("engine_args", {})) or {}
         n_parallel_agents = engine_args.pop("n_parallel_agents", None) or self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
         print(f"n_parallel_agents: {n_parallel_agents}")
@@ -91,6 +95,38 @@ class AgentPPOTrainer(RayPPOTrainer):
             n_parallel_agents=n_parallel_agents,
             **engine_args,
         )
+
+    def _pre_initialize_shared_envs(self):
+        """
+        预初始化共享环境（在 Ray worker 进程中）。
+        
+        这个方法在 init_workers 中调用，确保重型环境（如 Webshop）
+        只在每个 Ray worker 进程中初始化一次，而不是每个任务都重新初始化。
+        
+        这解决了以下问题：
+        1. 主进程的 SharedEnvironmentManager 无法被 Ray worker 进程访问
+        2. 如果不预初始化，每个 webshop 任务都会触发完整的数据加载（118万产品）
+        3. ThreadPoolExecutor 可能会同时创建多个环境实例，导致内存爆炸
+        """
+        # 检查是否有 webshop 任务需要处理
+        webshop_args = self.env_args.get("webshop_args")
+        if webshop_args and "reward_fn" in webshop_args:
+            print("[AgentPPOTrainer] Pre-initializing shared Webshop environment in Ray worker...")
+            try:
+                # 使用 CompositeEnvironment 的类方法预初始化
+                if hasattr(self.env_class, 'pre_initialize_shared_envs'):
+                    self.env_class.pre_initialize_shared_envs(self.env_args)
+                    print("[AgentPPOTrainer] ✅ Shared Webshop environment initialized successfully.")
+                else:
+                    # 如果 env_class 不支持预初始化，直接初始化 WebshopEnvironment
+                    from rllm.environments.shared_env_manager import get_shared_env_manager
+                    from rllm.environments.webshop.webshop_env import WebshopEnvironment
+                    manager = get_shared_env_manager()
+                    manager.initialize_env("webshop", WebshopEnvironment, webshop_args)
+                    print("[AgentPPOTrainer] ✅ Shared Webshop environment initialized (fallback).")
+            except Exception as e:
+                print(f"[AgentPPOTrainer] ⚠️ Failed to pre-initialize Webshop environment: {e}")
+                # 不抛出异常，让后续的懒加载处理
 
     def init_envs_and_agents(self, batch):
         """

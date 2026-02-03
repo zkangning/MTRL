@@ -336,11 +336,17 @@ class WebshopEnvironment(BaseEnv):
             from web_agent_site.envs import WebAgentTextEnv
             
             # Create the environment
+            # 确保使用 human_goals=True，这样只加载 12,087 个人工标注的 goals
+            # 而不是 1100 万个 synthetic goals
+            env_kwargs = {
+                'human_goals': True,  # 使用人工标注的 goals
+                **self.kwargs  # 允许外部覆盖
+            }
             self._env = gym.make(
                 'WebAgentTextEnv-v0',
                 observation_mode=self.observation_mode,
                 seed=self.seed,
-                **self.kwargs
+                **env_kwargs
             )
             self._initialized = True
             logger.info("WebshopEnvironment initialized successfully.")
