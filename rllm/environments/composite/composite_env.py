@@ -8,6 +8,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# 需要使用共享环境的任务类型（初始化开销大的环境）
+SHARED_ENV_TYPES = {"webshop"}
+
+
 class CompositeEnvironment(BaseEnv):
     """
     多任务组合环境: BFCL + Math + Code + Search + ToolCall + LocalSearch + Webshop
@@ -15,8 +19,22 @@ class CompositeEnvironment(BaseEnv):
     使用懒加载模式：只有在首次使用某个任务类型时才实例化对应的环境，
     避免不必要的初始化开销（如 MCP Server 启动、Webshop 数据加载等）。
     
+    对于初始化开销大的环境（如 Webshop），使用 SharedEnvironmentManager 进行
+    跨实例共享，避免每个任务都重新加载数据。
+    
     充当数据适配器，负责将 Dataset 中的扁平化数据解包为各子环境所需的原始格式。
     """
+    
+    # 类级别的共享环境管理器（延迟初始化）
+    _shared_manager = None
+    
+    @classmethod
+    def _get_shared_manager(cls):
+        """获取共享环境管理器（延迟初始化）"""
+        if cls._shared_manager is None:
+            from rllm.environments.shared_env_manager import get_shared_env_manager
+            cls._shared_manager = get_shared_env_manager()
+        return cls._shared_manager
     
     def __init__(
         self,
@@ -27,7 +45,8 @@ class CompositeEnvironment(BaseEnv):
         tool_call_args: Dict[str, Any] = None,
         local_search_args: Dict[str, Any] = None,
         webshop_args: Dict[str, Any] = None,
-        task: Dict[str, Any] = None
+        task: Dict[str, Any] = None,
+        use_shared_envs: bool = True,  # 是否使用共享环境
     ):
         """
         初始化 CompositeEnvironment。
@@ -44,8 +63,10 @@ class CompositeEnvironment(BaseEnv):
             local_search_args: Local Search 环境配置
             webshop_args: Webshop 环境配置
             task: 初始任务（可选）
+            use_shared_envs: 是否对重型环境使用共享实例（默认 True）
         """
         self.task = task or {}
+        self.use_shared_envs = use_shared_envs
         
         # 保存配置参数（不立即实例化）
         self._bfcl_args = bfcl_args or {}
@@ -56,7 +77,7 @@ class CompositeEnvironment(BaseEnv):
         self._local_search_args = local_search_args or {}
         self._webshop_args = webshop_args or {}
         
-        # 环境实例缓存（懒加载）
+        # 环境实例缓存（懒加载）- 仅用于非共享环境
         self._env_cache: Dict[str, Optional[BaseEnv]] = {
             "bfcl": None,
             "math": None,
@@ -66,6 +87,9 @@ class CompositeEnvironment(BaseEnv):
             "local_search": None,
             "webshop": None,
         }
+        
+        # 记录哪些环境是从共享管理器获取的（close 时不关闭）
+        self._shared_env_types: set = set()
         
         # 当前激活的环境
         self.active_env: Optional[BaseEnv] = None
@@ -78,17 +102,32 @@ class CompositeEnvironment(BaseEnv):
         """
         获取或创建指定类型的环境（懒加载核心逻辑）。
         
+        对于 SHARED_ENV_TYPES 中的环境类型，使用 SharedEnvironmentManager 获取共享实例。
+        这样可以避免每个任务都重新初始化重型环境（如 Webshop 的商品数据加载）。
+        
         Args:
             task_type: 任务类型
             
         Returns:
             对应的环境实例
         """
-        # 如果已缓存，直接返回
+        # 如果已缓存（本地或共享），直接返回
         if self._env_cache.get(task_type) is not None:
             return self._env_cache[task_type]
         
-        # 否则，按需创建
+        # 检查是否应该使用共享环境
+        use_shared = self.use_shared_envs and task_type in SHARED_ENV_TYPES
+        
+        if use_shared:
+            # 尝试从共享管理器获取
+            env = self._get_shared_env(task_type)
+            if env is not None:
+                self._env_cache[task_type] = env
+                self._shared_env_types.add(task_type)
+                self._initialized_envs.add(task_type)
+                return env
+        
+        # 否则，按需创建新实例
         logger.info(f"[CompositeEnv] Lazy-loading environment for task_type='{task_type}'...")
         
         env = None
@@ -153,6 +192,35 @@ class CompositeEnvironment(BaseEnv):
         logger.info(f"[CompositeEnv] ✅ Environment '{task_type}' initialized successfully.")
         
         return env
+    
+    def _get_shared_env(self, task_type: str) -> Optional[BaseEnv]:
+        """
+        从共享管理器获取环境实例。
+        
+        Args:
+            task_type: 任务类型
+            
+        Returns:
+            共享的环境实例，如果不支持共享则返回 None
+        """
+        manager = self._get_shared_manager()
+        
+        if task_type == "webshop":
+            from rllm.environments.webshop.webshop_env import WebshopEnvironment
+            if not self._webshop_args or "reward_fn" not in self._webshop_args:
+                raise RuntimeError(
+                    "Webshop Environment requires 'reward_fn' in webshop_args."
+                )
+            env = manager.get_or_create_env(
+                env_type="webshop",
+                env_class=WebshopEnvironment,
+                env_args=self._webshop_args
+            )
+            logger.info(f"[CompositeEnv] ✅ Using shared environment for '{task_type}'.")
+            return env
+        
+        # 其他类型暂不支持共享
+        return None
 
     def _create_env_with_reward_fn(self, env_class, args: Dict[str, Any]) -> BaseEnv:
         """
@@ -299,24 +367,39 @@ class CompositeEnvironment(BaseEnv):
         return obs, reward, done, info
 
     def close(self):
-        """关闭所有已初始化的子环境。"""
-        for task_type, env in self._env_cache.items():
-            if env is not None and hasattr(env, 'close'):
-                try:
-                    env.close()
-                    logger.debug(f"[CompositeEnv] Closed environment: {task_type}")
-                except Exception as e:
-                    logger.warning(f"[CompositeEnv] Failed to close {task_type}: {e}")
+        """
+        关闭所有已初始化的子环境。
         
-        # 清空缓存
+        注意：共享环境不会被关闭，它们由 SharedEnvironmentManager 管理。
+        """
+        for task_type, env in self._env_cache.items():
+            if env is not None:
+                # 跳过共享环境（由 SharedEnvironmentManager 管理）
+                if task_type in self._shared_env_types:
+                    logger.debug(f"[CompositeEnv] Skipping shared environment: {task_type}")
+                    continue
+                    
+                if hasattr(env, 'close'):
+                    try:
+                        env.close()
+                        logger.debug(f"[CompositeEnv] Closed environment: {task_type}")
+                    except Exception as e:
+                        logger.warning(f"[CompositeEnv] Failed to close {task_type}: {e}")
+        
+        # 清空缓存（但不影响共享管理器中的环境）
         self._env_cache = {k: None for k in self._env_cache}
         self._initialized_envs.clear()
+        self._shared_env_types.clear()
         self.active_env = None
         self.active_task_type = None
 
     def get_initialized_envs(self) -> set:
         """返回已初始化的环境类型集合（用于调试）。"""
         return self._initialized_envs.copy()
+    
+    def get_shared_envs(self) -> set:
+        """返回使用共享实例的环境类型集合（用于调试）。"""
+        return self._shared_env_types.copy()
 
     @staticmethod
     def is_multithread_safe() -> bool:
@@ -341,5 +424,42 @@ class CompositeEnvironment(BaseEnv):
             tool_call_args=env_args.get("tool_call_args"),
             local_search_args=env_args.get("local_search_args"),
             webshop_args=env_args.get("webshop_args"),
-            task=env_args
+            task=env_args,
+            use_shared_envs=env_args.get("use_shared_envs", True),
         )
+    
+    @classmethod
+    def pre_initialize_shared_envs(cls, env_args: dict):
+        """
+        预初始化共享环境（可选的优化方法）。
+        
+        在处理任务之前调用此方法，可以提前加载重型环境（如 Webshop），
+        避免第一个任务的延迟。
+        
+        Args:
+            env_args: 环境配置字典
+            
+        Example:
+            CompositeEnvironment.pre_initialize_shared_envs({
+                "webshop_args": {"reward_fn": webshop_reward_fn, "max_steps": 15}
+            })
+        """
+        manager = cls._get_shared_manager()
+        
+        # 预初始化 Webshop
+        webshop_args = env_args.get("webshop_args")
+        if webshop_args and "reward_fn" in webshop_args:
+            from rllm.environments.webshop.webshop_env import WebshopEnvironment
+            logger.info("[CompositeEnv] Pre-initializing shared Webshop environment...")
+            manager.initialize_env("webshop", WebshopEnvironment, webshop_args)
+    
+    @classmethod
+    def cleanup_shared_envs(cls):
+        """
+        清理所有共享环境。
+        
+        在所有任务完成后调用此方法，释放共享环境占用的资源。
+        """
+        if cls._shared_manager is not None:
+            cls._shared_manager.close_all()
+            logger.info("[CompositeEnv] Cleaned up all shared environments.")

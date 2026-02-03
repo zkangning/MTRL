@@ -1,91 +1,105 @@
 # Copyright 2025 RLLM Team
 # Webshop Agent adapted for RLLM Multi-Task Training
+# Tool-call version
 
 import copy
+import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from rllm.agents.agent import Action, BaseAgent, Step, Trajectory
 
 logger = logging.getLogger(__name__)
 
 
-# System prompt for Webshop task
-WEBSHOP_SYSTEM_PROMPT = """You are an expert autonomous agent operating in the WebShop e-commerce environment.
+# Tool definitions for Webshop task
+WEBSHOP_TOOLS = [
+    {
+        "name": "search",
+        "description": "Search for products with the given query. Use this only if a [Search] button appears in the observation. Note: If you wish to search and there's no [Search] button, click the [Back to Search] button instead.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for products"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "click",
+        "description": "Click on a button or product. Use this only if a [button] is present in the observation. When you have identified the most suitable product, click the [Buy Now] button on its product page to finish the shopping task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "button": {
+                    "type": "string",
+                    "description": "Name of the button or product ASIN, don't add '[]' around the button name"
+                }
+            },
+            "required": ["button"]
+        }
+    }
+]
 
-Your goal is to find and purchase a product that matches ALL the requirements specified in the instruction.
 
-## Available Actions (MUST use exact format)
-1. search[keywords]: Search for products using keywords
-   - Example: search[red running shoes]
-   - Use simple, relevant keywords (2-4 words work best)
-   
-2. click[element]: Click on any button, link, or option
-   - Navigation: click[next >], click[< prev], click[back to search]
-   - Products: click[B07HRFSNL4] (use the product ASIN code)
-   - Options: click[large], click[red], click[size: medium]
-   - Purchase: click[buy now]
+def format_tools_for_prompt(tools: List[Dict]) -> str:
+    """Format tool definitions for inclusion in system prompt."""
+    tool_strs = []
+    for tool in tools:
+        params = tool.get("parameters", {}).get("properties", {})
+        param_strs = []
+        for param_name, param_info in params.items():
+            param_strs.append(f'"{param_name}": "{param_info.get("description", "")}"')
+        params_json = "{" + ", ".join(param_strs) + "}"
+        tool_strs.append(f"- {tool['name']}: {tool['description']}\n  Parameters: {params_json}")
+    return "\n".join(tool_strs)
+
+
+# System prompt for Webshop task (Tool-call version)
+WEBSHOP_SYSTEM_PROMPT = f"""You are a shopping assistant in the WebShop environment.
+
+Your goal is to find and purchase a product that matches ALL requirements in the instruction.
+
+## Available Tools
+{format_tools_for_prompt(WEBSHOP_TOOLS)}
 
 ## Response Format
-You MUST follow this exact format:
-1. First, reason about the current situation inside <think> </think> tags
-2. Then, provide your action inside <action> </action> tags
+You MUST respond with:
+1. Your reasoning inside <think> </think> tags
+2. A tool call inside <tool_call> </tool_call> tags in JSON format
 
-## Example Interactions
-
-Example 1 - Searching:
+Example response:
 <think>
-The instruction asks for red shoes under $50. I see a search bar is available.
-I should search with simple keywords first.
+I need to search for the product first.
 </think>
-<action>search[red shoes under 50]</action>
-
-Example 2 - Clicking a product:
-<think>
-I see product B07HRFSNL4 which looks like it might match. I should click on it to see details.
-</think>
-<action>click[b07hrfsnl4]</action>
-
-Example 3 - Navigating pages:
-<think>
-None of the products on this page match. I should check the next page.
-</think>
-<action>click[next >]</action>
-
-Example 4 - Selecting options and buying:
-<think>
-This product matches all requirements. I need to select size "large" first.
-</think>
-<action>click[large]</action>
-
-<think>
-Size is selected. Now I can purchase.
-</think>
-<action>click[buy now]</action>
+<tool_call>
+{{"name": "search", "arguments": {{"query": "red running shoes"}}}}
+</tool_call>
 
 ## Important Rules
-1. ALWAYS use click[element] format for ALL clicks - never just write the element name
-2. Use simple search keywords (avoid long phrases with many attributes)
-3. Click on product ASINs (like B07HRFSNL4) to view product details
-4. Select required options (size, color) BEFORE clicking "buy now"
-5. Only click "buy now" when the product matches ALL requirements in the instruction
-6. Check price, size, color, and other attributes carefully before purchasing
-7. If no matching products after browsing 3 pages, click[back to search] and try different keywords
+1. Use simple search keywords (2-4 words)
+2. Click on product ASINs (like B07HRFSNL4) to view details
+3. Select required options (size, color) before clicking Buy Now
+4. If no matching products after browsing 3 pages, click Back to Search and try different keywords
 """
 
 
 class WebshopAgent(BaseAgent):
     """
-    Agent for Webshop shopping tasks.
+    Agent for Webshop shopping tasks using tool-call format.
     
     This agent handles the interaction with the Webshop environment,
-    parsing observations and formatting actions in the expected format.
+    parsing observations and formatting actions as tool calls.
     """
     
     def __init__(
         self,
         system_prompt: str = WEBSHOP_SYSTEM_PROMPT,
+        tools: List[Dict] = None,
         **kwargs
     ):
         """
@@ -93,8 +107,10 @@ class WebshopAgent(BaseAgent):
         
         Args:
             system_prompt: System prompt for the agent
+            tools: List of tool definitions (defaults to WEBSHOP_TOOLS)
         """
         self.system_prompt = system_prompt
+        self.tools = tools or WEBSHOP_TOOLS
         
         # Initialize state
         self._trajectory = Trajectory()
@@ -154,8 +170,8 @@ class WebshopAgent(BaseAgent):
         Returns:
             Action object containing the parsed action
         """
-        # Parse action from response
-        parsed_action = self._parse_action(response)
+        # Parse tool call from response
+        parsed_action = self._parse_tool_call(response)
         
         # Add assistant message
         self.messages.append({"role": "assistant", "content": response})
@@ -171,32 +187,60 @@ class WebshopAgent(BaseAgent):
         
         return Action(action=parsed_action)
     
-    def _parse_action(self, response: str) -> str:
+    def _parse_tool_call(self, response: str) -> str:
         """
-        Parse the action from model response.
+        Parse the tool call from model response.
         
-        Expected format: <think>...</think><action>...</action>
+        Expected format: <think>...</think><tool_call>{"name": "...", "arguments": {...}}</tool_call>
         
         Args:
             response: The model's response
             
         Returns:
-            The parsed action string
+            The parsed action string in format "search[query]" or "click[button]"
         """
-        response_lower = response.lower()
+        # Try to extract tool call from <tool_call>...</tool_call> tags
+        tool_call_match = re.search(
+            r'<tool_call>\s*(.*?)\s*</tool_call>',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
         
-        # Try to extract action from <action>...</action> tags
-        start_tag = "<action>"
-        end_tag = "</action>"
-        start_idx = response_lower.find(start_tag)
-        end_idx = response_lower.find(end_tag)
+        if tool_call_match:
+            tool_call_str = tool_call_match.group(1).strip()
+            try:
+                # Parse JSON
+                tool_call = json.loads(tool_call_str)
+                tool_name = tool_call.get("name", "").lower()
+                arguments = tool_call.get("arguments", {})
+                
+                if tool_name == "search":
+                    query = arguments.get("query", "")
+                    return f"search[{query}]"
+                elif tool_name == "click":
+                    button = arguments.get("button", "")
+                    return f"click[{button}]"
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse tool call JSON: {tool_call_str}")
         
-        if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            # Extract action content (use original case)
-            action = response[start_idx + len(start_tag):end_idx].strip()
-            return action
+        # Fallback: try to find JSON pattern directly
+        json_match = re.search(r'\{[^{}]*"name"\s*:\s*"(search|click)"[^{}]*\}', response, re.IGNORECASE)
+        if json_match:
+            try:
+                tool_call = json.loads(json_match.group(0))
+                tool_name = tool_call.get("name", "").lower()
+                arguments = tool_call.get("arguments", {})
+                
+                if tool_name == "search":
+                    query = arguments.get("query", "")
+                    return f"search[{query}]"
+                elif tool_name == "click":
+                    button = arguments.get("button", "")
+                    return f"click[{button}]"
+            except json.JSONDecodeError:
+                pass
         
-        # Fallback: try to find search[...] or click[...] patterns
+        # Fallback: try old format search[...] or click[...]
         search_match = re.search(r'search\[([^\]]+)\]', response, re.IGNORECASE)
         if search_match:
             return f"search[{search_match.group(1)}]"
@@ -205,7 +249,8 @@ class WebshopAgent(BaseAgent):
         if click_match:
             return f"click[{click_match.group(1)}]"
         
-        # Last resort: return the last part of response
+        # Last resort: return the response as-is (will likely fail)
+        logger.warning(f"Could not parse tool call from response: {response[:200]}")
         return response[-100:] if len(response) > 100 else response
     
     @property
@@ -217,3 +262,9 @@ class WebshopAgent(BaseAgent):
     def trajectory(self) -> Trajectory:
         """Returns the trajectory recorded so far."""
         return self._trajectory
+
+
+# Export tool definitions for use by environment
+def get_webshop_tools() -> List[Dict]:
+    """Get the tool definitions for Webshop environment."""
+    return WEBSHOP_TOOLS

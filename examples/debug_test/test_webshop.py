@@ -161,7 +161,12 @@ if __name__ == "__main__":
 
     sampling_params = {"temperature": 0.6, "top_p": 0.95, "model": model_name, "max_tokens": 32768}
 
-    # --- 3. 初始化引擎 ---
+    # --- 3. 预初始化共享环境（优化：避免每个任务都重新加载 Webshop 数据）---
+    logger.info("Pre-initializing shared Webshop environment...")
+    CompositeEnvironment.pre_initialize_shared_envs(env_args)
+    logger.info("Shared environment pre-initialization complete.")
+
+    # --- 4. 初始化引擎 ---
     engine = AgentExecutionEngine(
         agent_class=CompositeAgent,
         agent_args=agent_args,
@@ -177,7 +182,7 @@ if __name__ == "__main__":
         max_steps=webshop_max_steps,  # 传递给 Engine，控制最大交互步数
     )
 
-    # --- 4. 加载 Webshop 数据 ---
+    # --- 5. 加载 Webshop 数据 ---
     logger.info(f"Loading Webshop Dataset (subset: {debug_subset_size})...")
     tasks = load_webshop_data("test", debug_subset_size)
     
@@ -190,12 +195,18 @@ if __name__ == "__main__":
     for i, task in enumerate(tasks[:3]):
         logger.info(f"  Task {i}: goal_idx={task.get('goal_idx')}, task_type={task.get('task_type')}")
     
-    # --- 5. 执行调试 ---
+    # --- 6. 执行调试 ---
     logger.info(f"Running {debug_task_type} evaluation on {len(tasks)} samples...")
+    logger.info("Note: Webshop environment is now shared across tasks (no repeated initialization).")
     
-    results = asyncio.run(engine.execute_tasks(tasks))
+    try:
+        results = asyncio.run(engine.execute_tasks(tasks))
+    finally:
+        # --- 清理共享环境 ---
+        logger.info("Cleaning up shared environments...")
+        CompositeEnvironment.cleanup_shared_envs()
     
-    # --- 6. 保存与分析 ---
+    # --- 7. 保存与分析 ---
     output_file = f"./trajectories/{debug_task_type}_debug_trajectories.json"
     save_detailed_trajectories(results, output_file)
     

@@ -1,11 +1,13 @@
 # Copyright 2025 RLLM Team
 # Webshop Environment adapted for RLLM Multi-Task Training
+# Tool-call version
 #
 # Based on the original implementation from verl-agent (GiGPO) team.
 
+import json
 import logging
 import re
-from typing import Any, Dict, Tuple, Callable, Optional
+from typing import Any, Dict, Tuple, Callable, Optional, List
 
 from rllm.environments.base.base_env import BaseEnv
 from rllm.rewards.reward_types import RewardOutput
@@ -13,107 +15,115 @@ from rllm.rewards.reward_types import RewardOutput
 logger = logging.getLogger(__name__)
 
 
-# System prompt for Webshop task (kept for backward compatibility)
-# The main system prompt is now in rllm/agents/webshop_agent.py
-WEBSHOP_SYSTEM_PROMPT = """You are an expert autonomous agent operating in the WebShop e-commerce environment.
+# Tool definitions for Webshop task
+WEBSHOP_TOOLS = [
+    {
+        "name": "search",
+        "description": "Search for products with the given query. Use this only if a [Search] button appears in the observation. Note: If you wish to search and there's no [Search] button, click the [Back to Search] button instead.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for products (use 2-4 simple keywords)"
+                }
+            },
+            "required": ["query"]
+        }
+    },
+    {
+        "name": "click",
+        "description": "Click on a button or product. Use this only if a [button] is present in the observation. When you have identified the most suitable product, click the [Buy Now] button on its product page to finish the shopping task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "button": {
+                    "type": "string",
+                    "description": "Name of the button or product ASIN, don't add '[]' around the button name"
+                }
+            },
+            "required": ["button"]
+        }
+    }
+]
 
-Your goal is to find and purchase a product that matches ALL the requirements specified in the instruction.
 
-## Available Actions (MUST use exact format)
-1. search[keywords]: Search for products using keywords
-   - Example: search[red running shoes]
-   - Use simple, relevant keywords (2-4 words work best)
-   
-2. click[element]: Click on any button, link, or option
-   - Navigation: click[next >], click[< prev], click[back to search]
-   - Products: click[B07HRFSNL4] (use the product ASIN code)
-   - Options: click[large], click[red], click[size: medium]
-   - Purchase: click[buy now]
+def format_tools_for_prompt(tools: List[Dict]) -> str:
+    """Format tool definitions for inclusion in system prompt."""
+    tool_strs = []
+    for tool in tools:
+        params = tool.get("parameters", {}).get("properties", {})
+        param_strs = []
+        for param_name, param_info in params.items():
+            param_strs.append(f'"{param_name}": "{param_info.get("description", "")}"')
+        params_json = "{" + ", ".join(param_strs) + "}"
+        tool_strs.append(f"- {tool['name']}: {tool['description']}\n  Parameters: {params_json}")
+    return "\n".join(tool_strs)
+
+
+# System prompt for Webshop task (Tool-call version)
+WEBSHOP_SYSTEM_PROMPT = f"""You are a shopping assistant in the WebShop environment.
+
+Your goal is to find and purchase a product that matches ALL requirements in the instruction.
+
+## Available Tools
+{format_tools_for_prompt(WEBSHOP_TOOLS)}
 
 ## Response Format
-You MUST follow this exact format:
-1. First, reason about the current situation inside <think> </think> tags
-2. Then, provide your action inside <action> </action> tags
+You MUST respond with:
+1. Your reasoning inside <think> </think> tags
+2. A tool call inside <tool_call> </tool_call> tags in JSON format
 
-## Example
+Example response:
 <think>
-The instruction asks for red shoes under $50. I see a search bar is available.
+I need to search for the product first.
 </think>
-<action>search[red shoes]</action>
+<tool_call>
+{{"name": "search", "arguments": {{"query": "red running shoes"}}}}
+</tool_call>
 
 ## Important Rules
-1. ALWAYS use click[element] format for ALL clicks - never just write the element name
-2. Use simple search keywords (2-4 words work best)
-3. Click on product ASINs to view details, select options, then click[buy now]
-4. If no matching products after browsing 3 pages, click[back to search] and try different keywords
+1. Use simple search keywords (2-4 words)
+2. Click on product ASINs (like B07HRFSNL4) to view details
+3. Select required options (size, color) before clicking Buy Now
+4. If no matching products after browsing 3 pages, click Back to Search and try different keywords
 """
 
 
-# Common navigation button patterns that should be converted to click[...] format
+# Common navigation button patterns for normalization
 NAVIGATION_BUTTONS = {
-    "next >": "next >",
-    "next>": "next >",
-    "next": "next >",
-    "< prev": "< prev",
-    "<prev": "< prev",
-    "prev": "< prev",
-    "previous": "< prev",
-    "back to search": "back to search",
-    "back": "back to search",
-    "buy now": "buy now",
-    "buy": "buy now",
-    "purchase": "buy now",
-    "add to cart": "buy now",
-    "description": "description",
-    "features": "features",
-    "reviews": "reviews",
+    "next >": "Next >",
+    "next>": "Next >",
+    "next": "Next >",
+    "< prev": "< Prev",
+    "<prev": "< Prev",
+    "prev": "< Prev",
+    "previous": "< Prev",
+    "back to search": "Back to Search",
+    "back": "Back to Search",
+    "buy now": "Buy Now",
+    "buy": "Buy Now",
+    "purchase": "Buy Now",
+    "add to cart": "Buy Now",
+    "description": "Description",
+    "features": "Features",
+    "reviews": "Reviews",
+    "search": "Search",
 }
 
 
-def normalize_action_to_click(action: str) -> str:
+def parse_tool_call(response: str) -> Tuple[str, bool]:
     """
-    Normalize common navigation commands to click[...] format.
+    Parse the tool call from model response.
     
-    For example:
-    - "next >" -> "click[next >]"
-    - "< prev" -> "click[< prev]"
-    - "back to search" -> "click[back to search]"
-    """
-    action_lower = action.strip().lower()
+    Expected format: 
+    <think>...</think>
+    <tool_call>{"name": "search", "arguments": {"query": "..."}}</tool_call>
     
-    # Check if it's already in click[...] or search[...] format
-    if action_lower.startswith("click[") or action_lower.startswith("search["):
-        return action
-    
-    # Check if it matches a known navigation button
-    for pattern, normalized in NAVIGATION_BUTTONS.items():
-        if action_lower == pattern or action_lower == pattern.replace(" ", ""):
-            return f"click[{normalized}]"
-    
-    # Check if it looks like a product ASIN (e.g., B07HRFSNL4)
-    if re.match(r'^[Bb]\d{2}[A-Za-z0-9]{7}$', action.strip()):
-        return f"click[{action.strip().lower()}]"
-    
-    # If it's a short string without brackets, assume it's a click target
-    if len(action) < 50 and "[" not in action:
-        return f"click[{action.strip()}]"
-    
-    return action
-
-
-def parse_webshop_action(response: str) -> Tuple[str, bool]:
-    """
-    Parse the action from model response.
-    Expected format: <think>...</think><action>...</action>
-    Also supports direct search[...] or click[...] format.
-    
-    This function also normalizes common navigation commands:
-    - "next >" -> "click[next >]"
-    - "< prev" -> "click[< prev]"
-    - "back to search" -> "click[back to search]"
+    Also supports legacy format: search[...] or click[...]
     
     Returns:
-        Tuple of (action_string, is_valid)
+        Tuple of (action_string in format "search[query]" or "click[button]", is_valid)
     """
     if not response:
         return "", False
@@ -128,19 +138,79 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
     # Check for Chinese characters (invalid for webshop which uses English)
     has_chinese = bool(re.search(r'[\u4e00-\u9fff]', response))
     
-    # Try to extract action from <action>...</action> tags
-    start_tag = "<action>"
-    end_tag = "</action>"
-    start_idx = response_lower.find(start_tag)
-    end_idx = response_lower.find(end_tag)
-    
     action = None
     
-    if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-        # Extract action content using original case
-        action = response[start_idx + len(start_tag):end_idx].strip()
+    # Try to extract tool call from <tool_call>...</tool_call> tags
+    tool_call_match = re.search(
+        r'<tool_call>\s*(.*?)\s*</tool_call>',
+        response,
+        re.DOTALL | re.IGNORECASE
+    )
     
-    # If no action tag found, try to find search[...] or click[...] patterns
+    if tool_call_match:
+        tool_call_str = tool_call_match.group(1).strip()
+        try:
+            # Parse JSON
+            tool_call = json.loads(tool_call_str)
+            tool_name = tool_call.get("name", "").lower()
+            arguments = tool_call.get("arguments", {})
+            
+            if tool_name == "search":
+                query = arguments.get("query", "")
+                action = f"search[{query}]"
+            elif tool_name == "click":
+                button = arguments.get("button", "")
+                # Normalize button name
+                button_lower = button.lower().strip()
+                if button_lower in NAVIGATION_BUTTONS:
+                    button = NAVIGATION_BUTTONS[button_lower]
+                action = f"click[{button}]"
+        except json.JSONDecodeError:
+            logger.debug(f"Failed to parse tool call JSON: {tool_call_str}")
+    
+    # Fallback: try to find JSON pattern directly (without tags)
+    if not action:
+        json_match = re.search(
+            r'\{\s*"name"\s*:\s*"(search|click)".*?\}',
+            response,
+            re.IGNORECASE | re.DOTALL
+        )
+        if json_match:
+            try:
+                # Find the complete JSON object
+                json_str = json_match.group(0)
+                # Handle nested braces
+                brace_count = 0
+                end_idx = 0
+                for i, c in enumerate(json_str):
+                    if c == '{':
+                        brace_count += 1
+                    elif c == '}':
+                        brace_count -= 1
+                        if brace_count == 0:
+                            end_idx = i + 1
+                            break
+                
+                if end_idx > 0:
+                    json_str = json_str[:end_idx]
+                
+                tool_call = json.loads(json_str)
+                tool_name = tool_call.get("name", "").lower()
+                arguments = tool_call.get("arguments", {})
+                
+                if tool_name == "search":
+                    query = arguments.get("query", "")
+                    action = f"search[{query}]"
+                elif tool_name == "click":
+                    button = arguments.get("button", "")
+                    button_lower = button.lower().strip()
+                    if button_lower in NAVIGATION_BUTTONS:
+                        button = NAVIGATION_BUTTONS[button_lower]
+                    action = f"click[{button}]"
+            except json.JSONDecodeError:
+                pass
+    
+    # Fallback: try legacy format search[...] or click[...]
     if not action:
         search_match = re.search(r'search\[([^\]]+)\]', response, re.IGNORECASE)
         if search_match:
@@ -148,32 +218,44 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
         else:
             click_match = re.search(r'click\[([^\]]+)\]', response, re.IGNORECASE)
             if click_match:
-                action = f"click[{click_match.group(1)}]"
+                button = click_match.group(1)
+                button_lower = button.lower().strip()
+                if button_lower in NAVIGATION_BUTTONS:
+                    button = NAVIGATION_BUTTONS[button_lower]
+                action = f"click[{button}]"
+    
+    # Fallback: try to extract action from <action>...</action> tags (legacy)
+    if not action:
+        action_match = re.search(
+            r'<action>\s*(.*?)\s*</action>',
+            response,
+            re.DOTALL | re.IGNORECASE
+        )
+        if action_match:
+            action_content = action_match.group(1).strip()
+            # Try to parse as search[...] or click[...]
+            search_match = re.search(r'search\[([^\]]+)\]', action_content, re.IGNORECASE)
+            if search_match:
+                action = f"search[{search_match.group(1)}]"
+            else:
+                click_match = re.search(r'click\[([^\]]+)\]', action_content, re.IGNORECASE)
+                if click_match:
+                    button = click_match.group(1)
+                    button_lower = button.lower().strip()
+                    if button_lower in NAVIGATION_BUTTONS:
+                        button = NAVIGATION_BUTTONS[button_lower]
+                    action = f"click[{button}]"
+                else:
+                    # Assume it's a click target
+                    button_lower = action_content.lower().strip()
+                    if button_lower in NAVIGATION_BUTTONS:
+                        action = f"click[{NAVIGATION_BUTTONS[button_lower]}]"
+                    else:
+                        action = f"click[{action_content}]"
     
     if action:
-        # Normalize the action format
-        action = action.strip()
-        
-        # First, try to normalize navigation commands to click[...] format
-        action = normalize_action_to_click(action)
-        
-        # Ensure proper format: search[...] or click[...]
-        search_match = re.search(r'search\[([^\]]+)\]', action, re.IGNORECASE)
-        if search_match:
-            # Return normalized search action
-            is_valid = has_think and not has_chinese
-            return f"search[{search_match.group(1)}]", is_valid
-        
-        click_match = re.search(r'click\[([^\]]+)\]', action, re.IGNORECASE)
-        if click_match:
-            # Return normalized click action
-            is_valid = has_think and not has_chinese
-            return f"click[{click_match.group(1)}]", is_valid
-        
-        # Action found but not in expected format - try to normalize it
-        normalized = normalize_action_to_click(action)
         is_valid = has_think and not has_chinese
-        return normalized, is_valid
+        return action, is_valid
     
     # Last resort: return the last part of response (invalid format)
     return response[-100:] if len(response) > 100 else response, False
@@ -182,9 +264,10 @@ def parse_webshop_action(response: str) -> Tuple[str, bool]:
 class WebshopEnvironment(BaseEnv):
     """
     Webshop Environment adapted for RLLM multi-task training.
+    Tool-call version.
     
     This environment wraps the WebAgentTextEnv from the webshop package
-    and provides a standard RLLM interface.
+    and provides a standard RLLM interface with tool-call format.
     """
     
     def __init__(
@@ -274,21 +357,28 @@ class WebshopEnvironment(BaseEnv):
         """
         Reset the environment for a new episode.
         
+        This method is designed to be efficient for shared environments:
+        - The underlying webshop environment (with loaded product data) is reused
+        - Only the episode state is reset
+        
         Args:
             task: Task dictionary containing goal_idx or instruction
             
         Returns:
             Tuple of (observation, info)
         """
+        # Lazy init only happens once (first call)
         self._lazy_init()
         
         if task is not None:
             self.task = task
         
-        # Reset state
+        # Reset episode state (soft reset)
         self._current_step = 0
         self._done = False
         self._cumulative_reward = 0.0
+        self._instruction_text = ""
+        self._last_info = {}
         
         # Get goal index from task if available
         goal_idx = None
@@ -311,7 +401,7 @@ class WebshopEnvironment(BaseEnv):
         if hasattr(self._env, 'get_available_actions'):
             available_actions = self._env.get_available_actions()
         
-        # Build observation with instruction
+        # Build observation with instruction (tool-call format)
         full_observation = self._build_observation(obs, available_actions)
         
         # Build info dict
@@ -343,13 +433,12 @@ class WebshopEnvironment(BaseEnv):
         else:
             action_str = str(action)
         
-        # Parse action from model response
-        parsed_action, is_valid_format = parse_webshop_action(action_str)
+        # Parse tool call from model response
+        parsed_action, is_valid_format = parse_tool_call(action_str)
         
         self._current_step += 1
         
         # Execute action in environment
-        # 注意：原始环境的 step() 返回的 reward 就是 task_score (0.0 ~ 1.0)
         obs, raw_reward, done, info = self._env.step(parsed_action)
         info = dict(info or {})
         
@@ -358,18 +447,16 @@ class WebshopEnvironment(BaseEnv):
         if hasattr(self._env, 'get_available_actions'):
             available_actions = self._env.get_available_actions()
         
-        # 保存原始的 task_score (0.0 ~ 1.0)
-        # 这是 webshop 环境计算的匹配分数，综合考虑了类型、属性、选项、价格
+        # Calculate task score
         task_score = float(raw_reward) if raw_reward is not None else 0.0
-        task_score = max(0.0, min(1.0, task_score))  # 确保在 [0, 1] 范围内
+        task_score = max(0.0, min(1.0, task_score))
         
-        # 判断是否完美完成（task_score == 1.0）
+        # Check if task is completed successfully
         won = done and task_score >= 1.0
         info['won'] = won
         info['task_score'] = task_score
         
-        # 使用二元奖励：只有完美完成才给 1.0，否则给 0.0
-        # 这与其他任务（math, code）的奖励设计保持一致
+        # Binary reward: 1.0 for perfect completion, 0.0 otherwise
         if done:
             reward = 1.0 if won else 0.0
         else:
@@ -380,9 +467,9 @@ class WebshopEnvironment(BaseEnv):
             done = True
         
         self._done = done
-        self._cumulative_reward += reward  # 累积二元奖励
+        self._cumulative_reward += reward
         
-        # Build observation
+        # Build observation (tool-call format)
         full_observation = self._build_observation(obs, available_actions)
         
         # Build info dict
@@ -391,18 +478,21 @@ class WebshopEnvironment(BaseEnv):
             "available_actions": available_actions,
             "step": self._current_step,
             "max_steps": self.max_steps,
-            "task_score": task_score,  # 原始匹配分数 (0.0 ~ 1.0)
+            "task_score": task_score,
             "is_valid_format": is_valid_format,
             "parsed_action": parsed_action,
             "cumulative_reward": self._cumulative_reward,
-            "done": done,  # 添加 done 状态，供 reward_fn 使用
+            "done": done,
         })
         self._last_info = info
         
         return full_observation, reward, done, info
     
     def _build_observation(self, obs: str, available_actions: Dict) -> str:
-        """Build the full observation string for the agent."""
+        """
+        Build the full observation string for the agent.
+        Uses [button] format for clickable elements to match tool-call style.
+        """
         parts = []
         
         # Add instruction
@@ -412,11 +502,11 @@ class WebshopEnvironment(BaseEnv):
         # Add current page observation
         parts.append(f"\nCurrent Page:\n{obs}")
         
-        # Add available actions hint - this is CRITICAL for the agent
+        # Add available actions in [button] format for tool-call style
         if available_actions:
             clickables = available_actions.get("clickables", [])
             if clickables:
-                # Categorize clickables for better understanding
+                # Categorize clickables
                 navigation_buttons = []
                 product_asins = []
                 options = []
@@ -424,62 +514,77 @@ class WebshopEnvironment(BaseEnv):
                 
                 for item in clickables:
                     item_lower = item.lower()
-                    if item_lower in ['next >', '< prev', 'back to search', 'buy now']:
+                    if item_lower in ['next >', '< prev', 'back to search', 'buy now', 'search']:
                         navigation_buttons.append(item)
                     elif re.match(r'^b\d{2}[a-z0-9]{7}$', item_lower):
-                        product_asins.append(item)
+                        product_asins.append(item.upper())  # ASINs in uppercase
                     elif any(x in item_lower for x in ['size', 'color', 'small', 'medium', 'large', 'xl', 'xxl']):
                         options.append(item)
                     else:
                         other_buttons.append(item)
                 
-                parts.append("\n--- Available Actions ---")
+                parts.append("\n--- Available Buttons ---")
                 
-                # Show navigation buttons first (most important)
+                # Show navigation buttons with [button] format
                 if navigation_buttons:
-                    nav_formatted = [f"click[{b}]" for b in navigation_buttons]
-                    parts.append(f"Navigation: {', '.join(nav_formatted)}")
+                    nav_formatted = [f"[{b.title() if b.lower() not in ['< prev', 'next >'] else b}]" for b in navigation_buttons]
+                    parts.append(f"Navigation: {' '.join(nav_formatted)}")
                 
-                # Show product ASINs (important for product selection)
+                # Show product ASINs
                 if product_asins:
-                    # Show up to 10 products
                     displayed_products = product_asins[:10]
-                    asin_formatted = [f"click[{a}]" for a in displayed_products]
-                    parts.append(f"Products ({len(product_asins)} total): {', '.join(asin_formatted)}")
+                    asin_formatted = [f"[{a}]" for a in displayed_products]
+                    parts.append(f"Products ({len(product_asins)} total): {' '.join(asin_formatted)}")
                     if len(product_asins) > 10:
                         parts.append(f"  ... and {len(product_asins) - 10} more products")
                 
-                # Show options (size, color, etc.)
+                # Show options
                 if options:
-                    opt_formatted = [f"click[{o}]" for o in options[:20]]
-                    parts.append(f"Options: {', '.join(opt_formatted)}")
+                    opt_formatted = [f"[{o}]" for o in options[:20]]
+                    parts.append(f"Options: {' '.join(opt_formatted)}")
                 
                 # Show other buttons
                 if other_buttons:
-                    other_formatted = [f"click[{b}]" for b in other_buttons[:10]]
-                    parts.append(f"Other: {', '.join(other_formatted)}")
+                    other_formatted = [f"[{b}]" for b in other_buttons[:10]]
+                    parts.append(f"Other: {' '.join(other_formatted)}")
             
             if available_actions.get("has_search_bar"):
-                parts.append("\nSearch bar available: Use search[keywords] to search.")
-        
-        # Add action format reminder
-        parts.append("\nRemember: Use search[keywords] or click[element] format for your action.")
+                parts.append("\n[Search] button available - use search tool with query")
         
         return "\n".join(parts)
     
     def close(self):
-        """Close the environment."""
+        """
+        Close the environment.
+        
+        Note: For shared environments managed by SharedEnvironmentManager,
+        this method should NOT be called directly. The manager will handle cleanup.
+        """
         if self._env is not None:
-            self._env.close()
+            try:
+                self._env.close()
+            except Exception as e:
+                logger.warning(f"Error closing webshop environment: {e}")
             self._env = None
             self._initialized = False
+    
+    def soft_reset(self):
+        """
+        Soft reset: only reset episode state without reinitializing the environment.
+        
+        This is useful for shared environments where we want to reuse the
+        initialized environment (with loaded product data) for multiple episodes.
+        """
+        self._current_step = 0
+        self._done = False
+        self._cumulative_reward = 0.0
+        self._instruction_text = ""
+        self._last_info = {}
     
     @staticmethod
     def from_dict(env_args: dict) -> "WebshopEnvironment":
         """Create environment from dictionary configuration."""
-        # 提取已知参数
         known_keys = {"reward_fn", "max_steps", "observation_mode", "seed", "webshop_path", "task"}
-        # 其余参数作为 kwargs 传递给底层环境（如 num_products, file_path, attr_path 等）
         extra_kwargs = {k: v for k, v in env_args.items() if k not in known_keys}
         
         return WebshopEnvironment(
@@ -496,3 +601,9 @@ class WebshopEnvironment(BaseEnv):
     def is_multithread_safe() -> bool:
         """Webshop environment is NOT multithread safe due to Flask server."""
         return False
+
+
+# Export tool definitions
+def get_webshop_tools() -> List[Dict]:
+    """Get the tool definitions for Webshop environment."""
+    return WEBSHOP_TOOLS
