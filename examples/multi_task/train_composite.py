@@ -361,7 +361,13 @@ def main(config):
         }
     }
 
-    # 4. 初始化 Trainer
+    # 4. 预初始化共享环境（优化：避免每个 batch 都重新加载 Webshop 数据）
+    if webshop_num > 0:
+        logger.info(">>> Pre-initializing shared Webshop environment...")
+        CompositeEnvironment.pre_initialize_shared_envs(composite_env_args)
+        logger.info(">>> Shared Webshop environment initialized successfully.")
+
+    # 5. 初始化 Trainer
     trainer = AgentTrainer(
         agent_class=CompositeAgent,
         env_class=CompositeEnvironment,
@@ -373,7 +379,13 @@ def main(config):
     )
     
     logger.info(">>> Starting Composite Training...")
-    trainer.train()
+    try:
+        trainer.train()
+    finally:
+        # 清理共享环境
+        if webshop_num > 0:
+            logger.info(">>> Cleaning up shared environments...")
+            CompositeEnvironment.cleanup_shared_envs()
 
 if __name__ == "__main__":
     main()

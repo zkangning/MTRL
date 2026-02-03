@@ -1,3 +1,4 @@
+#!/bin/bash
 set -x
 
 # ================= 环境变量设置 =================
@@ -39,6 +40,11 @@ RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dir
 # 这里请替换为你实际的 Qwen3-32B 或其他 Base Model 路径
 MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
 
+# ================= Webshop 数据配置 =================
+# 全量训练数据: 约 11,587 个目标 (goal_idx 500-12087)
+# 测试集: 500 个目标 (goal_idx 0-500)
+# 如果需要使用子集进行调试，可以减小 WEBSHOP_TRAIN_NUM 的值
+
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
@@ -46,15 +52,17 @@ python3 -m examples.multi_task.train_composite \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
-    +data.search_num=0\
-    +data.tool_call_num=3200 \
+    +data.search_num=0 \
+    +data.tool_call_num=0 \
     +data.local_search_num=0 \
-    +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_2_math0_code0_tool3k_search0_localsearch0 \
-    trainer.experiment_name='m2_2_math0_code0_tool3k_search0_localsearch0-8b-mixed-tasks' \
-    data.val_batch_size=512 \
-    data.max_prompt_length=6400 \
-    data.max_response_length=20480 \
+    +data.webshop_num=3200 \
+    +data.webshop_path=null \
+    +data.tool_call_data_path='' \
+    +data.dataset_name=m2_3_code0_tool0_localsearch0_webshop3k \
+    trainer.experiment_name='m2_3_code0_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
+    data.val_batch_size=256 \
+    data.max_prompt_length=8192 \
+    data.max_response_length=16384 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     \
@@ -111,7 +119,7 @@ python3 -m examples.multi_task.train_composite \
     trainer.test_freq=25 \
     trainer.total_epochs=10 \
     \
-    rllm.agent.max_steps=10 \
+    rllm.agent.max_steps=15 \
     rllm.stepwise_advantage.enable=False \
     \
     rllm.length_penalty.enable=False \
