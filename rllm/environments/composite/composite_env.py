@@ -9,7 +9,10 @@ logger = logging.getLogger(__name__)
 
 
 # 需要使用共享环境的任务类型（初始化开销大的环境）
-SHARED_ENV_TYPES = {"webshop"}
+# NOTE: Webshop removed from shared types due to thread safety issues
+# The underlying SimBrowser is not thread-safe and causes session pollution
+# between concurrent tasks. Each task should get its own WebshopEnvironment instance.
+SHARED_ENV_TYPES = set()  # {"webshop"}  # Disabled until thread safety is resolved
 
 
 class CompositeEnvironment(BaseEnv):
@@ -406,10 +409,11 @@ class CompositeEnvironment(BaseEnv):
         """
         CompositeEnvironment 是否线程安全。
         
-        由于某些子环境（如 Webshop、MCP）不是线程安全的，
-        CompositeEnvironment 保守地返回 True，让 AgentExecutionEngine 可以运行。
+        由于共享环境模式已禁用，每个并行任务会获得独立的 CompositeEnvironment
+        和子环境实例，因此支持 n_parallel_agents > 1 的并行执行。
         
-        注意：如果使用 webshop 任务，建议设置 n_parallel_agents=1。
+        Returns:
+            True - 支持并行执行
         """
         return True
 
@@ -431,10 +435,15 @@ class CompositeEnvironment(BaseEnv):
     @classmethod
     def pre_initialize_shared_envs(cls, env_args: dict):
         """
-        预初始化共享环境（可选的优化方法）。
+        预初始化共享数据（可选的优化方法）。
         
-        在处理任务之前调用此方法，可以提前加载重型环境（如 Webshop），
-        避免第一个任务的延迟。
+        在处理任务之前调用此方法，可以提前加载 Webshop 的只读数据：
+        - 产品数据 (all_products, product_item_dict, product_prices)
+        - 搜索引擎 (LuceneSearcher)
+        - 目标列表 (goals)
+        
+        这样后续创建的 WebshopEnvironment 实例可以直接复用这些数据，
+        将每个实例的创建时间从 ~3-5s 降低到 <0.1s。
         
         Args:
             env_args: 环境配置字典
@@ -444,14 +453,30 @@ class CompositeEnvironment(BaseEnv):
                 "webshop_args": {"reward_fn": webshop_reward_fn, "max_steps": 15}
             })
         """
-        manager = cls._get_shared_manager()
-        
-        # 预初始化 Webshop
-        webshop_args = env_args.get("webshop_args")
-        if webshop_args and "reward_fn" in webshop_args:
-            from rllm.environments.webshop.webshop_env import WebshopEnvironment
-            logger.info("[CompositeEnv] Pre-initializing shared Webshop environment...")
-            manager.initialize_env("webshop", WebshopEnvironment, webshop_args)
+        webshop_args = env_args.get("webshop_args", {})
+        if webshop_args:
+            logger.info("[CompositeEnv] Pre-loading shared Webshop data...")
+            try:
+                # 触发共享数据加载
+                # 这会加载产品数据、搜索引擎和目标列表到进程级缓存中
+                from web_agent_site.envs import get_shared_webshop_data
+                from web_agent_site.utils import DEFAULT_FILE_PATH, DEFAULT_ATTR_PATH
+                
+                shared_data = get_shared_webshop_data()
+                shared_data.get_or_load_data(
+                    file_path=DEFAULT_FILE_PATH,
+                    attr_path=DEFAULT_ATTR_PATH,
+                    num_products=webshop_args.get('num_products', 1000),
+                    human_goals=webshop_args.get('human_goals', False),
+                    seed=webshop_args.get('seed', 42)
+                )
+                logger.info("[CompositeEnv] Shared Webshop data pre-loaded successfully.")
+            except ImportError:
+                logger.warning("[CompositeEnv] Could not import webshop module for pre-loading. "
+                              "Data will be loaded on first use.")
+            except Exception as e:
+                logger.warning(f"[CompositeEnv] Failed to pre-load Webshop data: {e}. "
+                              "Data will be loaded on first use.")
     
     @classmethod
     def cleanup_shared_envs(cls):

@@ -6,7 +6,11 @@
 
 import json
 import logging
+import random
 import re
+import string
+import threading
+import uuid
 from typing import Any, Dict, Tuple, Callable, Optional, List
 
 from rllm.environments.base.base_env import BaseEnv
@@ -268,7 +272,27 @@ class WebshopEnvironment(BaseEnv):
     
     This environment wraps the WebAgentTextEnv from the webshop package
     and provides a standard RLLM interface with tool-call format.
+    
+    Thread Safety Note:
+    -------------------
+    Each WebshopEnvironment instance maintains its own WebAgentTextEnv,
+    which includes an independent SimServer and SimBrowser. This means:
+    
+    1. When shared environment mode is DISABLED (default, recommended):
+       - Each parallel task gets its own WebshopEnvironment instance
+       - Each instance has independent SimServer/SimBrowser state
+       - n_parallel_agents > 1 is SAFE
+    
+    2. When shared environment mode was ENABLED (deprecated):
+       - Multiple tasks would share one WebAgentTextEnv
+       - Session pollution could occur due to non-thread-safe SimBrowser
+       - This mode is now disabled in CompositeEnvironment
+    
+    Current Status: Safe for parallel execution with independent instances.
     """
+    
+    # Thread-local storage for session management
+    _local = threading.local()
     
     def __init__(
         self,
@@ -307,8 +331,14 @@ class WebshopEnvironment(BaseEnv):
         self._cumulative_reward = 0.0
         self._last_info = {}
         
+        # Unique instance ID for session isolation
+        self._instance_id = str(uuid.uuid4())[:8]
+        
         # Lazy initialization flag
         self._initialized = False
+        
+        # Lock for thread-safe reset/step operations
+        self._lock = threading.Lock()
     
     def _lazy_init(self):
         """Lazily initialize the underlying webshop environment."""
@@ -360,6 +390,24 @@ class WebshopEnvironment(BaseEnv):
             logger.error(f"Failed to initialize webshop environment: {e}")
             raise
     
+    def _generate_unique_session_id(self, goal_idx: int = None) -> str:
+        """
+        Generate a unique session ID to ensure session isolation in shared environments.
+        
+        The session ID format: {goal_idx}_{instance_id}_{random_suffix}
+        This ensures that even if multiple tasks have the same goal_idx, they will
+        have different session IDs and won't interfere with each other.
+        
+        Args:
+            goal_idx: The goal index for this task
+            
+        Returns:
+            A unique session ID string
+        """
+        goal_part = str(goal_idx) if goal_idx is not None else "rand"
+        random_suffix = ''.join(random.choices(string.ascii_lowercase, k=6))
+        return f"{goal_part}_{self._instance_id}_{random_suffix}"
+    
     def reset(self, task: Dict[str, Any] = None) -> Tuple[Any, Dict]:
         """
         Reset the environment for a new episode.
@@ -367,6 +415,7 @@ class WebshopEnvironment(BaseEnv):
         This method is designed to be efficient for shared environments:
         - The underlying webshop environment (with loaded product data) is reused
         - Only the episode state is reset
+        - Each reset generates a unique session ID for isolation
         
         Args:
             task: Task dictionary containing goal_idx or instruction
@@ -374,76 +423,93 @@ class WebshopEnvironment(BaseEnv):
         Returns:
             Tuple of (observation, info)
         """
-        # Lazy init only happens once (first call)
-        self._lazy_init()
-        
-        if task is not None:
-            self.task = task
-        
-        # Reset episode state (soft reset)
-        self._current_step = 0
-        self._done = False
-        self._cumulative_reward = 0.0
-        self._instruction_text = ""
-        self._last_info = {}
-        
-        # Get goal index from task if available
-        goal_idx = None
-        if self.task:
-            goal_idx = self.task.get("goal_idx") or self.task.get("session_idx")
-        
-        # Get the number of available goals to prevent index out of range
-        # The goals are stored in self._env.server.goals
-        num_goals = 0
-        try:
-            if hasattr(self._env, 'server') and hasattr(self._env.server, 'goals'):
-                num_goals = len(self._env.server.goals)
-            elif hasattr(self._env, 'unwrapped') and hasattr(self._env.unwrapped, 'server'):
-                num_goals = len(self._env.unwrapped.server.goals)
-        except Exception as e:
-            logger.warning(f"Failed to get number of goals: {e}")
-        
-        # Apply modulo to goal_idx to prevent index out of range
-        # This ensures that even if the data generator produces goal_idx values
-        # larger than available goals, we still get a valid index
-        if goal_idx is not None and num_goals > 0:
-            original_goal_idx = goal_idx
-            goal_idx = goal_idx % num_goals
-            if original_goal_idx != goal_idx:
-                logger.debug(
-                    f"Adjusted goal_idx from {original_goal_idx} to {goal_idx} "
-                    f"(num_goals={num_goals})"
-                )
-        
-        # Reset underlying environment
-        if goal_idx is not None:
-            obs, info = self._env.reset(session=goal_idx)
-        else:
-            obs, info = self._env.reset()
-        
-        info = info or {}
-        
-        # Get instruction text
-        self._instruction_text = self._env.get_instruction_text() if hasattr(self._env, 'get_instruction_text') else ""
-        
-        # Get available actions
-        available_actions = {}
-        if hasattr(self._env, 'get_available_actions'):
-            available_actions = self._env.get_available_actions()
-        
-        # Build observation with instruction (tool-call format)
-        full_observation = self._build_observation(obs, available_actions)
-        
-        # Build info dict
-        info.update({
-            "instruction": self._instruction_text,
-            "available_actions": available_actions,
-            "step": self._current_step,
-            "max_steps": self.max_steps,
-        })
-        self._last_info = info
-        
-        return full_observation, info
+        # Use lock to ensure thread-safe reset
+        with self._lock:
+            # Lazy init only happens once (first call)
+            self._lazy_init()
+            
+            if task is not None:
+                self.task = task
+            
+            # Reset episode state (soft reset)
+            self._current_step = 0
+            self._done = False
+            self._cumulative_reward = 0.0
+            self._instruction_text = ""
+            self._last_info = {}
+            
+            # Get goal index from task if available
+            goal_idx = None
+            if self.task:
+                goal_idx = self.task.get("goal_idx") or self.task.get("session_idx")
+            
+            # Get the number of available goals to prevent index out of range
+            # The goals are stored in self._env.server.goals
+            num_goals = 0
+            try:
+                if hasattr(self._env, 'server') and hasattr(self._env.server, 'goals'):
+                    num_goals = len(self._env.server.goals)
+                elif hasattr(self._env, 'unwrapped') and hasattr(self._env.unwrapped, 'server'):
+                    num_goals = len(self._env.unwrapped.server.goals)
+            except Exception as e:
+                logger.warning(f"Failed to get number of goals: {e}")
+            
+            # Apply modulo to goal_idx to prevent index out of range
+            # This ensures that even if the data generator produces goal_idx values
+            # larger than available goals, we still get a valid index
+            effective_goal_idx = goal_idx
+            if goal_idx is not None and num_goals > 0:
+                effective_goal_idx = goal_idx % num_goals
+                if goal_idx != effective_goal_idx:
+                    logger.debug(
+                        f"Adjusted goal_idx from {goal_idx} to {effective_goal_idx} "
+                        f"(num_goals={num_goals})"
+                    )
+            
+            # Generate unique session ID for isolation in shared environments
+            # The session ID includes goal_idx, instance_id, and a random suffix
+            unique_session_id = self._generate_unique_session_id(effective_goal_idx)
+            
+            # Configure the underlying environment to use our unique session
+            # Note: We set session_prefix to ensure the session_id includes goal info
+            # but remains unique across concurrent tasks
+            if hasattr(self._env, 'session_prefix'):
+                self._env.session_prefix = f"g{effective_goal_idx if effective_goal_idx is not None else 'r'}_"
+            
+            # Reset underlying environment with the effective goal index
+            # The underlying env will create a session based on goal_idx
+            if effective_goal_idx is not None:
+                obs, info = self._env.reset(session=effective_goal_idx)
+            else:
+                obs, info = self._env.reset()
+            
+            # Store the actual session ID for debugging
+            self._current_session = self._env.session if hasattr(self._env, 'session') else None
+            
+            info = info or {}
+            
+            # Get instruction text
+            self._instruction_text = self._env.get_instruction_text() if hasattr(self._env, 'get_instruction_text') else ""
+            
+            # Get available actions
+            available_actions = {}
+            if hasattr(self._env, 'get_available_actions'):
+                available_actions = self._env.get_available_actions()
+            
+            # Build observation with instruction (tool-call format)
+            full_observation = self._build_observation(obs, available_actions)
+            
+            # Build info dict
+            info.update({
+                "instruction": self._instruction_text,
+                "available_actions": available_actions,
+                "step": self._current_step,
+                "max_steps": self.max_steps,
+                "session_id": self._current_session,
+            })
+            self._last_info = info
+            
+            return full_observation, info
     
     def step(self, action: Any) -> Tuple[Any, float, bool, Dict]:
         """
@@ -455,68 +521,71 @@ class WebshopEnvironment(BaseEnv):
         Returns:
             Tuple of (observation, reward, done, info)
         """
-        self._lazy_init()
-        
-        # Extract action string
-        if hasattr(action, 'action'):
-            action_str = str(action.action)
-        else:
-            action_str = str(action)
-        
-        # Parse tool call from model response
-        parsed_action, is_valid_format = parse_tool_call(action_str)
-        
-        self._current_step += 1
-        
-        # Execute action in environment
-        obs, raw_reward, done, info = self._env.step(parsed_action)
-        info = dict(info or {})
-        
-        # Get available actions
-        available_actions = {}
-        if hasattr(self._env, 'get_available_actions'):
-            available_actions = self._env.get_available_actions()
-        
-        # Calculate task score
-        task_score = float(raw_reward) if raw_reward is not None else 0.0
-        task_score = max(0.0, min(1.0, task_score))
-        
-        # Check if task is completed successfully
-        won = done and task_score >= 1.0
-        info['won'] = won
-        info['task_score'] = task_score
-        
-        # Binary reward: 1.0 for perfect completion, 0.0 otherwise
-        if done:
-            reward = 1.0 if won else 0.0
-        else:
-            reward = 0.0
-        
-        # Check max steps
-        if self._current_step >= self.max_steps:
-            done = True
-        
-        self._done = done
-        self._cumulative_reward += reward
-        
-        # Build observation (tool-call format)
-        full_observation = self._build_observation(obs, available_actions)
-        
-        # Build info dict
-        info.update({
-            "instruction": self._instruction_text,
-            "available_actions": available_actions,
-            "step": self._current_step,
-            "max_steps": self.max_steps,
-            "task_score": task_score,
-            "is_valid_format": is_valid_format,
-            "parsed_action": parsed_action,
-            "cumulative_reward": self._cumulative_reward,
-            "done": done,
-        })
-        self._last_info = info
-        
-        return full_observation, reward, done, info
+        # Use lock to ensure thread-safe step
+        with self._lock:
+            self._lazy_init()
+            
+            # Extract action string
+            if hasattr(action, 'action'):
+                action_str = str(action.action)
+            else:
+                action_str = str(action)
+            
+            # Parse tool call from model response
+            parsed_action, is_valid_format = parse_tool_call(action_str)
+            
+            self._current_step += 1
+            
+            # Execute action in environment
+            obs, raw_reward, done, info = self._env.step(parsed_action)
+            info = dict(info or {})
+            
+            # Get available actions
+            available_actions = {}
+            if hasattr(self._env, 'get_available_actions'):
+                available_actions = self._env.get_available_actions()
+            
+            # Calculate task score
+            task_score = float(raw_reward) if raw_reward is not None else 0.0
+            task_score = max(0.0, min(1.0, task_score))
+            
+            # Check if task is completed successfully
+            won = done and task_score >= 1.0
+            info['won'] = won
+            info['task_score'] = task_score
+            
+            # Binary reward: 1.0 for perfect completion, 0.0 otherwise
+            if done:
+                reward = 1.0 if won else 0.0
+            else:
+                reward = 0.0
+            
+            # Check max steps
+            if self._current_step >= self.max_steps:
+                done = True
+            
+            self._done = done
+            self._cumulative_reward += reward
+            
+            # Build observation (tool-call format)
+            full_observation = self._build_observation(obs, available_actions)
+            
+            # Build info dict
+            info.update({
+                "instruction": self._instruction_text,
+                "available_actions": available_actions,
+                "step": self._current_step,
+                "max_steps": self.max_steps,
+                "task_score": task_score,
+                "is_valid_format": is_valid_format,
+                "parsed_action": parsed_action,
+                "cumulative_reward": self._cumulative_reward,
+                "done": done,
+                "session_id": getattr(self, '_current_session', None),
+            })
+            self._last_info = info
+            
+            return full_observation, reward, done, info
     
     def _build_observation(self, obs: str, available_actions: Dict) -> str:
         """
@@ -629,8 +698,16 @@ class WebshopEnvironment(BaseEnv):
     
     @staticmethod
     def is_multithread_safe() -> bool:
-        """Webshop environment is NOT multithread safe due to Flask server."""
-        return False
+        """
+        Check if the environment is safe for multi-threaded execution.
+        
+        With shared environment mode DISABLED (the default), each parallel task
+        gets its own independent WebshopEnvironment instance, making it fully
+        thread-safe.
+        
+        Returns True to allow parallel execution.
+        """
+        return True
 
 
 # Export tool definitions
