@@ -103,7 +103,7 @@ class SharedWebshopData:
         cache_key = (file_path, attr_path, num_products, human_goals, seed)
         
         if cache_key in self._data_cache:
-            print(f"[SharedWebshopData] Cache hit for config: num_products={num_products}, human_goals={human_goals}")
+            # Cache hit - no need to print every time (too verbose in training)
             return self._data_cache[cache_key]
         
         with self._lock:
@@ -580,7 +580,8 @@ class SimServer:
             self.weights = [goal['weight'] for goal in self.goals]
             self.cum_weights = [0] + np.cumsum(self.weights).tolist()
         
-        print(f'[SimServer] Initialized with {len(self.goals)} goals (shared data)')
+        # Only print on first initialization (tracked by SharedWebshopData cache)
+        # Suppress verbose logging during training
 
         # ========== 实例私有的可变状态 ==========
         # 每个 SimServer 实例有自己独立的 user_sessions
