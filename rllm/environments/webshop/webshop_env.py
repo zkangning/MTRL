@@ -391,6 +391,29 @@ class WebshopEnvironment(BaseEnv):
         if self.task:
             goal_idx = self.task.get("goal_idx") or self.task.get("session_idx")
         
+        # Get the number of available goals to prevent index out of range
+        # The goals are stored in self._env.server.goals
+        num_goals = 0
+        try:
+            if hasattr(self._env, 'server') and hasattr(self._env.server, 'goals'):
+                num_goals = len(self._env.server.goals)
+            elif hasattr(self._env, 'unwrapped') and hasattr(self._env.unwrapped, 'server'):
+                num_goals = len(self._env.unwrapped.server.goals)
+        except Exception as e:
+            logger.warning(f"Failed to get number of goals: {e}")
+        
+        # Apply modulo to goal_idx to prevent index out of range
+        # This ensures that even if the data generator produces goal_idx values
+        # larger than available goals, we still get a valid index
+        if goal_idx is not None and num_goals > 0:
+            original_goal_idx = goal_idx
+            goal_idx = goal_idx % num_goals
+            if original_goal_idx != goal_idx:
+                logger.debug(
+                    f"Adjusted goal_idx from {original_goal_idx} to {goal_idx} "
+                    f"(num_goals={num_goals})"
+                )
+        
         # Reset underlying environment
         if goal_idx is not None:
             obs, info = self._env.reset(session=goal_idx)

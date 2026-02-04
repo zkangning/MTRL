@@ -873,6 +873,11 @@ def load_webshop_data(split: str, num_samples: int) -> List[Dict]:
     【奖励范围】
     环境返回的 task_score 在 [0.0, 1.0] 范围内，与其他任务一致。
     
+    【注意】
+    如果使用 num_products 参数限制产品数量（例如 num_products=1000），
+    实际可用的 goals 数量会远少于这里生成的 goal_idx 范围。
+    WebshopEnvironment.reset() 会自动对 goal_idx 进行取模处理，防止索引越界。
+    
     Args:
         split: 数据集划分 ("train" 或 "test")
         num_samples: 需要的样本数量
