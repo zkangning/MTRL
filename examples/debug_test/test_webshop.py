@@ -52,9 +52,9 @@ def save_detailed_trajectories(results, output_path: str = "debug_trajectories.j
                 
                 steps_details.append({
                     "step_index": step_idx,
+                    "observation": str(step.observation) if step.observation else None,
                     "model_response": step.model_response,
                     "action": str(step.action) if step.action else None,
-                    "observation": str(step.observation) if step.observation else None,  # 截断长观察
                     "task_score": step.info.get("task_score") if step.info else None,
                     "parsed_action": step.info.get("parsed_action") if step.info else None,
                 })

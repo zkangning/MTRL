@@ -632,19 +632,19 @@ class SimServer:
                     status['reward'] = reward
                     status['done'] = True
                 elif clickable_name == BACK_TO_SEARCH.lower():
-                    # If "back to search" clicked, return to the previous search results page
-                    # (preserving keywords and page number)
-                    if session.get("keywords"):
-                        # If we have previous search keywords, return to search results
-                        html, url, status = self.receive(
-                            session_id,
-                            current_url,
-                            keywords=session["keywords"],
-                            page=session.get("page", 1),
-                        )
-                    else:
-                        # If no previous search, reset to initial search page
-                        html, url, status = self.receive(session_id, current_url)
+                    # If "back to search" clicked, ALWAYS return to the initial search page
+                    # This allows the user to enter a new search query
+                    # Reset session state but preserve the goal
+                    self.user_sessions[session_id].update({
+                        'keywords': None,
+                        'page': None,
+                        'asin': None,
+                        'asins': set(),
+                        'options': dict(),
+                        # Note: don't reset 'actions' to track cumulative actions
+                    })
+                    kwargs_reset = {'instruction_text': instruction_text}
+                    html, url = self.index(session_id, **kwargs_reset)
                 elif (clickable_name == NEXT_PAGE.lower() and 
                       self.get_page_name(current_url) == 'search_results'):
                     # If "next page" clicked from search results, re-render with `page` enumerated
