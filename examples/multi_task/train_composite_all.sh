@@ -43,16 +43,16 @@ python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=128 \
     +data.math_num=0 \
-    +data.code_num=0 \
+    +data.code_num=3200 \
     +data.bfcl_num=0 \
     +data.search_num=0 \
     +data.tool_call_num=0 \
     +data.local_search_num=0 \
-    +data.webshop_num=3200 \
+    +data.webshop_num=0 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_3_code3k_tool0_localsearch0_webshop3k \
-    trainer.experiment_name='m2_3_code3k_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
+    +data.dataset_name=m2_4_code3k_tool0_localsearch0_webshop0 \
+    trainer.experiment_name='m2_4_code3k_tool0_localsearch0_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=20480 \
@@ -66,7 +66,7 @@ python3 -m examples.multi_task.train_composite \
     \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
-    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=2 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=26880 \
     \
@@ -87,7 +87,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.mode="async" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.temperature=1.0 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
