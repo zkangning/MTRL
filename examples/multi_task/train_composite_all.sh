@@ -21,9 +21,10 @@ export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000,http://10.217.65.160:8001
 
 
 # Web Shop 任务配置
+# 使用 1000 产品的小数据集和合成 goals（synthetic goals）
 export WEBSHOP_DATA_DIR=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/webshop
 export WEBSHOP_INDEX_DIR=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/webshop/search_engine
-export WEBSHOP_USE_FULL_DATA=true
+export WEBSHOP_USE_FULL_DATA=false  # 使用 1000 产品集（items_shuffle_1000.json, items_ins_v2_1000.json）
 
 # 获取 RLLM 路径
 RLLM_DIR=$(python3 -c "import rllm; import os; print(os.path.dirname(os.path.dirname(rllm.__file__)))")
@@ -34,9 +35,14 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 
 
 # ================= Webshop 数据配置 =================
-# 全量训练数据: 约 11,587 个目标 (goal_idx 500-12087)
-# 测试集: 500 个目标 (goal_idx 0-500)
-# 如果需要使用子集进行调试，可以减小 WEBSHOP_TRAIN_NUM 的值
+# 使用 1000 产品的小数据集和合成 goals（synthetic goals）
+# 合成 goals 基于产品属性和选项组合自动生成
+#
+# 数据划分：
+#   - 测试集: goal_idx 范围 [0, 500) - 固定使用前 500 个目标
+#   - 训练集: goal_idx 范围 [500, total_goals) - 数量由 webshop_num 参数决定
+#
+# 训练数据量通过 +data.webshop_num 参数控制
 
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \

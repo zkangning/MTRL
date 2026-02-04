@@ -320,11 +320,14 @@ def main(config):
             "max_steps": config.rllm.agent.get("max_steps", 20),
         },
         # [新增] Webshop 环境参数
+        # 使用 1000 产品的小数据集和合成 goals（synthetic goals）
         "webshop_args": {
             "reward_fn": webshop_reward_fn,
             "max_steps": config.rllm.agent.get("max_steps", 15),
             "webshop_path": webshop_path,
             "observation_mode": "text",
+            "num_products": 1000,  # 使用 1000 产品的小数据集
+            "human_goals": False,  # 使用合成 goals（synthetic goals）
         }
     }
 

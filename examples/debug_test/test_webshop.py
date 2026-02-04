@@ -83,12 +83,16 @@ def save_detailed_trajectories(results, output_path: str = "debug_trajectories.j
 
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
+    
+    # --- Webshop 数据配置 ---
+    # 使用 1000 产品的小数据集和合成 goals
+    os.environ["WEBSHOP_USE_FULL_DATA"] = "false"  # 使用 1000 产品集
 
     # --- 配置区域 ---
     debug_task_type = "webshop"
     
     n_parallel_agents = 1  # Webshop 环境不是线程安全的，建议使用 1
-    model_name = "Qwen3-8B" 
+    model_name = "Qwen3-8B"
     model_path = "/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-8B"
     
     api_base_url = "http://localhost:8803/v1"
@@ -153,9 +157,10 @@ if __name__ == "__main__":
             "observation_mode": "text",
             "webshop_path": webshop_path,
             "reward_fn": webshop_reward_fn,
-            # 使用 1000 个商品的小数据集（需要先构建 indexes_1k）
-            # 如果使用完整数据集，设为 None
+            # 使用 1000 个商品的小数据集
             "num_products": 1000,
+            # 使用合成 goals（synthetic goals）而非人工标注的 goals
+            "human_goals": False,
         }
     }
 

@@ -850,7 +850,7 @@ def load_tool_call_json_dataset(data_dir: str, split: str = "train", num_samples
         return []
 
 
-def load_webshop_data(split: str, num_samples: int) -> List[Dict]:
+def load_webshop_data(split: str, num_samples: int, total_goals: int = None) -> List[Dict]:
     """
     加载 Webshop 数据 (用于 Webshop 购物任务)
     
@@ -861,26 +861,26 @@ def load_webshop_data(split: str, num_samples: int) -> List[Dict]:
     3. 这里只需要生成 goal_idx 索引，实际的 instruction 会在环境 reset 时获取
     
     【数据来源】
-    原始数据需要通过 webshop 的 setup.sh 脚本下载：
-    - items_shuffle.json: 产品信息 (118万个产品)
-    - items_ins_v2.json: 产品属性
-    - items_human_ins.json: 人工标注的购物指令 (12,087条)
+    使用 1000 产品的小数据集：
+    - items_shuffle_1000.json: 产品信息 (1000个产品)
+    - items_ins_v2_1000.json: 产品属性（合成指令）
+    
+    使用合成 goals (synthetic goals) 而非人工标注的 goals：
+    - 合成 goals 基于产品属性和选项组合自动生成
+    - 1000 产品可能生成数千到数万个 goals（取决于选项组合数）
     
     【数据划分】
-    - 测试集: goal_idx 范围 [0, 500) - 500 个目标
-    - 训练集: goal_idx 范围 [500, total_goals) - 约 11,500+ 个目标
+    - 测试集: goal_idx 范围 [0, 500) - 固定使用前 500 个目标
+    - 训练集: goal_idx 范围 [500, total_goals) - 数量由参数决定
     
     【奖励范围】
     环境返回的 task_score 在 [0.0, 1.0] 范围内，与其他任务一致。
     
-    【注意】
-    如果使用 num_products 参数限制产品数量（例如 num_products=1000），
-    实际可用的 goals 数量会远少于这里生成的 goal_idx 范围。
-    WebshopEnvironment.reset() 会自动对 goal_idx 进行取模处理，防止索引越界。
-    
     Args:
         split: 数据集划分 ("train" 或 "test")
         num_samples: 需要的样本数量
+        total_goals: 合成 goals 的总数量（如果为 None，则使用默认估计值）
+                    对于 1000 产品，通常会有 3000-10000 个合成 goals
         
     Returns:
         List[Dict]: 标准化的数据样本列表，包含 goal_idx 用于环境 reset
@@ -891,16 +891,22 @@ def load_webshop_data(split: str, num_samples: int) -> List[Dict]:
     logger.info(f"Generating Webshop task indices ({split}, num={num_samples})...")
     
     try:
-        # Webshop 的目标索引范围（与原始 webshop 环境保持一致）
-        # 参考: agent_system/environments/env_package/webshop/envs.py
+        # Webshop 使用合成 goals
+        # 测试集：固定使用前 500 个 goals
+        # 训练集：从 500 开始到 total_goals
         if split == "test":
             goal_idx_start = 0
-            goal_idx_end = 500
+            goal_idx_end = 500  # 固定使用前 500 个作为测试集
         else:  # train
             goal_idx_start = 500
-            # 人工标注的目标约有 12,087 个
-            # 实际可用数量取决于 webshop 环境加载的数据
-            goal_idx_end = 12087
+            # 合成 goals 的数量取决于产品数和选项组合
+            # 对于 1000 产品，估计有 5000-15000 个 goals
+            # 使用提供的 total_goals 或默认估计值
+            if total_goals is not None and total_goals > 500:
+                goal_idx_end = total_goals
+            else:
+                # 默认估计：假设 1000 产品平均每个产品 10 个选项组合
+                goal_idx_end = 10000
         
         # 生成可用的 goal 索引列表
         available_indices = list(range(goal_idx_start, goal_idx_end))

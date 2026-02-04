@@ -336,10 +336,11 @@ class WebshopEnvironment(BaseEnv):
             from web_agent_site.envs import WebAgentTextEnv
             
             # Create the environment
-            # 确保使用 human_goals=True，这样只加载 12,087 个人工标注的 goals
-            # 而不是 1100 万个 synthetic goals
+            # 使用 human_goals=False 加载合成 goals（synthetic goals）
+            # 合成 goals 基于产品属性和选项组合自动生成
+            # 对于 1000 产品的小数据集，会生成数千个 goals
             env_kwargs = {
-                'human_goals': True,  # 使用人工标注的 goals
+                'human_goals': False,  # 使用合成的 goals（synthetic goals）
                 **self.kwargs  # 允许外部覆盖
             }
             self._env = gym.make(
