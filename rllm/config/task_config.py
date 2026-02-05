@@ -32,43 +32,43 @@ class TaskTypeConfig:
 DEFAULT_TASK_CONFIGS: Dict[str, TaskTypeConfig] = {
     # Math: 需要较长的推理链，但 prompt 通常较短
     "math": TaskTypeConfig(
-        max_prompt_length=2048,
+        max_prompt_length=4096,
         max_response_length=16384,  # 长推理链
-        max_steps=10,  # 工具调用次数有限
+        max_steps=5,  # 工具调用次数有限
     ),
     
     # Code: prompt 可能包含较长的问题描述，response 需要完整代码
     "code": TaskTypeConfig(
-        max_prompt_length=4096,
-        max_response_length=8192,  # 代码通常不需要太长
+        max_prompt_length=2048,
+        max_response_length=20480,  # 代码通常不需要太长
         max_steps=1,  # 单轮生成
     ),
     
     # Search: 多轮检索，每轮 prompt 会累积
     "search": TaskTypeConfig(
-        max_prompt_length=6144,  # 检索结果会累积到 prompt
-        max_response_length=4096,
-        max_steps=15,  # 多轮检索
+        max_prompt_length=1024,  # 检索结果会累积到 prompt
+        max_response_length=6144,
+        max_steps=4,  # 多轮检索
     ),
     
     # Local Search: 类似 Search
     "local_search": TaskTypeConfig(
-        max_prompt_length=6144,
-        max_response_length=4096,
-        max_steps=15,
+        max_prompt_length=1024,
+        max_response_length=6144,
+        max_steps=4,
     ),
     
     # Tool Call: 工具调用任务
     "tool_call": TaskTypeConfig(
-        max_prompt_length=4096,
+        max_prompt_length=6400,
         max_response_length=4096,
-        max_steps=8,
+        max_steps=1,
     ),
     
     # Webshop: 多轮交互购物
     "webshop": TaskTypeConfig(
-        max_prompt_length=4096,  # 包含产品描述
-        max_response_length=2048,  # 动作较短
+        max_prompt_length=1024,  # 包含产品描述
+        max_response_length=15360,  # 动作较短
         max_steps=15,  # 多轮浏览
     ),
     
