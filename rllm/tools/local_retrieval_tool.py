@@ -14,18 +14,188 @@ Usage:
     For multi-GPU setup:
     3. Launch servers: bash examples/search/retrieval/launch_multi_gpu.sh ./search_data/prebuilt_indices 8000 4
     4. Set env: export RETRIEVAL_SERVER_URL="http://127.0.0.1:8000,http://127.0.0.1:8001,http://127.0.0.1:8002,http://127.0.0.1:8003"
+
+Cache Feature:
+    The tool supports caching of retrieval results to avoid redundant queries.
+    - Set cache_dir parameter or LOCAL_SEARCH_CACHE_DIR env var to enable caching
+    - Cache stores query -> formatted results mapping in JSON format
+    - Cache is shared across all workers/processes using file locks
 """
 
+import json
 import logging
 import os
 import random
-from typing import Any
+import threading
+from typing import Any, Dict, Optional
 
 import httpx
 
 from rllm.tools.tool_base import Tool, ToolOutput
 
 logger = logging.getLogger(__name__)
+
+
+class LocalSearchCache:
+    """
+    本地检索缓存，用于减少重复的检索请求，加速 local_search 任务。
+    
+    特点：
+    - 只缓存 query 和格式化后的检索结果（不包含 URL 等额外信息）
+    - 使用线程锁保证并发安全
+    - 自动持久化到 JSON 文件
+    - 支持多进程共享（通过文件锁）
+    
+    缓存格式：
+    {
+        "query1": "formatted_result1",
+        "query2": "formatted_result2",
+        ...
+    }
+    """
+    
+    def __init__(self, cache_dir: str, cache_filename: str = "local_search_cache.json"):
+        """
+        初始化缓存。
+        
+        Args:
+            cache_dir: 缓存目录路径
+            cache_filename: 缓存文件名
+        """
+        self.cache_dir = cache_dir
+        self.cache_filename = cache_filename
+        self.cache_path = os.path.join(cache_dir, cache_filename)
+        
+        # 创建缓存目录
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+        
+        # 线程锁
+        self._lock = threading.Lock()
+        
+        # 内存缓存
+        self._data: Dict[str, str] = {}
+        
+        # 加载已有缓存
+        self._load()
+        
+        logger.info(f"[LocalSearchCache] Initialized with {len(self._data)} cached queries at {self.cache_path}")
+    
+    def _load(self):
+        """从文件加载缓存数据"""
+        if os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, 'r', encoding='utf-8') as f:
+                    self._data = json.load(f)
+            except Exception as e:
+                logger.warning(f"[LocalSearchCache] Failed to load cache: {e}")
+                self._data = {}
+    
+    def _save(self):
+        """持久化缓存到文件"""
+        try:
+            # 使用临时文件 + rename 保证原子性
+            temp_path = self.cache_path + ".tmp"
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+            os.replace(temp_path, self.cache_path)
+        except Exception as e:
+            logger.error(f"[LocalSearchCache] Failed to save cache: {e}")
+    
+    def _normalize_query(self, query: str) -> str:
+        """
+        规范化 query 作为缓存 key。
+        
+        Args:
+            query: 原始查询字符串
+            
+        Returns:
+            规范化后的查询字符串
+        """
+        # 去除首尾空白，转小写，压缩连续空格
+        normalized = query.strip().lower()
+        normalized = ' '.join(normalized.split())
+        return normalized
+    
+    def _is_valid_result(self, result: str) -> bool:
+        """
+        判断检索结果是否值得缓存。
+        
+        Args:
+            result: 格式化后的检索结果
+            
+        Returns:
+            是否应该缓存
+        """
+        if not result:
+            return False
+        
+        # 错误结果不缓存
+        if result.startswith("Error:") or "error" in result.lower()[:50]:
+            return False
+        
+        # 空结果不缓存
+        if result == "No relevant documents found." or result == "No relevant documents found for the query.":
+            return False
+        
+        # 结果太短不缓存（可能是错误）
+        if len(result.strip()) < 20:
+            return False
+        
+        return True
+    
+    def get(self, query: str) -> Optional[str]:
+        """
+        获取缓存的检索结果。
+        
+        Args:
+            query: 查询字符串
+            
+        Returns:
+            缓存的结果，如果不存在则返回 None
+        """
+        key = self._normalize_query(query)
+        if not key:
+            return None
+        
+        with self._lock:
+            result = self._data.get(key)
+            if result:
+                logger.debug(f"[LocalSearchCache] Cache HIT for query: {key[:50]}...")
+            return result
+    
+    def put(self, query: str, result: str):
+        """
+        缓存检索结果。
+        
+        Args:
+            query: 查询字符串
+            result: 格式化后的检索结果
+        """
+        if not self._is_valid_result(result):
+            return
+        
+        key = self._normalize_query(query)
+        if not key:
+            return
+        
+        with self._lock:
+            # 只在新数据时写入
+            if key not in self._data:
+                self._data[key] = result
+                self._save()
+                logger.debug(f"[LocalSearchCache] Cached result for query: {key[:50]}...")
+    
+    def size(self) -> int:
+        """返回缓存条目数"""
+        return len(self._data)
+    
+    def clear(self):
+        """清空缓存"""
+        with self._lock:
+            self._data = {}
+            self._save()
+            logger.info("[LocalSearchCache] Cache cleared")
 
 
 class LocalRetrievalTool(Tool):
@@ -36,6 +206,11 @@ class LocalRetrievalTool(Tool):
     and performs dense retrieval using E5 embeddings on the indexed Wikipedia corpus.
     
     Supports multiple server URLs for load balancing across multi-GPU deployments.
+    
+    Features:
+    - Load balancing across multiple retrieval servers
+    - Automatic failover on server errors
+    - Result caching to avoid redundant queries
     """
 
     NAME = "local_search"
@@ -48,6 +223,8 @@ class LocalRetrievalTool(Tool):
         server_url: str | list[str] | None = None,
         timeout: float = 30.0,
         max_results: int = 10,
+        cache_dir: str | None = None,
+        enable_cache: bool = True,
     ):
         """
         Initialize the Local Retrieval Tool.
@@ -62,6 +239,9 @@ class LocalRetrievalTool(Tool):
                 - None: checks RETRIEVAL_SERVER_URL env var
             timeout: Request timeout in seconds
             max_results: Maximum number of results to return
+            cache_dir: Directory for caching retrieval results. If None, checks 
+                       LOCAL_SEARCH_CACHE_DIR env var, defaults to "./local_search_cache"
+            enable_cache: Whether to enable caching (default: True)
         """
         # Use environment variable if server_url not provided
         if server_url is None:
@@ -83,6 +263,15 @@ class LocalRetrievalTool(Tool):
         # Track server health for smart load balancing
         self._server_failures: dict[str, int] = {url: 0 for url in self.server_urls}
         self._max_failures = 3  # Mark server as unhealthy after this many consecutive failures
+
+        # 初始化缓存
+        self.enable_cache = enable_cache
+        self.cache: Optional[LocalSearchCache] = None
+        
+        if enable_cache:
+            if cache_dir is None:
+                cache_dir = os.environ.get("LOCAL_SEARCH_CACHE_DIR", "./local_search_cache")
+            self.cache = LocalSearchCache(cache_dir)
 
         super().__init__(name=name, description=description)
 
@@ -192,6 +381,17 @@ class LocalRetrievalTool(Tool):
         if _tried_servers is None:
             _tried_servers = set()
         
+        # 【缓存检查】尝试从缓存获取结果
+        if self.cache and _retry_count == 0:  # 只在首次请求时检查缓存
+            cached_result = self.cache.get(query)
+            if cached_result:
+                logger.debug(f"[LocalRetrievalTool] Cache HIT for query: {query[:50]}...")
+                return ToolOutput(
+                    name=self.name, 
+                    output=cached_result, 
+                    metadata={"query": query, "cache_hit": True, "retriever_type": "dense"}
+                )
+        
         # Select a server (load balancing)
         server_url = self._get_server_url()
         
@@ -253,8 +453,18 @@ class LocalRetrievalTool(Tool):
             # Format results
             formatted_output = self._format_search_results(results)
 
+            # 【缓存写入】保存结果到缓存
+            if self.cache:
+                self.cache.put(query, formatted_output)
+
             # Create metadata for potential downstream use
-            metadata = {"query": query, "num_results": len(results), "retriever_type": "dense", "server_url": server_url}
+            metadata = {
+                "query": query, 
+                "num_results": len(results), 
+                "retriever_type": "dense", 
+                "server_url": server_url,
+                "cache_hit": False
+            }
 
             return ToolOutput(name=self.name, output=formatted_output, metadata=metadata)
 
@@ -277,6 +487,21 @@ class LocalRetrievalTool(Tool):
         except Exception as e:
             return ToolOutput(name=self.name, error=f"Unexpected error: {str(e)}")
 
+    def get_cache_stats(self) -> dict:
+        """
+        获取缓存统计信息。
+        
+        Returns:
+            包含缓存统计的字典
+        """
+        if self.cache:
+            return {
+                "enabled": True,
+                "cache_dir": self.cache.cache_dir,
+                "cache_size": self.cache.size(),
+            }
+        return {"enabled": False}
+
     def __del__(self):
         """Clean up HTTP client."""
         try:
@@ -290,6 +515,8 @@ class LocalRetrievalTool(Tool):
 def create_local_retrieval_tool(
     server_url: str | list[str] = "http://127.0.0.1:8000",
     max_results: int = 10,
+    cache_dir: str | None = None,
+    enable_cache: bool = True,
 ) -> LocalRetrievalTool:
     """
     Create a LocalRetrievalTool instance with specified configuration.
@@ -300,8 +527,15 @@ def create_local_retrieval_tool(
             - Comma-separated: "http://127.0.0.1:8000,http://127.0.0.1:8001"
             - List: ["http://127.0.0.1:8000", "http://127.0.0.1:8001"]
         max_results: Maximum number of results to return
+        cache_dir: Directory for caching results (default: ./local_search_cache)
+        enable_cache: Whether to enable caching (default: True)
 
     Returns:
         LocalRetrievalTool instance
     """
-    return LocalRetrievalTool(server_url=server_url, max_results=max_results)
+    return LocalRetrievalTool(
+        server_url=server_url, 
+        max_results=max_results,
+        cache_dir=cache_dir,
+        enable_cache=enable_cache,
+    )

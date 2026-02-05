@@ -19,6 +19,11 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
 export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005"
 
+# Local Search 缓存配置（可选）
+# 缓存相同 query 的检索结果，避免重复请求，加速训练
+# 缓存文件保存在 LOCAL_SEARCH_CACHE_DIR 目录下的 local_search_cache.json
+export LOCAL_SEARCH_CACHE_DIR="./local_search_cache"
+
 
 # Web Shop 任务配置
 # 使用 1000 产品的小数据集和合成 goals（synthetic goals）
