@@ -79,6 +79,9 @@ class AgentExecutionEngine:
 
         self.agents = [None for _ in range(n_parallel_agents)]
         self.envs = [None for _ in range(n_parallel_agents)]
+        
+        # 用于跟踪已打印配置的任务类型（只打印一次）
+        self._logged_task_configs: set = set()
 
         self.trajectory_timeout = trajectory_timeout
         if not trajectory_timeout:
@@ -202,6 +205,25 @@ class AgentExecutionEngine:
         task_max_prompt_length = info.get("task_max_prompt_length", self.max_prompt_length)
         task_max_response_length = info.get("task_max_response_length", self.max_response_length)
         task_max_steps = info.get("task_max_steps", self.max_steps)
+        
+        # 【调试日志】验证任务级别配置是否生效（每种任务类型只打印一次）
+        task_type = info.get("task_type", "unknown")
+        if task_type not in self._logged_task_configs:
+            self._logged_task_configs.add(task_type)
+            # 判断是否使用了任务级别配置
+            using_task_config = (
+                task_max_prompt_length != self.max_prompt_length or
+                task_max_response_length != self.max_response_length or
+                task_max_steps != self.max_steps
+            )
+            config_source = "✅ TASK-LEVEL CONFIG" if using_task_config else "⚠️ GLOBAL DEFAULT"
+            colorful_print(
+                f"\n[TaskConfig] First trajectory for task_type='{task_type}' | {config_source}\n"
+                f"  max_prompt_length:   {task_max_prompt_length:>6} (global: {self.max_prompt_length})\n"
+                f"  max_response_length: {task_max_response_length:>6} (global: {self.max_response_length})\n"
+                f"  max_steps:           {task_max_steps:>6} (global: {self.max_steps})",
+                "cyan" if using_task_config else "yellow"
+            )
         
         info["max_steps"] = task_max_steps
 
