@@ -213,3 +213,4 @@ difficulty_eval/*
 search_cache_data/*
 trajectories/*
 verl_agent_examples/*
+local_search_cache/*

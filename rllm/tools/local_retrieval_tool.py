@@ -18,16 +18,23 @@ Usage:
 Cache Feature:
     The tool supports caching of retrieval results to avoid redundant queries.
     - Set cache_dir parameter or LOCAL_SEARCH_CACHE_DIR env var to enable caching
-    - Cache stores query -> formatted results mapping in JSON format
-    - Implementation follows SplitToolCache pattern from mcp_env.py
+    - Cache uses SQLite with WAL mode for high-concurrency multi-process access
+    - O(1) query, O(1) write - no file rewriting needed
+    - Two-level cache: memory (L1) + SQLite (L2)
+    
+    Migration from JSON:
+    If you have an existing local_search_cache.json file, you can import it:
+        cache = LocalSearchCache("./local_search_cache")
+        cache.import_from_json("./local_search_cache/local_search_cache.json")
 """
 
 import json
 import logging
 import os
 import random
+import sqlite3
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -38,70 +45,126 @@ logger = logging.getLogger(__name__)
 
 class LocalSearchCache:
     """
-    本地检索缓存，用于减少重复的检索请求，加速 local_search 任务。
+    基于 SQLite 的本地检索缓存，用于减少重复的检索请求，加速 local_search 任务。
     
-    与 SplitToolCache (mcp_env.py) 保持完全一致的实现：
-    - 使用 threading.Lock 保证线程安全
-    - 使用临时文件 + os.replace 保证原子写入
-    - 自动持久化到 JSON 文件
+    高性能、多进程安全的实现：
+    - 使用 SQLite WAL 模式，支持并发读写（读不阻塞写，写不阻塞读）
+    - O(1) 查询复杂度，基于索引快速定位
+    - 增量写入，不需要重写整个文件
+    - 内存一级缓存 + 磁盘二级缓存的多级缓存策略
     
-    缓存格式：
-    {
-        "query1": "formatted_result1",
-        "query2": "formatted_result2",
-        ...
-    }
+    相比 JSON 实现的优势：
+    - 写入：从 O(N) 降低到 O(1)
+    - 读取：从 O(N) 降低到 O(log N)
+    - 并发：从串行化锁降低到 WAL 模式的高并发
     """
     
-    def __init__(self, cache_dir: str, cache_filename: str = "local_search_cache.json"):
+    # SQLite 连接超时（秒），应对多进程写入时的短暂锁定
+    DB_TIMEOUT = 30.0
+    
+    # 批量写入的阈值，超过这个数量时使用事务批量提交
+    BATCH_COMMIT_THRESHOLD = 100
+    
+    def __init__(self, cache_dir: str, cache_filename: str = "local_search_cache.db"):
         """
         初始化缓存。
         
         Args:
             cache_dir: 缓存目录路径
-            cache_filename: 缓存文件名
+            cache_filename: 缓存数据库文件名（默认 .db 后缀）
         """
-        self.cache_dir = cache_dir
-        self.cache_filename = cache_filename
-        self.cache_path = os.path.join(cache_dir, cache_filename)
+        self.cache_dir = os.path.abspath(cache_dir)
+        self.db_path = os.path.join(self.cache_dir, cache_filename)
         
-        # 创建缓存目录
-        if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir, exist_ok=True)
+        # 确保缓存目录存在
+        self._ensure_cache_dir()
         
-        # 线程锁（与 SplitToolCache 一致）
-        self._lock = threading.Lock()
+        # 线程锁（保护单进程内的多线程访问内存缓存）
+        self._thread_lock = threading.Lock()
         
-        # 内存缓存
-        self._data: Dict[str, str] = {}
+        # 内存一级缓存（热数据）
+        self._local_cache: Dict[str, str] = {}
         
-        # 加载已有缓存
-        self._load()
+        # 统计信息
+        self._stats = {
+            "memory_hits": 0,
+            "db_hits": 0,
+            "misses": 0,
+            "writes": 0,
+        }
         
-        logger.info(f"[LocalSearchCache] Initialized with {len(self._data)} cached queries at {self.cache_path}")
+        # 初始化数据库
+        self._init_db()
+        
+        # 预热：加载部分热数据到内存（可选）
+        self._warmup_cache()
+        
+        logger.info(f"[LocalSearchCache] SQLite cache initialized at {self.db_path}, "
+                    f"preloaded {len(self._local_cache)} entries")
     
-    def _load(self):
-        """从文件加载缓存数据"""
-        if os.path.exists(self.cache_path):
-            try:
-                with open(self.cache_path, 'r', encoding='utf-8') as f:
-                    self._data = json.load(f)
-            except Exception:
-                self._data = {}
+    def _ensure_cache_dir(self):
+        """确保缓存目录存在"""
+        os.makedirs(self.cache_dir, exist_ok=True)
     
-    def _save(self):
+    def _get_connection(self) -> sqlite3.Connection:
         """
-        持久化缓存到文件。
-        与 SplitToolCache._save_category() 完全一致。
+        获取数据库连接。
+        每次调用创建新连接，确保多线程安全。
         """
-        with self._lock:
-            try:
-                temp_path = self.cache_path + ".tmp"
-                with open(temp_path, 'w', encoding='utf-8') as f:
-                    json.dump(self._data, f, indent=2, ensure_ascii=False)
-                os.replace(temp_path, self.cache_path)
-            except Exception as e:
-                logger.error(f"[LocalSearchCache] Failed to save cache: {e}")
+        conn = sqlite3.connect(self.db_path, timeout=self.DB_TIMEOUT)
+        # 开启 WAL 模式和优化配置
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")  # 兼顾性能与安全
+        conn.execute("PRAGMA cache_size=10000;")     # 增大页面缓存
+        conn.execute("PRAGMA temp_store=MEMORY;")    # 临时表存内存
+        return conn
+    
+    def _init_db(self):
+        """初始化 SQLite 表结构"""
+        try:
+            with self._get_connection() as conn:
+                # 创建缓存表
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS search_cache (
+                        query_key TEXT PRIMARY KEY,
+                        query_raw TEXT,
+                        result TEXT,
+                        result_length INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        access_count INTEGER DEFAULT 0
+                    )
+                """)
+                
+                # 创建索引（PRIMARY KEY 已有索引，这里为访问频次创建索引用于热数据预热）
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_access_count
+                    ON search_cache(access_count DESC)
+                """)
+                
+                conn.commit()
+                
+        except sqlite3.Error as e:
+            logger.error(f"[LocalSearchCache] DB initialization failed: {e}")
+            raise
+    
+    def _warmup_cache(self, limit: int = 1000):
+        """
+        预热缓存：加载访问频次最高的条目到内存。
+        
+        Args:
+            limit: 预热条目数量上限
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT query_key, result FROM search_cache "
+                    "ORDER BY access_count DESC LIMIT ?",
+                    (limit,)
+                )
+                for row in cursor:
+                    self._local_cache[row[0]] = row[1]
+        except sqlite3.Error as e:
+            logger.warning(f"[LocalSearchCache] Cache warmup failed: {e}")
     
     def _normalize_query(self, query: str) -> str:
         """
@@ -113,7 +176,6 @@ class LocalSearchCache:
         Returns:
             规范化后的查询字符串
         """
-        # 去除首尾空白，转小写，压缩连续空格
         normalized = query.strip().lower()
         normalized = ' '.join(normalized.split())
         return normalized
@@ -121,7 +183,6 @@ class LocalSearchCache:
     def _is_valid_result(self, result: str) -> bool:
         """
         判断检索结果是否值得缓存。
-        与 SplitToolCache._is_valid_response() 保持类似逻辑。
         
         Args:
             result: 格式化后的检索结果
@@ -132,16 +193,15 @@ class LocalSearchCache:
         if not result:
             return False
         
-        # 错误结果不缓存（与 SplitToolCache 一致）
+        # 错误结果不缓存
         if "execution failed" in result or result.strip().startswith("Error:"):
-            logger.info(f"[LocalSearchCache] Detected error in result, skipping cache.")
             return False
         
         # 空结果不缓存
-        if result == "No relevant documents found." or result == "No relevant documents found for the query.":
+        if result in ("No relevant documents found.", "No relevant documents found for the query."):
             return False
         
-        # 结果太短不缓存（可能是错误，与 scrape_as_markdown 检查类似）
+        # 结果太短不缓存（可能是错误）
         if len(result.strip()) < 20:
             return False
         
@@ -150,7 +210,7 @@ class LocalSearchCache:
     def get(self, query: str) -> Optional[str]:
         """
         获取缓存的检索结果。
-        与 SplitToolCache.get() 一致。
+        采用两级缓存策略：内存 -> SQLite。
         
         Args:
             query: 查询字符串
@@ -161,12 +221,54 @@ class LocalSearchCache:
         key = self._normalize_query(query)
         if not key:
             return None
-        return self._data.get(key)
+        
+        # Level 1: 检查内存缓存（O(1)）
+        with self._thread_lock:
+            if key in self._local_cache:
+                self._stats["memory_hits"] += 1
+                return self._local_cache[key]
+        
+        # Level 2: 查询 SQLite（O(log N)，只查这一条，不加载整个文件）
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute(
+                    "SELECT result FROM search_cache WHERE query_key = ?",
+                    (key,)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    result = row[0]
+                    
+                    # 更新访问计数（异步更新，不阻塞返回）
+                    try:
+                        conn.execute(
+                            "UPDATE search_cache SET access_count = access_count + 1 "
+                            "WHERE query_key = ?",
+                            (key,)
+                        )
+                        conn.commit()
+                    except sqlite3.Error:
+                        pass  # 更新失败不影响主逻辑
+                    
+                    # 回填内存缓存
+                    with self._thread_lock:
+                        self._local_cache[key] = result
+                    
+                    self._stats["db_hits"] += 1
+                    return result
+                    
+        except sqlite3.Error as e:
+            logger.warning(f"[LocalSearchCache] DB read error: {e}")
+        
+        self._stats["misses"] += 1
+        return None
     
     def put(self, query: str, result: str):
         """
-        缓存检索结果。
-        与 SplitToolCache.put() 完全一致。
+        缓存检索结果（增量写入，多进程安全）。
+        
+        使用 INSERT OR IGNORE 避免并发写入冲突。
         
         Args:
             query: 查询字符串
@@ -179,23 +281,191 @@ class LocalSearchCache:
         if not key:
             return
         
-        with self._lock:
-            if key not in self._data:
-                self._data[key] = result
+        # 检查内存缓存是否已存在
+        with self._thread_lock:
+            if key in self._local_cache:
+                return  # 已存在，不重复写入
+            # 更新内存缓存
+            self._local_cache[key] = result
         
-        # 只有在确实写入了新数据且有效时才保存
-        self._save()
+        # 写入 SQLite（INSERT OR IGNORE 避免冲突）
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO search_cache "
+                    "(query_key, query_raw, result, result_length) VALUES (?, ?, ?, ?)",
+                    (key, query, result, len(result))
+                )
+                conn.commit()
+                self._stats["writes"] += 1
+                
+        except sqlite3.Error as e:
+            logger.error(f"[LocalSearchCache] DB write error: {e}")
+    
+    def put_batch(self, entries: Dict[str, str]):
+        """
+        批量缓存检索结果（使用事务，大幅减少 IO）。
+        
+        Args:
+            entries: {query: result} 字典
+        """
+        valid_entries: List[Tuple[str, str, str, int]] = []
+        
+        for query, result in entries.items():
+            if not self._is_valid_result(result):
+                continue
+            key = self._normalize_query(query)
+            if not key:
+                continue
+            
+            # 检查内存缓存是否已存在
+            with self._thread_lock:
+                if key in self._local_cache:
+                    continue
+                self._local_cache[key] = result
+            
+            valid_entries.append((key, query, result, len(result)))
+        
+        if not valid_entries:
+            return
+        
+        # 批量写入 SQLite（单个事务）
+        try:
+            with self._get_connection() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO search_cache "
+                    "(query_key, query_raw, result, result_length) VALUES (?, ?, ?, ?)",
+                    valid_entries
+                )
+                conn.commit()
+                self._stats["writes"] += len(valid_entries)
+                logger.debug(f"[LocalSearchCache] Batch inserted {len(valid_entries)} entries")
+                
+        except sqlite3.Error as e:
+            logger.error(f"[LocalSearchCache] DB batch write error: {e}")
     
     def size(self) -> int:
-        """返回缓存条目数"""
-        return len(self._data)
+        """返回缓存总条目数"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute("SELECT COUNT(*) FROM search_cache")
+                return cursor.fetchone()[0]
+        except sqlite3.Error:
+            return len(self._local_cache)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        获取缓存统计信息。
+        
+        Returns:
+            包含命中率等统计的字典
+        """
+        total_requests = (self._stats["memory_hits"] +
+                          self._stats["db_hits"] +
+                          self._stats["misses"])
+        
+        hit_rate = 0.0
+        if total_requests > 0:
+            hit_rate = (self._stats["memory_hits"] + self._stats["db_hits"]) / total_requests
+        
+        return {
+            "db_path": self.db_path,
+            "total_entries": self.size(),
+            "memory_cache_size": len(self._local_cache),
+            "memory_hits": self._stats["memory_hits"],
+            "db_hits": self._stats["db_hits"],
+            "misses": self._stats["misses"],
+            "writes": self._stats["writes"],
+            "hit_rate": f"{hit_rate:.2%}",
+        }
+    
+    def refresh(self):
+        """刷新内存缓存（重新预热）"""
+        with self._thread_lock:
+            self._local_cache.clear()
+        self._warmup_cache()
+        logger.info(f"[LocalSearchCache] Cache refreshed, {len(self._local_cache)} entries loaded")
     
     def clear(self):
-        """清空缓存"""
-        with self._lock:
-            self._data = {}
-        self._save()
-        logger.info("[LocalSearchCache] Cache cleared")
+        """清空所有缓存（谨慎使用）"""
+        with self._thread_lock:
+            self._local_cache.clear()
+        
+        try:
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM search_cache")
+                conn.execute("VACUUM")  # 回收空间
+                conn.commit()
+            logger.info("[LocalSearchCache] Cache cleared")
+        except sqlite3.Error as e:
+            logger.error(f"[LocalSearchCache] Failed to clear cache: {e}")
+    
+    def optimize(self):
+        """优化数据库（定期调用，减少碎片）"""
+        try:
+            with self._get_connection() as conn:
+                conn.execute("PRAGMA optimize;")
+                conn.execute("VACUUM;")
+                conn.commit()
+            logger.info("[LocalSearchCache] Database optimized")
+        except sqlite3.Error as e:
+            logger.warning(f"[LocalSearchCache] Optimization failed: {e}")
+    
+    def export_to_json(self, output_path: str):
+        """
+        导出缓存到 JSON 文件（用于备份或迁移）。
+        
+        Args:
+            output_path: 输出文件路径
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.execute("SELECT query_key, result FROM search_cache")
+                data = {row[0]: row[1] for row in cursor}
+            
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            
+            logger.info(f"[LocalSearchCache] Exported {len(data)} entries to {output_path}")
+        except Exception as e:
+            logger.error(f"[LocalSearchCache] Export failed: {e}")
+    
+    def import_from_json(self, input_path: str):
+        """
+        从 JSON 文件导入缓存（用于迁移旧数据）。
+        
+        Args:
+            input_path: 输入文件路径
+        """
+        try:
+            with open(input_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            if not isinstance(data, dict):
+                logger.error("[LocalSearchCache] Invalid JSON format for import")
+                return
+            
+            # 批量导入
+            entries = []
+            for key, result in data.items():
+                if self._is_valid_result(result):
+                    entries.append((key, key, result, len(result)))
+            
+            with self._get_connection() as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO search_cache "
+                    "(query_key, query_raw, result, result_length) VALUES (?, ?, ?, ?)",
+                    entries
+                )
+                conn.commit()
+            
+            logger.info(f"[LocalSearchCache] Imported {len(entries)} entries from {input_path}")
+            
+            # 刷新内存缓存
+            self.refresh()
+            
+        except Exception as e:
+            logger.error(f"[LocalSearchCache] Import failed: {e}")
 
 
 class LocalRetrievalTool(Tool):
@@ -495,11 +765,9 @@ class LocalRetrievalTool(Tool):
             包含缓存统计的字典
         """
         if self.cache:
-            return {
-                "enabled": True,
-                "cache_dir": self.cache.cache_dir,
-                "cache_size": self.cache.size(),
-            }
+            stats = self.cache.get_stats()
+            stats["enabled"] = True
+            return stats
         return {"enabled": False}
 
     def __del__(self):

@@ -21,8 +21,9 @@ export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001
 
 # Local Search 缓存配置（可选）
 # 缓存相同 query 的检索结果，避免重复请求，加速训练
-# 缓存文件保存在 LOCAL_SEARCH_CACHE_DIR 目录下的 local_search_cache.json
-export LOCAL_SEARCH_CACHE_DIR="./local_search_cache"
+# 使用 SQLite 数据库存储，支持高并发多进程读写（WAL 模式）
+# 缓存数据库保存在 LOCAL_SEARCH_CACHE_DIR 目录下的 local_search_cache.db
+export LOCAL_SEARCH_CACHE_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/local_search_cache"
 
 
 # Web Shop 任务配置
