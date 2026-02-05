@@ -17,7 +17,7 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # ================= Local Search 多 GPU 配置 =================
 # 多服务器负载均衡模式（推荐）- 逗号分隔多个服务器地址
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
-export RETRIEVAL_SERVER_URL="http://10.217.65.160:8000,http://10.217.65.160:8001,http://10.217.65.160:8002,http://10.217.65.160:8003,http://10.217.65.160:8004,http://10.217.65.160:8005"
+export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005"
 
 
 # Web Shop 任务配置
@@ -71,16 +71,16 @@ python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=128 \
     +data.math_num=0 \
-    +data.code_num=3200 \
+    +data.code_num=0 \
     +data.bfcl_num=0 \
     +data.search_num=0 \
     +data.tool_call_num=0 \
-    +data.local_search_num=0 \
+    +data.local_search_num=3200 \
     +data.webshop_num=0 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_4_code3k_tool0_localsearch0_webshop0 \
-    trainer.experiment_name='m2_4_code3k_tool0_localsearch0_webshop0-8b-mixed-tasks' \
+    +data.dataset_name=m2_5_code0_tool0_localsearch3k_webshop0 \
+    trainer.experiment_name='m2_5_code0_tool0_localsearch3k_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=20480 \
@@ -124,7 +124,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.actor.ppo_mini_batch_size=2 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=26880 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32000 \
     \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
