@@ -19,7 +19,7 @@ Cache Feature:
     The tool supports caching of retrieval results to avoid redundant queries.
     - Set cache_dir parameter or LOCAL_SEARCH_CACHE_DIR env var to enable caching
     - Cache stores query -> formatted results mapping in JSON format
-    - Cache is shared across all workers/processes using file locks
+    - Implementation follows SplitToolCache pattern from mcp_env.py
 """
 
 import json
@@ -40,10 +40,10 @@ class LocalSearchCache:
     """
     本地检索缓存，用于减少重复的检索请求，加速 local_search 任务。
     
-    与 MCP 环境中的 SplitToolCache 保持一致的实现逻辑：
-    - 使用线程锁保证并发安全（锁只保护 data 更新，save 独立加锁）
-    - 自动持久化到 JSON 文件（原子写入）
-    - 支持多线程共享
+    与 SplitToolCache (mcp_env.py) 保持完全一致的实现：
+    - 使用 threading.Lock 保证线程安全
+    - 使用临时文件 + os.replace 保证原子写入
+    - 自动持久化到 JSON 文件
     
     缓存格式：
     {
@@ -69,9 +69,8 @@ class LocalSearchCache:
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir, exist_ok=True)
         
-        # 线程锁（与 SplitToolCache 一致：data 锁和 save 锁分离）
-        self._data_lock = threading.Lock()
-        self._save_lock = threading.Lock()
+        # 线程锁（与 SplitToolCache 一致）
+        self._lock = threading.Lock()
         
         # 内存缓存
         self._data: Dict[str, str] = {}
@@ -87,18 +86,16 @@ class LocalSearchCache:
             try:
                 with open(self.cache_path, 'r', encoding='utf-8') as f:
                     self._data = json.load(f)
-            except Exception as e:
-                logger.warning(f"[LocalSearchCache] Failed to load cache: {e}")
+            except Exception:
                 self._data = {}
     
     def _save(self):
         """
         持久化缓存到文件。
-        与 SplitToolCache._save_category() 保持一致：独立加锁，原子写入。
+        与 SplitToolCache._save_category() 完全一致。
         """
-        with self._save_lock:
+        with self._lock:
             try:
-                # 使用临时文件 + rename 保证原子性
                 temp_path = self.cache_path + ".tmp"
                 with open(temp_path, 'w', encoding='utf-8') as f:
                     json.dump(self._data, f, indent=2, ensure_ascii=False)
@@ -153,6 +150,7 @@ class LocalSearchCache:
     def get(self, query: str) -> Optional[str]:
         """
         获取缓存的检索结果。
+        与 SplitToolCache.get() 一致。
         
         Args:
             query: 查询字符串
@@ -163,17 +161,12 @@ class LocalSearchCache:
         key = self._normalize_query(query)
         if not key:
             return None
-        
-        # 读取时加锁（与 SplitToolCache.get 一致，直接读取无需加锁因为 dict.get 是线程安全的）
-        result = self._data.get(key)
-        if result:
-            logger.debug(f"[LocalSearchCache] Cache HIT for query: {key[:50]}...")
-        return result
+        return self._data.get(key)
     
     def put(self, query: str, result: str):
         """
         缓存检索结果。
-        与 SplitToolCache.put() 保持一致：先用 data_lock 更新内存，再调用 _save()。
+        与 SplitToolCache.put() 完全一致。
         
         Args:
             query: 查询字符串
@@ -186,17 +179,12 @@ class LocalSearchCache:
         if not key:
             return
         
-        need_save = False
-        with self._data_lock:
-            # 只在新数据时写入
+        with self._lock:
             if key not in self._data:
                 self._data[key] = result
-                need_save = True
         
-        # 只有在确实写入了新数据且有效时才保存（与 SplitToolCache 一致）
-        if need_save:
-            self._save()
-            logger.debug(f"[LocalSearchCache] Cached result for query: {key[:50]}...")
+        # 只有在确实写入了新数据且有效时才保存
+        self._save()
     
     def size(self) -> int:
         """返回缓存条目数"""
@@ -204,7 +192,7 @@ class LocalSearchCache:
     
     def clear(self):
         """清空缓存"""
-        with self._data_lock:
+        with self._lock:
             self._data = {}
         self._save()
         logger.info("[LocalSearchCache] Cache cleared")
