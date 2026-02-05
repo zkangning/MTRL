@@ -40,11 +40,10 @@ class LocalSearchCache:
     """
     本地检索缓存，用于减少重复的检索请求，加速 local_search 任务。
     
-    特点：
-    - 只缓存 query 和格式化后的检索结果（不包含 URL 等额外信息）
-    - 使用线程锁保证并发安全
-    - 自动持久化到 JSON 文件
-    - 支持多进程共享（通过文件锁）
+    与 MCP 环境中的 SplitToolCache 保持一致的实现逻辑：
+    - 使用线程锁保证并发安全（锁只保护 data 更新，save 独立加锁）
+    - 自动持久化到 JSON 文件（原子写入）
+    - 支持多线程共享
     
     缓存格式：
     {
@@ -70,8 +69,9 @@ class LocalSearchCache:
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir, exist_ok=True)
         
-        # 线程锁
-        self._lock = threading.Lock()
+        # 线程锁（与 SplitToolCache 一致：data 锁和 save 锁分离）
+        self._data_lock = threading.Lock()
+        self._save_lock = threading.Lock()
         
         # 内存缓存
         self._data: Dict[str, str] = {}
@@ -92,15 +92,19 @@ class LocalSearchCache:
                 self._data = {}
     
     def _save(self):
-        """持久化缓存到文件"""
-        try:
-            # 使用临时文件 + rename 保证原子性
-            temp_path = self.cache_path + ".tmp"
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(self._data, f, indent=2, ensure_ascii=False)
-            os.replace(temp_path, self.cache_path)
-        except Exception as e:
-            logger.error(f"[LocalSearchCache] Failed to save cache: {e}")
+        """
+        持久化缓存到文件。
+        与 SplitToolCache._save_category() 保持一致：独立加锁，原子写入。
+        """
+        with self._save_lock:
+            try:
+                # 使用临时文件 + rename 保证原子性
+                temp_path = self.cache_path + ".tmp"
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(self._data, f, indent=2, ensure_ascii=False)
+                os.replace(temp_path, self.cache_path)
+            except Exception as e:
+                logger.error(f"[LocalSearchCache] Failed to save cache: {e}")
     
     def _normalize_query(self, query: str) -> str:
         """
@@ -120,6 +124,7 @@ class LocalSearchCache:
     def _is_valid_result(self, result: str) -> bool:
         """
         判断检索结果是否值得缓存。
+        与 SplitToolCache._is_valid_response() 保持类似逻辑。
         
         Args:
             result: 格式化后的检索结果
@@ -130,15 +135,16 @@ class LocalSearchCache:
         if not result:
             return False
         
-        # 错误结果不缓存
-        if result.startswith("Error:") or "error" in result.lower()[:50]:
+        # 错误结果不缓存（与 SplitToolCache 一致）
+        if "execution failed" in result or result.strip().startswith("Error:"):
+            logger.info(f"[LocalSearchCache] Detected error in result, skipping cache.")
             return False
         
         # 空结果不缓存
         if result == "No relevant documents found." or result == "No relevant documents found for the query.":
             return False
         
-        # 结果太短不缓存（可能是错误）
+        # 结果太短不缓存（可能是错误，与 scrape_as_markdown 检查类似）
         if len(result.strip()) < 20:
             return False
         
@@ -158,15 +164,16 @@ class LocalSearchCache:
         if not key:
             return None
         
-        with self._lock:
-            result = self._data.get(key)
-            if result:
-                logger.debug(f"[LocalSearchCache] Cache HIT for query: {key[:50]}...")
-            return result
+        # 读取时加锁（与 SplitToolCache.get 一致，直接读取无需加锁因为 dict.get 是线程安全的）
+        result = self._data.get(key)
+        if result:
+            logger.debug(f"[LocalSearchCache] Cache HIT for query: {key[:50]}...")
+        return result
     
     def put(self, query: str, result: str):
         """
         缓存检索结果。
+        与 SplitToolCache.put() 保持一致：先用 data_lock 更新内存，再调用 _save()。
         
         Args:
             query: 查询字符串
@@ -179,12 +186,17 @@ class LocalSearchCache:
         if not key:
             return
         
-        with self._lock:
+        need_save = False
+        with self._data_lock:
             # 只在新数据时写入
             if key not in self._data:
                 self._data[key] = result
-                self._save()
-                logger.debug(f"[LocalSearchCache] Cached result for query: {key[:50]}...")
+                need_save = True
+        
+        # 只有在确实写入了新数据且有效时才保存（与 SplitToolCache 一致）
+        if need_save:
+            self._save()
+            logger.debug(f"[LocalSearchCache] Cached result for query: {key[:50]}...")
     
     def size(self) -> int:
         """返回缓存条目数"""
@@ -192,10 +204,10 @@ class LocalSearchCache:
     
     def clear(self):
         """清空缓存"""
-        with self._lock:
+        with self._data_lock:
             self._data = {}
-            self._save()
-            logger.info("[LocalSearchCache] Cache cleared")
+        self._save()
+        logger.info("[LocalSearchCache] Cache cleared")
 
 
 class LocalRetrievalTool(Tool):
