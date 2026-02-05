@@ -32,7 +32,11 @@ from rllm.data.utils import (
     load_tool_call_dataset,
     load_tool_call_json_dataset,
     load_webshop_data,  # [新增] Webshop 数据加载
+    set_task_config_manager,  # [新增] 设置任务配置管理器
 )
+
+# [新增] 引入任务配置模块
+from rllm.config.task_config import TaskConfigManager, DEFAULT_TASK_CONFIGS
 
 # 引入 System Prompts
 from rllm.agents.system_prompts import MATH_SYSTEM_PROMPT, SEARCH_SYSTEM_PROMPT, LOCAL_SEARCH_SYSTEM_PROMPT
@@ -210,6 +214,41 @@ def main(config):
     local_search_num = config.data.get("local_search_num", 0)  # [新增] Local Search 数量
     webshop_num = config.data.get("webshop_num", 0)  # [新增] Webshop 数量
     webshop_path = config.data.get("webshop_path", None)  # [新增] Webshop 环境路径
+
+    # ============================================================
+    # [新增] 任务级别参数配置
+    # 支持为不同任务类型设置不同的 max_prompt_length, max_response_length, max_steps
+    # 这些参数会被注入到每条数据的 extra_info 中，在执行引擎中动态使用
+    # ============================================================
+    task_configs = config.get("task_configs", {})
+    
+    # 如果配置中有自定义的任务参数，解析并创建配置管理器
+    custom_task_configs = {}
+    if task_configs:
+        # 支持在 config 中指定每种任务的参数，例如：
+        # task_configs:
+        #   math:
+        #     max_prompt_length: 2048
+        #     max_response_length: 16384
+        #     max_steps: 10
+        #   code:
+        #     max_prompt_length: 4096
+        #     max_response_length: 8192
+        #     max_steps: 1
+        for task_type, params in task_configs.items():
+            if isinstance(params, dict):
+                custom_task_configs[task_type] = dict(params)
+    
+    # 创建并设置全局任务配置管理器
+    task_config_manager = TaskConfigManager(custom_task_configs)
+    set_task_config_manager(task_config_manager)
+    
+    # 打印任务配置摘要
+    logger.info("\n" + task_config_manager.summary())
+    
+    # 获取全局最大值（用于 padding 等全局参数）
+    global_max = task_config_manager.get_global_max_lengths()
+    logger.info(f"Global max values: {global_max}")
 
     # --- Search / MCP 环境配置 ---
     mcp_tool_map = {}

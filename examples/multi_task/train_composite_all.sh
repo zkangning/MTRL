@@ -44,6 +44,28 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 #
 # 训练数据量通过 +data.webshop_num 参数控制
 
+# ================= 任务级别配置说明 =================
+# 【新功能】不同任务类型可以配置不同的参数：
+#   - max_prompt_length: 最大 prompt 长度
+#   - max_response_length: 最大 response 长度  
+#   - max_steps: 最大交互步数
+#
+# 配置方式：通过 +task_configs.{task_type}.{param}={value} 格式
+#
+# 默认值（在 rllm/config/task_config.py 中定义）：
+#   math:        prompt=2048,  response=16384, steps=10
+#   code:        prompt=4096,  response=8192,  steps=1
+#   search:      prompt=6144,  response=4096,  steps=15
+#   local_search: prompt=6144, response=4096,  steps=15
+#   tool_call:   prompt=4096,  response=4096,  steps=8
+#   webshop:     prompt=4096,  response=2048,  steps=15
+#   bfcl:        prompt=4096,  response=4096,  steps=5
+#
+# 【重要】全局 data.max_prompt_length 和 data.max_response_length 仍然需要设置：
+# - 作为 padding 的全局上限
+# - 应设置为所有任务中最大值的上界
+# - 建议设为所有任务配置中最大值的 1.2-1.5 倍
+
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
@@ -64,6 +86,26 @@ python3 -m examples.multi_task.train_composite \
     data.max_response_length=20480 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
+    \
+    '+task_configs.math.max_prompt_length=2048' \
+    '+task_configs.math.max_response_length=16384' \
+    '+task_configs.math.max_steps=10' \
+    \
+    '+task_configs.code.max_prompt_length=4096' \
+    '+task_configs.code.max_response_length=8192' \
+    '+task_configs.code.max_steps=1' \
+    \
+    '+task_configs.search.max_prompt_length=6144' \
+    '+task_configs.search.max_response_length=4096' \
+    '+task_configs.search.max_steps=15' \
+    \
+    '+task_configs.tool_call.max_prompt_length=4096' \
+    '+task_configs.tool_call.max_response_length=4096' \
+    '+task_configs.tool_call.max_steps=8' \
+    \
+    '+task_configs.webshop.max_prompt_length=4096' \
+    '+task_configs.webshop.max_response_length=2048' \
+    '+task_configs.webshop.max_steps=15' \
     \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.hybrid_engine=True \

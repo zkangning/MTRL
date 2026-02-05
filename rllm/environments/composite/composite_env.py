@@ -290,6 +290,13 @@ class CompositeEnvironment(BaseEnv):
         """
         重置环境，根据任务类型路由到对应的子环境。
         
+        【新增功能】自动将任务级别的配置参数注入到 info 中：
+        - task_max_prompt_length: 该任务类型的最大 prompt 长度
+        - task_max_response_length: 该任务类型的最大 response 长度
+        - task_max_steps: 该任务类型的最大交互步数
+        
+        执行引擎会在运行时读取这些参数，实现动态配置。
+        
         Args:
             task: 任务数据字典
             
@@ -301,6 +308,11 @@ class CompositeEnvironment(BaseEnv):
         
         # 获取任务类型，默认为 "math"（而非 "bfcl"，因为 math 更常用）
         self.active_task_type = current_task.get("task_type", "math")
+        
+        # 【新增】提取任务级别的配置参数
+        self._task_max_prompt_length = current_task.get("task_max_prompt_length")
+        self._task_max_response_length = current_task.get("task_max_response_length")
+        self._task_max_steps = current_task.get("task_max_steps")
         
         # 懒加载对应的环境
         try:
@@ -349,6 +361,16 @@ class CompositeEnvironment(BaseEnv):
 
         info = info or {}
         info["task_type"] = self.active_task_type
+        
+        # 【新增】将任务级别的配置参数注入到 info 中
+        # 执行引擎会在每个 trajectory 开始时读取这些参数
+        if self._task_max_prompt_length is not None:
+            info["task_max_prompt_length"] = self._task_max_prompt_length
+        if self._task_max_response_length is not None:
+            info["task_max_response_length"] = self._task_max_response_length
+        if self._task_max_steps is not None:
+            info["task_max_steps"] = self._task_max_steps
+            
         return obs, info
 
     def step(self, action: Any) -> Tuple[Any, float, bool, Dict]:

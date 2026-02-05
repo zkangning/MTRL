@@ -6,7 +6,7 @@ import requests
 import random
 import os
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datasets import load_dataset
 from collections import Counter, defaultdict
 import pandas as pd
@@ -25,20 +25,81 @@ os.environ['PYTHONHASHSEED'] = str(GLOBAL_SEED)
 
 # 注意：torch 的种子设置在 train_composite.py 中完成，因为这里不一定导入 torch
 
-def create_standard_sample(prompt: str, response: str, task_type: str, raw_data: Dict) -> Dict[str, str]:
+# ============================================================
+# 全局任务配置管理器（延迟初始化）
+# ============================================================
+_task_config_manager = None
+
+
+def get_task_config_manager():
+    """获取全局任务配置管理器（延迟初始化）"""
+    global _task_config_manager
+    if _task_config_manager is None:
+        from rllm.config.task_config import TaskConfigManager
+        _task_config_manager = TaskConfigManager()
+    return _task_config_manager
+
+
+def set_task_config_manager(manager):
+    """设置全局任务配置管理器"""
+    global _task_config_manager
+    _task_config_manager = manager
+
+
+def create_standard_sample(
+    prompt: str,
+    response: str,
+    task_type: str,
+    raw_data: Dict,
+    inject_task_config: bool = True
+) -> Dict[str, str]:
     """
     强制统一数据格式，防止 PyArrow Schema 报错。
     所有字段强制转为字符串，复杂对象存入 extra_info。
+    
+    【新增功能】自动注入任务级别的配置参数：
+    - task_max_prompt_length: 该任务类型的最大 prompt 长度
+    - task_max_response_length: 该任务类型的最大 response 长度
+    - task_max_steps: 该任务类型的最大交互步数
+    
+    这些参数会被存入 extra_info，在执行引擎中动态读取使用。
+    
+    Args:
+        prompt: 提示文本
+        response: 响应文本
+        task_type: 任务类型 (math, code, search, tool_call, local_search, webshop, bfcl)
+        raw_data: 原始数据字典
+        inject_task_config: 是否注入任务配置（默认 True）
+        
+    Returns:
+        标准化的数据样本字典
     """
     safe_prompt = str(prompt) if prompt is not None else ""
     safe_response = str(response) if response is not None else ""
     
+    # 确保 raw_data 包含 task_type
+    if "task_type" not in raw_data:
+        raw_data["task_type"] = task_type
+    
+    # 注入任务级别的配置参数
+    if inject_task_config:
+        try:
+            manager = get_task_config_manager()
+            config = manager.get_config(task_type)
+            raw_data["task_max_prompt_length"] = config.max_prompt_length
+            raw_data["task_max_response_length"] = config.max_response_length
+            raw_data["task_max_steps"] = config.max_steps
+        except Exception as e:
+            # 如果配置获取失败，使用默认值
+            logging.getLogger(__name__).debug(f"Failed to get task config for {task_type}: {e}")
+            pass
+    
     return {
-        "prompt": safe_prompt,      
-        "response": safe_response,  
+        "prompt": safe_prompt,
+        "response": safe_response,
         "task_type": str(task_type),
         "data_source": str(task_type),
-        "extra_info": json.dumps(raw_data, ensure_ascii=False),   
+        "extra_info": json.dumps(raw_data, ensure_ascii=False),
     }
 
 # def load_dataset(dataset_enum: TrainDataset.Math | TrainDataset.Code | TestDataset.Math | TestDataset.Code) -> list[dict[str, Any]]:

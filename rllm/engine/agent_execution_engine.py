@@ -166,7 +166,14 @@ class AgentExecutionEngine:
         self.agents = agents
 
     async def run_agent_trajectory_async(self, idx, application_id, seed=0, mode="Text", **kwargs):
-        """Run a single agent's trajectory asynchronously"""
+        """
+        Run a single agent's trajectory asynchronously
+        
+        【新增功能】支持动态任务级别配置：
+        - 从 env.reset() 返回的 info 中读取 task_max_prompt_length, task_max_response_length, task_max_steps
+        - 如果存在，则使用任务级别的配置；否则使用全局默认值
+        - 这使得不同任务类型可以有不同的长度和步数限制
+        """
         agent = self.agents[idx]
         env = self.envs[idx]
         # env_id = env.env_id
@@ -189,7 +196,14 @@ class AgentExecutionEngine:
         # Reset environment with the task using the executor
         loop = asyncio.get_event_loop()
         observation, info = await loop.run_in_executor(self.executor, env.reset)
-        info["max_steps"] = self.max_steps
+        
+        # 【新增】从 info 中获取任务级别的配置参数
+        # 优先使用任务级别配置，如果不存在则使用全局默认值
+        task_max_prompt_length = info.get("task_max_prompt_length", self.max_prompt_length)
+        task_max_response_length = info.get("task_max_response_length", self.max_response_length)
+        task_max_steps = info.get("task_max_steps", self.max_steps)
+        
+        info["max_steps"] = task_max_steps
 
         # Reset agent
         agent.reset()
@@ -204,14 +218,15 @@ class AgentExecutionEngine:
         prompt_tokens, _ = convert_messages_to_tokens_and_masks(messages, tokenizer=self.tokenizer, parser=self.chat_parser, contains_first_msg=True, contains_generation_msg=True)
         prompt_token_len = len(prompt_tokens)
         # Note, this should never happen!
-        if prompt_token_len > self.max_prompt_length:
+        # 【修改】使用动态的 task_max_prompt_length 而非全局 self.max_prompt_length
+        if prompt_token_len > task_max_prompt_length:
             # agent.reset()
-            # raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {self.max_prompt_length}, retrying")
+            # raise Exception(f"Trajectory {idx}: initial prompt length {prompt_token_len} already exceeded max_prompt_length {task_max_prompt_length}, retrying")
             colorful_print(
-                f"Warning: Trajectory {idx} initial prompt length {prompt_token_len} exceeds max_prompt_length {self.max_prompt_length}. Truncating from left.", 
+                f"Warning: Trajectory {idx} initial prompt length {prompt_token_len} exceeds task_max_prompt_length {task_max_prompt_length}. Truncating from left.",
                 "yellow"
             )
-            prompt_tokens = prompt_tokens[-self.max_prompt_length:]
+            prompt_tokens = prompt_tokens[-task_max_prompt_length:]
             prompt_token_len = len(prompt_tokens)
 
             # try:
@@ -226,20 +241,23 @@ class AgentExecutionEngine:
             # except Exception as e:
             #     logger.error(f"Trajectory {idx}: Failed to sync truncated prompt back to agent: {e}")
 
-        for step_idx in range(self.max_steps):
+        # 【修改】使用动态的 task_max_steps 而非全局 self.max_steps
+        for step_idx in range(task_max_steps):
             # Get action from agent
             prompt_messages = agent.chat_completions.copy()
             # Max remaining tokens left for the response
             # For enforced max prompt at each step, no need to deduct here
+            # 【修改】使用动态的 task_max_response_length
             if not self.enforce_max_prompt_length:
-                max_tokens = self.max_response_length - response_token_len
+                max_tokens = task_max_response_length - response_token_len
             else:
-                max_tokens = self.max_response_length
+                max_tokens = task_max_response_length
 
                 # since max prompt is enforced, we filter out too long prompts.
+                # 【修改】使用动态的 task_max_prompt_length
                 prompt_str = self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True)
                 prompt_len = len(self.tokenizer.encode(prompt_str, add_special_tokens=False))
-                if prompt_len > self.max_prompt_length:
+                if prompt_len > task_max_prompt_length:
                     termination_reason = "PROMPT_TRUNCATION"
                     break
 
@@ -282,7 +300,7 @@ class AgentExecutionEngine:
             delta_time = time.time() - start_time
             env_time += delta_time
             total_time += delta_time
-            info["max_steps"] = self.max_steps
+            info["max_steps"] = task_max_steps
             info["cur_tokens"] = response_token_len
 
             # Update agent internal state.
@@ -314,9 +332,10 @@ class AgentExecutionEngine:
             # Update repsonse token length
             response_token_len += len(assistant_msg_tokens) + len(env_msg_tokens)
             # Reached maximum number of tokens for the trajectory
-            if not self.enforce_max_prompt_length and response_token_len >= self.max_response_length:
+            # 【修改】使用动态的 task_max_response_length
+            if not self.enforce_max_prompt_length and response_token_len >= task_max_response_length:
                 # Truncation length
-                truncation_length = self.max_response_length - response_token_len
+                truncation_length = task_max_response_length - response_token_len
                 # Truncate the response and masks
                 if truncation_length < 0:
                     truncated_response_tokens = (assistant_msg_tokens + env_msg_tokens)[:truncation_length]
@@ -330,7 +349,8 @@ class AgentExecutionEngine:
                 response_masks.extend(truncated_response_masks)
 
                 cur_step = agent.get_current_state()
-                if response_token_len - len(env_msg_tokens) > self.max_response_length:
+                # 【修改】使用动态的 task_max_response_length
+                if response_token_len - len(env_msg_tokens) > task_max_response_length:
                     cur_step.reward = 0.0
                 cur_step.done = True
                 termination_reason = "TRUNCATION"
@@ -357,7 +377,8 @@ class AgentExecutionEngine:
             response_tokens.extend(env_msg_tokens)
             response_masks.extend(env_msg_masks)
 
-            if step_idx == self.max_steps - 1:
+            # 【修改】使用动态的 task_max_steps
+            if step_idx == task_max_steps - 1:
                 termination_reason = "MAX_STEPS"
 
         masked_out = False
