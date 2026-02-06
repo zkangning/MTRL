@@ -37,8 +37,39 @@ echo "Queue timeout: ${QUEUE_TIMEOUT}s"
 echo "Total concurrent capacity: $((NUM_GPUS * MAX_CONCURRENT))"
 echo "=========================================="
 
-# 创建日志目录
-LOG_DIR="${SCRIPT_DIR}/logs"
+# 获取当前服务器 IP 地址
+# 优先获取非 localhost 的 IP，支持多种获取方式
+get_server_ip() {
+    local ip=""
+    
+    # 方式1: 通过 hostname -I 获取（Linux）
+    if command -v hostname &> /dev/null; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+    
+    # 方式2: 如果上面失败，尝试通过 ip 命令获取
+    if [ -z "$ip" ] && command -v ip &> /dev/null; then
+        ip=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+    fi
+    
+    # 方式3: 如果还是失败，尝试通过 ifconfig 获取（macOS 兼容）
+    if [ -z "$ip" ] && command -v ifconfig &> /dev/null; then
+        ip=$(ifconfig | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -Eo '([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | head -n1)
+    fi
+    
+    # 方式4: 最后的 fallback
+    if [ -z "$ip" ]; then
+        ip="unknown"
+    fi
+    
+    echo "$ip"
+}
+
+SERVER_IP=$(get_server_ip)
+echo "Server IP: ${SERVER_IP}"
+
+# 创建日志目录（包含 IP 子目录）
+LOG_DIR="${SCRIPT_DIR}/logs/${SERVER_IP}"
 mkdir -p "${LOG_DIR}"
 
 # 存储所有进程的 PID

@@ -17,7 +17,9 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # ================= Local Search 多 GPU 配置 =================
 # 多服务器负载均衡模式（推荐）- 逗号分隔多个服务器地址
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
-export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005"
+# export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005" # local_server_node 1
+export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005" # local_server_node 2
+
 
 # Local Search 缓存配置（可选）
 # 缓存相同 query 的检索结果，避免重复请求，加速训练
@@ -75,21 +77,21 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=128 \
+    data.train_batch_size=384 \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
     +data.search_num=0 \
-    +data.tool_call_num=0 \
+    +data.tool_call_num=3200 \
     +data.local_search_num=3200 \
-    +data.webshop_num=0 \
+    +data.webshop_num=3200 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_5_code0_tool0_localsearch3k_webshop0 \
-    trainer.experiment_name='m2_5_code0_tool0_localsearch3k_webshop0-8b-mixed-tasks' \
+    +data.dataset_name=m2_6_code0_tool3k_localsearch3k_webshop3k \
+    trainer.experiment_name='m2_5_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
-    data.max_response_length=20480 \
+    data.max_response_length=15360 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     \
@@ -110,7 +112,7 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
-    '+task_configs.tool_call.max_response_length=4096' \
+    '+task_configs.tool_call.max_response_length=6400' \
     '+task_configs.tool_call.max_steps=1' \
     \
     '+task_configs.webshop.max_prompt_length=1024' \
