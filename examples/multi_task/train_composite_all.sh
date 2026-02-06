@@ -25,7 +25,7 @@ export RETRIEVAL_SERVER_URL="http://10.217.69.175:8000,http://10.217.69.175:8001
 # 缓存相同 query 的检索结果，避免重复请求，加速训练
 # 使用 SQLite 数据库存储，支持高并发多进程读写（WAL 模式）
 # 缓存数据库保存在 LOCAL_SEARCH_CACHE_DIR 目录下的 local_search_cache.db
-export LOCAL_SEARCH_CACHE_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/local_search_cache/single_local_search"
+export LOCAL_SEARCH_CACHE_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/local_search_cache/multi_task_local_search"
 
 
 # Web Shop 任务配置
