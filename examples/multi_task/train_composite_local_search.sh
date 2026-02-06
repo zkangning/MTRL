@@ -17,8 +17,8 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # ================= Local Search 多 GPU 配置 =================
 # 多服务器负载均衡模式（推荐）- 逗号分隔多个服务器地址
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
-# export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005" # local_server_node 1
-export RETRIEVAL_SERVER_URL="http://10.217.69.175:8000,http://10.217.69.175:8001,http://10.217.69.175:8002,http://10.217.69.175:8003,http://10.217.69.175:8004,http://10.217.69.175:8005,http://10.217.69.175:8006" # local_server_node 2
+export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005,http://10.217.69.161:8006" # local_server_node 1
+# export RETRIEVAL_SERVER_URL="http://10.217.69.175:8000,http://10.217.69.175:8001,http://10.217.69.175:8002,http://10.217.69.175:8003,http://10.217.69.175:8004,http://10.217.69.175:8005,http://10.217.69.175:8006" # local_server_node 2
 
 
 # Local Search 缓存配置（可选）
@@ -90,8 +90,8 @@ python3 -m examples.multi_task.train_composite \
     +data.dataset_name=m2_6_code0_tool0_localsearch3k_webshop0 \
     trainer.experiment_name='m2_6_code0_tool0_localsearch3k_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
-    data.max_prompt_length=6400 \
-    data.max_response_length=15360 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=6400 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     \
@@ -104,11 +104,11 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.code.max_steps=1' \
     \
     '+task_configs.search.max_prompt_length=1024' \
-    '+task_configs.search.max_response_length=6144' \
+    '+task_configs.search.max_response_length=6400' \
     '+task_configs.search.max_steps=4' \
     \
     '+task_configs.local_search.max_prompt_length=1024' \
-    '+task_configs.local_search.max_response_length=6400' \
+    '+task_configs.local_search.max_response_length=6144' \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
