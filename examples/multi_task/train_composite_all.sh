@@ -104,11 +104,11 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.code.max_steps=1' \
     \
     '+task_configs.search.max_prompt_length=1024' \
-    '+task_configs.search.max_response_length=6400' \
+    '+task_configs.search.max_response_length=10240' \
     '+task_configs.search.max_steps=4' \
     \
     '+task_configs.local_search.max_prompt_length=1024' \
-    '+task_configs.local_search.max_response_length=6400' \
+    '+task_configs.local_search.max_response_length=10240' \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
@@ -153,9 +153,9 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
-    actor_rollout_ref.rollout.val_kwargs.n=4 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
     +actor_rollout_ref.rollout.repetition_penalty=1.05 \
     \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

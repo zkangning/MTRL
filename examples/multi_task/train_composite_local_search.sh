@@ -104,11 +104,11 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.code.max_steps=1' \
     \
     '+task_configs.search.max_prompt_length=1024' \
-    '+task_configs.search.max_response_length=6400' \
+    '+task_configs.search.max_response_length=10240' \
     '+task_configs.search.max_steps=4' \
     \
     '+task_configs.local_search.max_prompt_length=1024' \
-    '+task_configs.local_search.max_response_length=6400' \
+    '+task_configs.local_search.max_response_length=10240' \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
