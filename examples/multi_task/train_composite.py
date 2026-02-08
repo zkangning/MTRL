@@ -183,7 +183,9 @@ def prepare_composite_dataset(
         logger.error("No training data found! Please check data configuration.")
         # 这里可以选择抛出异常，或者让 Trainer 去处理空数据
     else:
-        random.shuffle(mixed_train)
+        # 使用固定种子的独立 Random 实例打乱训练数据，保证可复现性
+        rng = random.Random(GLOBAL_SEED)
+        rng.shuffle(mixed_train)
     
     # 统计日志
     logger.info(f"Prepared Data Details:")

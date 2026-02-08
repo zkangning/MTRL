@@ -12,7 +12,8 @@ actor_rollout_ref:
     agent:
       num_workers: 0
     val_kwargs:
-      do_sample: True
+      do_sample: False  # 验证时禁用采样，使用贪心解码保证可复现性
+      temperature: 0.0  # 验证时温度设为0，保证确定性输出
 
 data:
   gen_batch_size: ${mul:${data.train_batch_size},${rllm.rejection_sample.multiplier}}

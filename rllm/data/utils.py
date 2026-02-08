@@ -367,6 +367,10 @@ def load_and_tag_dataset(dataset_name: str, split: str, tag: str) -> List[Dict]:
 def load_search_data(split: str, sample_num: int) -> List[Dict]:
     """
     加载 HotpotQA 数据 (用于 Search 任务)
+    
+    【数据采样策略】
+    - 测试集 (split="test"): 始终取前 sample_num 条，保证固定性和可复现性
+    - 训练集 (split="train"): 使用固定种子随机采样，保证跨实验一致性
     """
     if sample_num <= 0:
         return []
@@ -380,8 +384,14 @@ def load_search_data(split: str, sample_num: int) -> List[Dict]:
         raw_list = list(ds)
         # 如果需要截断
         if sample_num > 0 and sample_num < len(raw_list):
-            random.shuffle(raw_list)
-            raw_list = raw_list[:sample_num]
+            if split == "test":
+                # 测试集：始终取前 sample_num 条，保证固定性
+                raw_list = raw_list[:sample_num]
+            else:
+                # 训练集：使用固定种子随机采样，保证可复现性
+                rng = random.Random(GLOBAL_SEED)
+                rng.shuffle(raw_list)
+                raw_list = raw_list[:sample_num]
             
         processed_data = []
         for item in raw_list:
@@ -411,6 +421,10 @@ def load_local_search_data(split: str, sample_num: int) -> List[Dict]:
     """
     加载 HotpotQA 数据 (用于 Local Search 任务)
     与 load_search_data 类似，但 task_type 为 "local_search"
+    
+    【数据采样策略】
+    - 测试集 (split="test"): 始终取前 sample_num 条，保证固定性和可复现性
+    - 训练集 (split="train"): 使用固定种子随机采样，保证跨实验一致性
     """
     if sample_num <= 0:
         return []
@@ -424,8 +438,14 @@ def load_local_search_data(split: str, sample_num: int) -> List[Dict]:
         raw_list = list(ds)
         # 如果需要截断
         if sample_num > 0 and sample_num < len(raw_list):
-            random.shuffle(raw_list)
-            raw_list = raw_list[:sample_num]
+            if split == "test":
+                # 测试集：始终取前 sample_num 条，保证固定性
+                raw_list = raw_list[:sample_num]
+            else:
+                # 训练集：使用固定种子随机采样，保证可复现性
+                rng = random.Random(GLOBAL_SEED)
+                rng.shuffle(raw_list)
+                raw_list = raw_list[:sample_num]
             
         processed_data = []
         for item in raw_list:
@@ -465,9 +485,10 @@ def load_dapo_math_dataset(num_samples: int) -> List[Dict]:
         # 转换为 list
         raw_list = list(ds)
         
-        # 如果指定了数量限制，先 Shuffle 再切片，保证数据随机性
+        # 如果指定了数量限制，使用固定种子随机采样，保证可复现性
         if num_samples > 0 and len(raw_list) > num_samples:
-            random.shuffle(raw_list)
+            rng = random.Random(GLOBAL_SEED)
+            rng.shuffle(raw_list)
             raw_list = raw_list[:num_samples]
             
         processed_data = []
@@ -603,19 +624,21 @@ def load_deepmath_dataset(num_samples: int) -> List[Dict]:
                 diff_to_bump = remainders[i][1]
                 quotas[diff_to_bump] += 1
             
-            # 3.3 执行随机抽取
+            # 3.3 执行固定种子随机抽取，保证可复现性
+            rng = random.Random(GLOBAL_SEED)
             for diff, count in quotas.items():
                 group_items = eligible_groups[diff]
-                # 随机打乱后取 count 个，或者直接用 random.sample
-                sampled = random.sample(group_items, count)
+                # 使用固定种子随机采样
+                sampled = rng.sample(group_items, count)
                 selected_raw_list.extend(sampled)
                 logger.info(f"  difficulty={diff}: Total {len(group_items)} -> Sampled {count}")
 
         # -------------------------------------------------------
         # 4. 标准化处理
         # -------------------------------------------------------
-        # 打乱最终列表，避免按难度排序
-        random.shuffle(selected_raw_list)
+        # 使用固定种子打乱最终列表，避免按难度排序
+        rng = random.Random(GLOBAL_SEED)
+        rng.shuffle(selected_raw_list)
 
         processed_data = []
         for item in selected_raw_list:
@@ -710,8 +733,9 @@ def load_deepmath_dataset_top_k(num_samples: int) -> List[Dict]:
         # -------------------------------------------------------
         selected_raw_list = [pair[1] for pair in selected_pairs]
         
-        # 重点：虽然选的是最高的，但在返回前要打乱，避免模型在训练时按难度顺序学习导致梯度不稳定
-        random.shuffle(selected_raw_list)
+        # 使用固定种子打乱，避免模型在训练时按难度顺序学习导致梯度不稳定，同时保证可复现性
+        rng = random.Random(GLOBAL_SEED)
+        rng.shuffle(selected_raw_list)
 
         processed_data = []
         for item in selected_raw_list:
@@ -869,11 +893,11 @@ def load_tool_call_json_dataset(data_dir: str, split: str = "train", num_samples
             logger.error(f"JSON file content expects a list of dicts, but got {type(raw_list)}")
             return []
 
-        # 3. 截断与打乱
+        # 3. 截断与采样 - 使用独立的固定种子 Random 实例，保证可复现性
         if num_samples > 0 and num_samples <= len(raw_list):
-            # 使用 random.sample 进行无放回抽样 (相当于 shuffle + slice)
-            random.seed(42)
-            raw_list = random.sample(raw_list, num_samples)
+            # 使用固定种子的独立 Random 实例进行无放回抽样
+            rng = random.Random(GLOBAL_SEED)
+            raw_list = rng.sample(raw_list, num_samples)
             
         processed_data = []
         for item in raw_list:
@@ -980,9 +1004,14 @@ def load_webshop_data(split: str, num_samples: int, total_goals: int = None) -> 
             )
             selected_indices = available_indices
         else:
-            # 随机选择指定数量的索引（使用全局种子保证可重复性）
-            random.shuffle(available_indices)
-            selected_indices = available_indices[:num_samples]
+            if split == "test":
+                # 测试集：始终取前 num_samples 个索引，保证固定性
+                selected_indices = available_indices[:num_samples]
+            else:
+                # 训练集：使用固定种子随机选择，保证可复现性
+                rng = random.Random(GLOBAL_SEED)
+                rng.shuffle(available_indices)
+                selected_indices = available_indices[:num_samples]
         
         processed_data = []
         for goal_idx in selected_indices:
