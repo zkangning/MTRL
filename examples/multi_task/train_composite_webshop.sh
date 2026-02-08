@@ -17,7 +17,7 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # ================= Local Search 多 GPU 配置 =================
 # 多服务器负载均衡模式（推荐）- 逗号分隔多个服务器地址
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
-# export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005, http://10.217.69.175:8006" # local_server_node 1
+# export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005" # local_server_node 1
 export RETRIEVAL_SERVER_URL="http://10.217.69.175:8000,http://10.217.69.175:8001,http://10.217.69.175:8002,http://10.217.69.175:8003,http://10.217.69.175:8004,http://10.217.69.175:8005,http://10.217.69.175:8006" # local_server_node 2
 
 
@@ -77,20 +77,20 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=384 \
+    data.train_batch_size=128 \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
     +data.search_num=0 \
-    +data.tool_call_num=3200 \
-    +data.local_search_num=3200 \
+    +data.tool_call_num=0 \
+    +data.local_search_num=0 \
     +data.webshop_num=3200 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_7_code0_tool3k_localsearch3k_webshop3k \
-    trainer.experiment_name='m2_7_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
+    +data.dataset_name=m2_7_code0_tool0_localsearch0_webshop3k \
+    trainer.experiment_name='m2_7_code0_tool0_localsearch0_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=512 \
-    data.max_prompt_length=6400 \
+    data.max_prompt_length=1024 \
     data.max_response_length=15360 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
@@ -135,8 +135,8 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32000 \
     \
-    actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.kl_loss_coef=0.0 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
     actor_rollout_ref.actor.entropy_coeff=0 \
@@ -155,7 +155,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False \
     +actor_rollout_ref.rollout.repetition_penalty=1.05 \
     \
@@ -165,6 +165,7 @@ python3 -m examples.multi_task.train_composite \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     \
     algorithm.kl_ctrl.kl_coef=0.000 \
+    algorithm.use_kl_in_reward=False \
     rllm.mask_truncated_samples=True \
     \
     trainer.critic_warmup=0 \

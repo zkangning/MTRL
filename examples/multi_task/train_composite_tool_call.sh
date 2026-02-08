@@ -91,7 +91,7 @@ python3 -m examples.multi_task.train_composite \
     trainer.experiment_name='m2_7_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
-    data.max_response_length=15360 \
+    data.max_response_length=6400 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     data.validation_shuffle=false \
@@ -185,7 +185,7 @@ python3 -m examples.multi_task.train_composite \
     rllm.length_penalty.warmup_steps=0 \
     rllm.length_penalty.min_response_length=200 \
     \
-    rllm.simple_length_penalty.enable=True \
+    rllm.simple_length_penalty.enable=False \
     rllm.simple_length_penalty.baseline_len=2048 \
     rllm.simple_length_penalty.coefficient=0.1 \
     rllm.simple_length_penalty.max_penalty=0.2 \

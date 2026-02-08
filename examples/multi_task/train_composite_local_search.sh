@@ -91,9 +91,10 @@ python3 -m examples.multi_task.train_composite \
     trainer.experiment_name='m2_6_code0_tool0_localsearch3k_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=1024 \
-    data.max_response_length=6400 \
+    data.max_response_length=15360 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
+    data.validation_shuffle=false \
     \
     '+task_configs.math.max_prompt_length=4096' \
     '+task_configs.math.max_response_length=16384' \
@@ -104,11 +105,11 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.code.max_steps=1' \
     \
     '+task_configs.search.max_prompt_length=1024' \
-    '+task_configs.search.max_response_length=10240' \
+    '+task_configs.search.max_response_length=15360' \
     '+task_configs.search.max_steps=4' \
     \
     '+task_configs.local_search.max_prompt_length=1024' \
-    '+task_configs.local_search.max_response_length=10240' \
+    '+task_configs.local_search.max_response_length=15360' \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
