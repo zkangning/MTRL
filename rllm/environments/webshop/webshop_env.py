@@ -82,6 +82,7 @@ Example response:
 <think>
 I need to search for the product first.
 </think>
+
 <tool_call>
 {{"name": "search", "arguments": {{"query": "red running shoes"}}}}
 </tool_call>
@@ -139,8 +140,8 @@ def parse_tool_call(response: str) -> Tuple[str, bool]:
     think_end = response_lower.find("</think>")
     has_think = think_start != -1 and think_end != -1
     
-    # Check for Chinese characters (invalid for webshop which uses English)
-    has_chinese = bool(re.search(r'[\u4e00-\u9fff]', response))
+    # Note: We no longer check for Chinese characters as it was too restrictive
+    # The model may include Chinese in thinking process which is acceptable
     
     action = None
     
@@ -258,7 +259,12 @@ def parse_tool_call(response: str) -> Tuple[str, bool]:
                         action = f"click[{action_content}]"
     
     if action:
-        is_valid = has_think and not has_chinese
+        # Format validation: accept any successfully parsed action
+        # The key insight: if we successfully parsed a valid action (search/click),
+        # the model understood the task. We don't want to terminate early just
+        # because of format issues (missing <think> tags or legacy format).
+        # Format strictness can be enforced via reward shaping if needed.
+        is_valid = True
         return action, is_valid
     
     # Last resort: return the last part of response (invalid format)
