@@ -77,18 +77,18 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # ================= 启动训练 =================
 python3 -m examples.multi_task.train_composite \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=384 \
+    data.train_batch_size=128 \
     +data.math_num=0 \
     +data.code_num=0 \
     +data.bfcl_num=0 \
     +data.search_num=0 \
     +data.tool_call_num=3200 \
-    +data.local_search_num=3200 \
-    +data.webshop_num=3200 \
+    +data.local_search_num=0 \
+    +data.webshop_num=0 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_7_code0_tool3k_localsearch3k_webshop3k \
-    trainer.experiment_name='m2_7_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
+    +data.dataset_name=m2_9_code0_tool3k_localsearch0_webshop0 \
+    trainer.experiment_name='m2_9_code0_tool3k_localsearch0_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=6400 \

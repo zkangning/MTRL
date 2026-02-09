@@ -18,7 +18,7 @@ export BRIGHT_DATA_API_TOKEN="da9e7e42-730d-4fb7-8357-b3dafcd7cc93"
 # 多服务器负载均衡模式（推荐）- 逗号分隔多个服务器地址
 # 每个服务器运行在不同的 GPU 上，客户端会自动进行负载均衡和故障转移
 # export RETRIEVAL_SERVER_URL="http://10.217.69.161:8000,http://10.217.69.161:8001,http://10.217.69.161:8002,http://10.217.69.161:8003,http://10.217.69.161:8004,http://10.217.69.161:8005, http://10.217.69.175:8006" # local_server_node 1
-export RETRIEVAL_SERVER_URL="http://10.217.69.175:8000,http://10.217.69.175:8001,http://10.217.69.175:8002,http://10.217.69.175:8003,http://10.217.69.175:8004,http://10.217.69.175:8005,http://10.217.69.175:8006" # local_server_node 2
+export RETRIEVAL_SERVER_URL="http://10.217.69.238:8000,http://10.217.69.238:8001,http://10.217.69.238:8002,http://10.217.69.238:8003,http://10.217.69.238:8004,http://10.217.69.238:8005,http://10.217.69.238:8006" # local_server_node 2
 
 
 # Local Search 缓存配置（可选）
@@ -185,7 +185,7 @@ python3 -m examples.multi_task.train_composite \
     rllm.length_penalty.warmup_steps=0 \
     rllm.length_penalty.min_response_length=200 \
     \
-    rllm.simple_length_penalty.enable=True \
+    rllm.simple_length_penalty.enable=False \
     rllm.simple_length_penalty.baseline_len=2048 \
     rllm.simple_length_penalty.coefficient=0.1 \
     rllm.simple_length_penalty.max_penalty=0.2 \
