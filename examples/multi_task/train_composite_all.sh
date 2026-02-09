@@ -87,8 +87,8 @@ python3 -m examples.multi_task.train_composite \
     +data.webshop_num=3200 \
     +data.webshop_path=null \
     +data.tool_call_data_path='/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/rllm/data/datasets/tool_call_data_1_28' \
-    +data.dataset_name=m2_7_code0_tool3k_localsearch3k_webshop3k \
-    trainer.experiment_name='m2_7_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
+    +data.dataset_name=m2_9_code0_tool3k_localsearch3k_webshop3k \
+    trainer.experiment_name='m2_9_code0_tool3k_localsearch3k_webshop3k-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
     data.max_response_length=15360 \
