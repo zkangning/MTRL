@@ -47,21 +47,21 @@ DEFAULT_TASK_CONFIGS: Dict[str, TaskTypeConfig] = {
     # Search: 多轮检索，每轮 prompt 会累积
     "search": TaskTypeConfig(
         max_prompt_length=1024,  # 检索结果会累积到 prompt
-        max_response_length=6144,
+        max_response_length=15360,
         max_steps=4,  # 多轮检索
     ),
     
     # Local Search: 类似 Search
     "local_search": TaskTypeConfig(
         max_prompt_length=1024,
-        max_response_length=6144,
+        max_response_length=15360,
         max_steps=4,
     ),
     
     # Tool Call: 工具调用任务
     "tool_call": TaskTypeConfig(
         max_prompt_length=6400,
-        max_response_length=4096,
+        max_response_length=6400,
         max_steps=1,
     ),
     

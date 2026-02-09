@@ -63,9 +63,9 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # 默认值（在 rllm/config/task_config.py 中定义）：
 #   math:        prompt=4096,  response=16384, steps=5
 #   code:        prompt=2048,  response=20480, steps=1
-#   search:      prompt=1024,  response=6144,  steps=4
-#   local_search: prompt=1024, response=6144,  steps=4
-#   tool_call:   prompt=6400,  response=4096,  steps=1
+#   search:      prompt=1024,  response=15360, steps=4
+#   local_search: prompt=1024, response=15360, steps=4
+#   tool_call:   prompt=6400,  response=6400,  steps=1
 #   webshop:     prompt=1024,  response=15360, steps=15
 #   bfcl:        prompt=4096,  response=4096,  steps=5
 #
