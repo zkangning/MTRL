@@ -331,6 +331,11 @@ class WebshopEnvironment(BaseEnv):
         self._cumulative_reward = 0.0
         self._last_info = {}
         
+        # Invalid action tracking for early termination
+        # When model produces invalid output, terminate immediately to save time
+        # and provide strong negative feedback (reward=0)
+        self._terminate_on_invalid_action = True  # Immediate termination on first invalid action
+        
         # Unique instance ID for session isolation
         self._instance_id = str(uuid.uuid4())[:8]
         
@@ -437,6 +442,7 @@ class WebshopEnvironment(BaseEnv):
             self._cumulative_reward = 0.0
             self._instruction_text = ""
             self._last_info = {}
+            # No need to reset invalid action counter - we terminate on first invalid
             
             # Get goal index from task if available
             goal_idx = None
@@ -535,6 +541,46 @@ class WebshopEnvironment(BaseEnv):
             parsed_action, is_valid_format = parse_tool_call(action_str)
             
             self._current_step += 1
+            
+            # Immediate termination on invalid action format
+            # This provides strong negative feedback (reward=0) and saves training time
+            if not is_valid_format and self._terminate_on_invalid_action:
+                logger.warning(
+                    f"Immediate termination: invalid action format at step {self._current_step}. "
+                    f"Action: {action_str[:100]}..."
+                )
+                # Force immediate termination
+                done = True
+                reward = 0.0
+                task_score = 0.0
+                
+                # Build minimal observation for termination
+                available_actions = {}
+                if hasattr(self._env, 'get_available_actions'):
+                    available_actions = self._env.get_available_actions()
+                
+                obs = "Episode terminated due to invalid action format."
+                full_observation = self._build_observation(obs, available_actions)
+                
+                info = {
+                    "instruction": self._instruction_text,
+                    "available_actions": available_actions,
+                    "step": self._current_step,
+                    "max_steps": self.max_steps,
+                    "task_score": task_score,
+                    "is_valid_format": is_valid_format,
+                    "parsed_action": parsed_action,
+                    "cumulative_reward": self._cumulative_reward,
+                    "done": done,
+                    "session_id": getattr(self, '_current_session', None),
+                    "won": False,
+                    "early_termination": True,
+                    "termination_reason": "invalid_action_format",
+                }
+                self._done = done
+                self._last_info = info
+                
+                return full_observation, reward, done, info
             
             # Execute action in environment
             obs, raw_reward, done, info = self._env.step(parsed_action)
