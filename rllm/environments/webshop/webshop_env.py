@@ -338,9 +338,9 @@ class WebshopEnvironment(BaseEnv):
         self._last_info = {}
         
         # Invalid action tracking for early termination
-        # When model produces invalid output, terminate immediately to save time
-        # and provide strong negative feedback (reward=0)
-        self._terminate_on_invalid_action = True  # Immediate termination on first invalid action
+        # Give the model multiple chances to produce valid output before terminating
+        self._max_consecutive_invalid_actions = 3  # Terminate after 3 consecutive invalid actions
+        self._consecutive_invalid_actions = 0  # Counter for consecutive invalid actions
         
         # Unique instance ID for session isolation
         self._instance_id = str(uuid.uuid4())[:8]
@@ -448,7 +448,7 @@ class WebshopEnvironment(BaseEnv):
             self._cumulative_reward = 0.0
             self._instruction_text = ""
             self._last_info = {}
-            # No need to reset invalid action counter - we terminate on first invalid
+            self._consecutive_invalid_actions = 0  # Reset invalid action counter
             
             # Get goal index from task if available
             goal_idx = None
@@ -548,24 +548,69 @@ class WebshopEnvironment(BaseEnv):
             
             self._current_step += 1
             
-            # Immediate termination on invalid action format
-            # This provides strong negative feedback (reward=0) and saves training time
-            if not is_valid_format and self._terminate_on_invalid_action:
+            # Track consecutive invalid actions
+            if not is_valid_format:
+                self._consecutive_invalid_actions += 1
                 logger.warning(
-                    f"Immediate termination: invalid action format at step {self._current_step}. "
+                    f"Invalid action format at step {self._current_step} "
+                    f"(consecutive: {self._consecutive_invalid_actions}/{self._max_consecutive_invalid_actions}). "
                     f"Action: {action_str[:100]}..."
                 )
-                # Force immediate termination
-                done = True
-                reward = 0.0
-                task_score = 0.0
                 
-                # Build minimal observation for termination
+                # Terminate after max consecutive invalid actions
+                if self._consecutive_invalid_actions >= self._max_consecutive_invalid_actions:
+                    logger.warning(
+                        f"Termination: {self._consecutive_invalid_actions} consecutive invalid actions. "
+                        f"Ending episode at step {self._current_step}."
+                    )
+                    # Force termination
+                    done = True
+                    reward = 0.0
+                    task_score = 0.0
+                    
+                    # Build minimal observation for termination
+                    available_actions = {}
+                    if hasattr(self._env, 'get_available_actions'):
+                        available_actions = self._env.get_available_actions()
+                    
+                    obs = f"Episode terminated: {self._consecutive_invalid_actions} consecutive invalid action formats."
+                    full_observation = self._build_observation(obs, available_actions)
+                    
+                    info = {
+                        "instruction": self._instruction_text,
+                        "available_actions": available_actions,
+                        "step": self._current_step,
+                        "max_steps": self.max_steps,
+                        "task_score": task_score,
+                        "is_valid_format": is_valid_format,
+                        "parsed_action": parsed_action,
+                        "cumulative_reward": self._cumulative_reward,
+                        "done": done,
+                        "session_id": getattr(self, '_current_session', None),
+                        "won": False,
+                        "early_termination": True,
+                        "termination_reason": "consecutive_invalid_actions",
+                        "consecutive_invalid_actions": self._consecutive_invalid_actions,
+                    }
+                    self._done = done
+                    self._last_info = info
+                    
+                    return full_observation, reward, done, info
+                
+                # Not yet at max - provide feedback but continue
+                # Use a no-op action or the last valid observation
                 available_actions = {}
                 if hasattr(self._env, 'get_available_actions'):
                     available_actions = self._env.get_available_actions()
                 
-                obs = "Episode terminated due to invalid action format."
+                obs = (
+                    f"Invalid action format (attempt {self._consecutive_invalid_actions}/{self._max_consecutive_invalid_actions}). "
+                    f"Please use the correct format:\n"
+                    f"<think>your reasoning</think>\n\n"
+                    f"<tool_call>{{\"name\": \"search\", \"arguments\": {{\"query\": \"...\"}}}}</tool_call>\n"
+                    f"or\n"
+                    f"<tool_call>{{\"name\": \"click\", \"arguments\": {{\"button\": \"...\"}}}}</tool_call>"
+                )
                 full_observation = self._build_observation(obs, available_actions)
                 
                 info = {
@@ -573,20 +618,28 @@ class WebshopEnvironment(BaseEnv):
                     "available_actions": available_actions,
                     "step": self._current_step,
                     "max_steps": self.max_steps,
-                    "task_score": task_score,
+                    "task_score": 0.0,
                     "is_valid_format": is_valid_format,
                     "parsed_action": parsed_action,
                     "cumulative_reward": self._cumulative_reward,
-                    "done": done,
+                    "done": False,
                     "session_id": getattr(self, '_current_session', None),
                     "won": False,
-                    "early_termination": True,
-                    "termination_reason": "invalid_action_format",
+                    "invalid_action_warning": True,
+                    "consecutive_invalid_actions": self._consecutive_invalid_actions,
                 }
-                self._done = done
                 self._last_info = info
                 
-                return full_observation, reward, done, info
+                # Check max steps even for invalid actions
+                if self._current_step >= self.max_steps:
+                    info["done"] = True
+                    self._done = True
+                    return full_observation, 0.0, True, info
+                
+                return full_observation, 0.0, False, info
+            
+            # Valid action - reset consecutive invalid counter
+            self._consecutive_invalid_actions = 0
             
             # Execute action in environment
             obs, raw_reward, done, info = self._env.step(parsed_action)
