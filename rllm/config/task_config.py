@@ -59,9 +59,12 @@ DEFAULT_TASK_CONFIGS: Dict[str, TaskTypeConfig] = {
     ),
     
     # Tool Call: 工具调用任务
+    # 注意：prompt 包含完整的 instruction (Tool Schema) + input (User Message)
+    # instruction 可能非常长（包含多个 Tool 的 JSON Schema），因此需要较大的 prompt 长度
+    # max_model_len = max_prompt_length + max_response_length，需要足够大以容纳完整的 prompt
     "tool_call": TaskTypeConfig(
         max_prompt_length=6400,
-        max_response_length=6400,
+        max_response_length=15360,  # 增大以确保 max_model_len 足够容纳长 prompt
         max_steps=1,
     ),
     

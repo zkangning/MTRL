@@ -63,9 +63,9 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 # 默认值（在 rllm/config/task_config.py 中定义）：
 #   math:        prompt=4096,  response=16384, steps=5
 #   code:        prompt=2048,  response=20480, steps=1
-#   search:      prompt=1024,  response=6144,  steps=4
-#   local_search: prompt=1024, response=6144,  steps=4
-#   tool_call:   prompt=6400,  response=4096,  steps=1
+#   search:      prompt=1024,  response=15360, steps=4
+#   local_search: prompt=1024, response=15360, steps=4
+#   tool_call:   prompt=6400,  response=15360, steps=1  (response 增大以确保 max_model_len 足够)
 #   webshop:     prompt=1024,  response=15360, steps=15
 #   bfcl:        prompt=4096,  response=4096,  steps=5
 #
@@ -91,7 +91,7 @@ python3 -m examples.multi_task.train_composite \
     trainer.experiment_name='m2_9_code0_tool3k_localsearch0_webshop0-8b-mixed-tasks' \
     data.val_batch_size=512 \
     data.max_prompt_length=6400 \
-    data.max_response_length=6400 \
+    data.max_response_length=15360 \
     data.truncation='left' \
     data.filter_overlong_prompts=False \
     data.validation_shuffle=false \
@@ -113,7 +113,7 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
-    '+task_configs.tool_call.max_response_length=6400' \
+    '+task_configs.tool_call.max_response_length=15360' \
     '+task_configs.tool_call.max_steps=1' \
     \
     '+task_configs.webshop.max_prompt_length=1024' \

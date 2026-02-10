@@ -65,7 +65,7 @@ MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/ba
 #   code:        prompt=2048,  response=20480, steps=1
 #   search:      prompt=1024,  response=15360, steps=4
 #   local_search: prompt=1024, response=15360, steps=4
-#   tool_call:   prompt=6400,  response=6400,  steps=1
+#   tool_call:   prompt=6400,  response=15360, steps=1  (response 增大以确保 max_model_len 足够)
 #   webshop:     prompt=1024,  response=15360, steps=15
 #   bfcl:        prompt=4096,  response=4096,  steps=5
 #
@@ -113,7 +113,7 @@ python3 -m examples.multi_task.train_composite \
     '+task_configs.local_search.max_steps=4' \
     \
     '+task_configs.tool_call.max_prompt_length=6400' \
-    '+task_configs.tool_call.max_response_length=6400' \
+    '+task_configs.tool_call.max_response_length=15360' \
     '+task_configs.tool_call.max_steps=1' \
     \
     '+task_configs.webshop.max_prompt_length=1024' \
