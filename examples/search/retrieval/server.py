@@ -19,6 +19,7 @@ Usage:
 import argparse
 import gc
 import json
+import logging
 import os
 import threading
 import time
@@ -29,6 +30,16 @@ import faiss
 import torch
 from flask import Flask, jsonify, request
 from sentence_transformers import SentenceTransformer
+
+
+class _HealthCheckFilter(logging.Filter):
+    """过滤 /health 的 200 日志，避免频繁刷屏。"""
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        # 只过滤 GET /health 的成功日志（200）
+        if "GET /health" in msg and "200" in msg:
+            return False
+        return True
 
 
 class LocalRetriever:
@@ -295,6 +306,9 @@ def main():
     print(f"Took {time.time() - start_time:.2f} seconds to start the server")
     print(f"Starting dense retrieval server on {args.host}:{args.port}")
     
+    # 抑制 /health 200 的日志输出，避免刷屏
+    logging.getLogger("werkzeug").addFilter(_HealthCheckFilter())
+
     # 使用 threaded=True 但通过信号量控制 GPU 并发
     app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 

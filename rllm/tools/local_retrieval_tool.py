@@ -509,7 +509,7 @@ class LocalRetrievalTool(Tool):
                 - None: checks RETRIEVAL_SERVER_URL env var
             timeout: Request timeout in seconds
             max_results: Maximum number of results to return
-            cache_dir: Directory for caching retrieval results. If None, checks 
+            cache_dir: Directory for caching retrieval results. If None, checks
                        LOCAL_SEARCH_CACHE_DIR env var, defaults to "./local_search_cache"
             enable_cache: Whether to enable caching (default: True)
         """
