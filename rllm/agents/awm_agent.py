@@ -3,16 +3,22 @@ AWM (Agentic World Model) Agent for RLLM
 
 This agent handles interaction with AWM-generated virtual environments
 through MCP (Model Context Protocol) tools.
+
+This implementation is aligned with the AWM native implementation (awm/core/agent.py).
 """
 
 import copy
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List
 
 from rllm.agents.agent import Action, BaseAgent, Step, Trajectory
 from rllm.agents.awm_prompts import AWM_SYSTEM_PROMPT
+
+# Import from AWM native code for compatibility
+from awm.tools import tools_robust_json_loads
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +58,11 @@ class AWMAgent(BaseAgent):
         self.reset()
 
     def _format_observation_as_messages(self, obs: Any) -> List[Dict[str, str]]:
-        """Format observation into messages for the chat history."""
+        """
+        Format observation into messages for the chat history.
+        
+        Matches the AWM native implementation message format.
+        """
         messages = []
         
         if isinstance(obs, dict):
@@ -62,22 +72,22 @@ class AWMAgent(BaseAgent):
                 self.messages[0]["content"] = obs["system_prompt"]
             
             if "task" in obs:
-                # Initial task description
-                messages.append({"role": "user", "content": f"Task: {obs['task']}"})
+                # Initial task description (user query)
+                messages.append({"role": "user", "content": obs['task']})
             
             # Tool results from environment
             if "tool_results" in obs:
                 tool_results = obs["tool_results"]
                 for result in tool_results:
-                    tool_name = result.get("tool", "unknown")
+                    tool_call_id = result.get("tool_call_id", f"call_{int(time.time() * 1000)}")
                     tool_output = result.get("result", "")
-                    success = result.get("success", False)
                     
-                    content = f"Tool: {tool_name}\n"
-                    content += f"Status: {'Success' if success else 'Failed'}\n"
-                    content += f"Result: {tool_output}"
-                    
-                    messages.append({"role": "user", "content": content})
+                    # Use tool role format matching native implementation
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": str(tool_output),
+                    })
         elif isinstance(obs, str):
             messages.append({"role": "user", "content": obs})
         elif obs:
@@ -116,11 +126,9 @@ class AWMAgent(BaseAgent):
         """
         Extract tool calls from the model response.
         
-        Expected format:
-        <think>
-        Reasoning here...
-        </think>
+        Matches the AWM native implementation (awm/core/agent.py:parse_tool_calls).
         
+        Expected format:
         <tool_call>
         {"name": "list_tools", "arguments": {}}
         </tool_call>
@@ -129,26 +137,44 @@ class AWMAgent(BaseAgent):
             response: Model's response string
             
         Returns:
-            List of tool call dictionaries
+            List of tool call dictionaries with id, name, and arguments
         """
         tool_calls = []
-        
-        # Find all tool_call blocks
         pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
         matches = re.findall(pattern, response, re.DOTALL)
         
-        for match in matches:
-            try:
-                data = json.loads(match.strip())
-                if isinstance(data, list) and len(data) > 0:
+        for i, match in enumerate(matches):
+            data = tools_robust_json_loads(match.strip())
+            if not data:
+                logger.warning(f"Failed to parse tool call JSON: {match[:100]}")
+                continue
+            
+            # Handle list wrapping: [{"name": ..., "arguments": ...}]
+            if isinstance(data, list):
+                if len(data) > 0 and isinstance(data[0], dict):
                     data = data[0]
-                if isinstance(data, dict):
-                    tool_calls.append({
-                        "name": data.get("name", ""),
-                        "arguments": data.get("arguments", {})
-                    })
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse tool call JSON: {e}")
+                else:
+                    continue
+            
+            if not isinstance(data, dict):
+                continue
+            
+            name = data.get("name", "")
+            arguments = data.get("arguments", {})
+            
+            # Handle mcp_tool_ prefix (matching native implementation)
+            if name.startswith("mcp_tool_"):
+                arguments = {
+                    "tool_name": name,
+                    "arguments": arguments if arguments else {},
+                }
+                name = "call_tool"
+            
+            tool_calls.append({
+                "id": f"call_{int(time.time() * 1000)}_{i}",
+                "name": name,
+                "arguments": arguments,
+            })
         
         return tool_calls
 

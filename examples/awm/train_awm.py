@@ -28,6 +28,7 @@ from rllm.data.dataset import DatasetRegistry
 from rllm.trainer.agent_trainer import AgentTrainer
 from rllm.rewards.reward_fn import awm_reward_fn
 from rllm.environments.awm import AWMEnvironment
+from rllm.agents.awm_agent import AWMAgent
 from rllm.agents.awm_prompts import AWM_SYSTEM_PROMPT
 from rllm.data.utils import load_awm_dataset
 
@@ -162,12 +163,8 @@ def main(config):
         "reward_fn": awm_reward_fn,
         "max_steps": max_steps,
         "server_start_timeout": server_start_timeout,
-        # Database directory for storing temp databases
-        "database_dir": config.data.get("database_dir", "./outputs/awm_databases"),
+        "server_host": "127.0.0.1",
     }
-    
-    # Ensure database directory exists
-    os.makedirs(env_args["database_dir"], exist_ok=True)
     
     # ============================================================
     # Agent Arguments
@@ -184,7 +181,7 @@ def main(config):
     logger.info(">>> Initializing AWM Trainer...")
     
     trainer = AgentTrainer(
-        agent_class=None,  # Use default agent
+        agent_class=AWMAgent,
         env_class=AWMEnvironment,
         agent_args=agent_args,
         env_args=env_args,

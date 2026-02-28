@@ -443,8 +443,14 @@ When you have completed the task, provide your final answer directly without any
         return tool_calls
     
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute a tool call.
+        
+        Compatible with AWM native implementation (awm/core/agent.py).
+        """
         name = tool_call.get("name", "")
         arguments = tool_call.get("arguments", {})
+        tool_call_id = tool_call.get("id", "")
         
         if name == "list_tools":
             try:
@@ -453,38 +459,86 @@ When you have completed the task, provide your final answer directly without any
                 tools = loop.run_until_complete(self.mcp_manager.list_tools())
                 loop.close()
                 self.available_tools = tools
-                return {"tool": "list_tools", "result": self._format_tools_for_response(tools), "success": True}
+                # Use the awm_prompts formatter for consistency
+                from rllm.agents.awm_prompts import format_awm_tools_for_prompt
+                formatted_tools = format_awm_tools_for_prompt(tools)
+                return {
+                    "tool": "list_tools",
+                    "tool_call_id": tool_call_id,
+                    "result": formatted_tools,
+                    "success": True
+                }
             except Exception as e:
-                return {"tool": "list_tools", "result": f"Error listing tools: {e}", "success": False}
+                return {
+                    "tool": "list_tools",
+                    "tool_call_id": tool_call_id,
+                    "result": f"Error listing tools: {e}",
+                    "success": False
+                }
         
         elif name == "call_tool":
-            tool_name = arguments.get("tool_name", "")
-            tool_args = arguments.get("arguments", {})
+            # Parse arguments matching native implementation (parse_call_tool_arguments)
+            tool_name, tool_args = self._parse_call_tool_arguments(arguments)
+            
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 result = loop.run_until_complete(self.mcp_manager.call_tool(tool_name, tool_args))
                 loop.close()
-                return {"tool": tool_name, "arguments": tool_args, "result": result, "success": not result.startswith("Error:")}
+                return {
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": tool_args,
+                    "result": result,
+                    "success": not result.startswith("Error:")
+                }
             except Exception as e:
-                return {"tool": tool_name, "arguments": tool_args, "result": f"Error: {e}", "success": False}
+                return {
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": tool_args,
+                    "result": f"Error: {e}",
+                    "success": False
+                }
         
-        return {"tool": name, "result": f"Unknown tool: {name}", "success": False}
+        return {"tool": name, "tool_call_id": tool_call_id, "result": f"Unknown tool: {name}", "success": False}
     
-    def _format_tools_for_response(self, tools: List[Dict]) -> str:
-        lines = [f"Available Tools ({len(tools)} tools):", "=" * 60]
-        for i, tool in enumerate(tools, 1):
-            name = tool.get("name", "")
-            description = tool.get("description", "")
-            schema = tool.get("inputSchema", {})
-            lines.append(f"\n{i}. {name}")
-            lines.append(f"   Description: {description}")
-            if schema and schema.get("properties"):
-                lines.append("   Parameters:")
-                for p_name, p_info in schema["properties"].items():
-                    req = " (required)" if p_name in schema.get("required", []) else " (optional)"
-                    lines.append(f"     - {p_name}: {p_info.get('type', 'any')}{req}")
-        return "\n".join(lines)
+    def _parse_call_tool_arguments(self, arguments: Any) -> tuple[str, dict]:
+        """
+        Parse call_tool arguments matching AWM native implementation.
+        
+        Args:
+            arguments: Can be dict, str, or None
+            
+        Returns:
+            Tuple of (tool_name, tool_args)
+        """
+        from awm.tools import tools_robust_json_loads
+        
+        if isinstance(arguments, str):
+            arguments = tools_robust_json_loads(arguments)
+        if not isinstance(arguments, dict):
+            return "", {}
+        
+        tool_name = arguments.get("tool_name", "")
+        inner_args = arguments.get("arguments", {})
+        
+        # Handle mcp_tool_ prefix
+        if tool_name.startswith("mcp_tool_"):
+            tool_name = tool_name[len("mcp_tool_"):]
+        
+        # Parse inner arguments if string
+        if isinstance(inner_args, str):
+            parsed = tools_robust_json_loads(inner_args) if inner_args.strip() else {}
+            if isinstance(parsed, dict):
+                inner_args = parsed
+            else:
+                inner_args = {}
+        
+        if not isinstance(inner_args, dict):
+            inner_args = {}
+        
+        return tool_name, inner_args
     
     def _compute_final_reward(self, final_answer: str) -> float:
         if self.reward_fn:

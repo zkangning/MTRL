@@ -168,15 +168,13 @@ fi
 # ============================================================
 python3 -m examples.awm.train_awm \
     algorithm.adv_estimator=grpo \
-    data.dataset_path="$AWM_DATA_DIR" \
+    +data.dataset_path="$AWM_DATA_DIR" \
+    +data.train_scenarios=$TRAIN_SCENARIOS \
+    +data.test_scenarios=$TEST_SCENARIOS \
+    +data.tasks_per_scenario=$TASKS_PER_SCENARIO \
+    +data.verification_mode=$VERIFICATION_MODE \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.val_batch_size=$VAL_BATCH_SIZE \
-    data.max_prompt_length=$MAX_PROMPT_LENGTH \
-    data.max_response_length=$MAX_RESPONSE_LENGTH \
-    data.train_scenarios=$TRAIN_SCENARIOS \
-    data.test_scenarios=$TEST_SCENARIOS \
-    data.tasks_per_scenario=$TASKS_PER_SCENARIO \
-    data.verification_mode=$VERIFICATION_MODE \
     actor_rollout_ref.model.path=$BASE_MODEL_PATH \
     actor_rollout_ref.hybrid_engine=True \
     actor_rollout_ref.actor.optim.lr=$LEARNING_RATE \
