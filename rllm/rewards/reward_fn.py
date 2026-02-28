@@ -140,3 +140,31 @@ def webshop_reward_fn(task_info: dict, action: str) -> RewardOutput:
         action = action.action
     return reward_fn(task_info, action)
 
+
+def awm_reward_fn(task_info: dict, action: str) -> RewardOutput:
+    """
+    A reward function for AWM (Agentic World Model) tasks.
+    
+    Uses the pure code-based verification approach by default.
+    The verification code is generated during AWM dataset creation
+    and evaluates whether the agent has completed the task.
+
+    Args:
+        task_info: The task dictionary containing:
+            - verifier_code: Python verification code
+            - db_path: Path to SQLite database
+            - final_answer: Agent's final response
+            - history: Interaction history
+        action: The agent's action/response
+
+    Returns:
+        RewardOutput: The calculated reward value (1.0 for complete, 0.0 otherwise)
+    """
+    from rllm.environments.awm.awm_reward import AWMMCPPureCodeRewardFn
+    
+    reward_config = RewardConfig()
+    reward_fn = AWMMCPPureCodeRewardFn(reward_config)
+    if isinstance(action, Action):
+        action = action.action
+    return reward_fn(task_info, action)
+

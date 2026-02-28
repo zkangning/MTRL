@@ -1,0 +1,188 @@
+# AWM (Agentic World Model) Training Configuration
+# 
+# This config is specifically designed for training agents on AWM-generated
+# virtual environments with MCP-based tool interactions.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+    - pkg://rllm.trainer.config
+
+defaults:
+  - ppo_trainer
+  - override ppo_trainer: default
+  - _self_
+
+# ============================================================
+# Data Configuration
+# ============================================================
+data:
+  dataset_name: awm_composite
+  dataset_path: Snowflake/AgenticWorldModel
+  train_scenarios: 100          # Number of scenarios for training
+  test_scenarios: 20            # Number of scenarios for testing
+  tasks_per_scenario: 10        # Tasks per scenario (1-10)
+  verification_mode: pure_code  # pure_code or sql
+  database_dir: ./outputs/awm_databases
+  
+  # Batch sizes
+  train_batch_size: 128
+  val_batch_size: 64
+  gen_batch_size: ${mul:${data.train_batch_size},${rllm.rejection_sample.multiplier}}
+  
+  # Filter settings
+  filter_truncated: true
+  filter_overlong: true
+  max_prompt_length: 4096
+  max_response_length: 8192
+
+# ============================================================
+# RLLM Agent Configuration
+# ============================================================
+rllm:
+  agent:
+    name: awm_agent
+    max_steps: 30               # Maximum interaction steps per episode
+    trajectory_timeout: 120     # Timeout per trajectory in seconds
+    overlong_filter: true
+    parser_name: qwen           # Parser for tool calls
+    engine_args:
+      temperature: 0.6
+      top_p: 0.9
+      max_tokens: 2048
+    
+  env:
+    name: awm_env
+    env_args:
+      server_start_timeout: 30.0
+      server_host: 127.0.0.1
+  
+  workflow:
+    use_workflow: false
+    name: multi_turn_workflow
+    workflow_args:
+      agent_cls: null
+      agent_args: {}
+      env_cls: null
+      env_args: {}
+      timeout: 1e6
+      gamma: 0.0
+      reward_bonus_coeff: 0.0
+    n_parallel_tasks: 64        # Reduced for AWM server startup overhead
+    retry_limit: 2
+  
+  # Thinking mode
+  disable_thinking: false
+  accumulate_reasoning: true
+  mask_truncated_samples: true
+  
+  # Stepwise advantage
+  stepwise_advantage:
+    enable: true
+    mode: broadcast
+    normalize_by_steps: true
+  
+  # Compact filtering
+  compact_filtering:
+    enable: true
+    mask_max_prompt_length_exceeded: true
+    mask_max_response_length_exceeded: true
+    mask_env_done: false
+    mask_max_turns_exceeded: true
+    mask_timeout: true
+    mask_unknown: false
+    mask_error: true
+  
+  # Rejection sampling
+  rejection_sample:
+    enable: true
+    multiplier: 2
+  
+  # Length penalty (Kimi K1.5 style)
+  length_penalty:
+    enable: true
+    weight: 0.1
+    warmup_steps: 50
+    min_response_length: 1024
+  
+  # Simple length penalty (disabled by default)
+  simple_length_penalty:
+    enable: false
+    baseline_len: 2048
+    coefficient: 0.15
+    max_penalty: 0.3
+    warmup_steps: 0
+
+# ============================================================
+# Actor/Rollout Configuration
+# ============================================================
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct  # Base model
+    enable_gradient_checkpointing: true
+  
+  actor:
+    strategy: fsdp
+    optim:
+      lr: 1e-6
+      lr_scheduler: cosine
+      warmup_steps: 100
+    
+  rollout:
+    mode: async
+    agent:
+      num_workers: 4              # Number of parallel rollout workers
+    val_kwargs:
+      do_sample: false
+      temperature: 0.0
+    
+  ref:
+    fsdp_config:
+      optimizer_cpu_offload: false
+
+# ============================================================
+# Critic Configuration
+# ============================================================
+critic:
+  model:
+    path: Qwen/Qwen2.5-7B-Instruct
+  strategy: fsdp
+  optim:
+    lr: 1e-5
+    lr_scheduler: cosine
+    warmup_steps: 100
+
+# ============================================================
+# Trainer Configuration
+# ============================================================
+trainer:
+  project_name: rllm-awm
+  experiment_name: awm-7b-ppo
+  
+  # Training settings
+  total_epochs: 3
+  total_training_steps: null
+  
+  # Logging
+  log_episodes: true
+  episode_log_dir: logs/${trainer.project_name}/${trainer.experiment_name}
+  log_freq: 10
+  
+  # Checkpointing
+  save_freq: 100
+  save_checkpoint_path: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  
+  # Evaluation
+  val_freq: 50
+  val_before_train: true
+  val_only: false
+
+# ============================================================
+# Logging Configuration
+# ============================================================
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  handlers:
+    - console
+    - file

@@ -865,6 +865,185 @@ def load_tool_call_dataset(data_dir: str, split: str = "train", num_samples: int
         return []
 
 
+def load_awm_dataset(
+    dataset_path: str = "Snowflake/AgenticWorldModel",
+    split: str = "train",
+    num_scenarios: int = 0,
+    tasks_per_scenario: int = 10,
+    verification_mode: str = "pure_code"  # "pure_code" or "sql"
+) -> List[Dict]:
+    """
+    加载 AWM (Agentic World Model) 数据集。
+    
+    AWM 数据集包含以下文件:
+    - gen_scenario.jsonl: 场景描述 (1000 scenarios)
+    - gen_tasks.jsonl: 用户任务 (10 tasks per scenario)
+    - gen_db.jsonl: 数据库 schema
+    - gen_sample.jsonl: 初始数据库数据
+    - gen_spec.jsonl: API 规范
+    - gen_envs.jsonl: FastAPI + MCP Server 代码
+    - gen_verifier.jsonl: 验证代码 (code-augmented LLM-as-Judge)
+    - gen_verifier.pure_code.jsonl: 纯代码验证
+    
+    Args:
+        dataset_path: HuggingFace 数据集路径，默认为 "Snowflake/AgenticWorldModel"
+        split: "train" 或 "test"
+        num_scenarios: 要加载的场景数量 (0 表示全部)
+        tasks_per_scenario: 每个场景加载的任务数量 (1-10)
+        verification_mode: "pure_code" 或 "sql"
+        
+    Returns:
+        标准化的数据样本列表，每个样本包含:
+        - scenario: 场景名称
+        - task: 任务描述
+        - env_code: FastAPI/MCP 代码
+        - db_path: 数据库文件路径
+        - verifier_code: 验证代码
+        - max_steps: 最大交互步数
+    """
+    logger.info(f"Loading AWM dataset from {dataset_path} ({split})...")
+    logger.info(f"  num_scenarios={num_scenarios}, tasks_per_scenario={tasks_per_scenario}")
+    logger.info(f"  verification_mode={verification_mode}")
+    
+    try:
+        from datasets import load_dataset as hf_load_dataset
+        
+        # 加载所有必要的文件
+        scenarios_ds = hf_load_dataset(dataset_path, data_files="gen_scenario.jsonl", split="train")
+        tasks_ds = hf_load_dataset(dataset_path, data_files="gen_tasks.jsonl", split="train")
+        dbs_ds = hf_load_dataset(dataset_path, data_files="gen_db.jsonl", split="train")
+        samples_ds = hf_load_dataset(dataset_path, data_files="gen_sample.jsonl", split="train")
+        specs_ds = hf_load_dataset(dataset_path, data_files="gen_spec.jsonl", split="train")
+        envs_ds = hf_load_dataset(dataset_path, data_files="gen_envs.jsonl", split="train")
+        
+        # 根据 verification_mode 选择验证文件
+        if verification_mode == "pure_code":
+            verifier_file = "gen_verifier.pure_code.jsonl"
+        else:
+            verifier_file = "gen_verifier.jsonl"
+        verifiers_ds = hf_load_dataset(dataset_path, data_files=verifier_file, split="train")
+        
+        # 转换为字典列表
+        scenarios = list(scenarios_ds)
+        tasks = list(tasks_ds)
+        dbs = list(dbs_ds)
+        samples = list(samples_ds)
+        specs = list(specs_ds)
+        envs = list(envs_ds)
+        verifiers = list(verifiers_ds)
+        
+        # 构建查找字典
+        scenario_map = {normalize_awm_scenario_name(s["scenario"]): s for s in scenarios}
+        tasks_map = {}
+        for t in tasks:
+            key = normalize_awm_scenario_name(t["scenario"])
+            if key not in tasks_map:
+                tasks_map[key] = []
+            tasks_map[key].append(t)
+        dbs_map = {normalize_awm_scenario_name(d["scenario"]): d for d in dbs}
+        samples_map = {normalize_awm_scenario_name(s["scenario"]): s for s in samples}
+        specs_map = {normalize_awm_scenario_name(s["scenario"]): s for s in specs}
+        envs_map = {normalize_awm_scenario_name(e["scenario"]): e for e in envs}
+        
+        # 验证代码按 scenario + task 索引
+        verifiers_map = {}
+        for v in verifiers:
+            key = (normalize_awm_scenario_name(v["scenario"]), v["task"])
+            verifiers_map[key] = v
+        
+        # 限制场景数量
+        if num_scenarios > 0 and num_scenarios < len(scenarios):
+            rng = random.Random(GLOBAL_SEED)
+            selected_scenarios = rng.sample(scenarios, num_scenarios)
+        else:
+            selected_scenarios = scenarios
+        
+        processed_data = []
+        
+        for scenario_data in selected_scenarios:
+            scenario_name = normalize_awm_scenario_name(scenario_data["scenario"])
+            
+            # 获取该场景的数据
+            scenario_tasks = tasks_map.get(scenario_name, [])
+            db_data = dbs_map.get(scenario_name)
+            sample_data = samples_map.get(scenario_name)
+            spec_data = specs_map.get(scenario_name)
+            env_data = envs_map.get(scenario_name)
+            
+            if not all([db_data, sample_data, spec_data, env_data]):
+                logger.warning(f"Missing data for scenario {scenario_name}, skipping...")
+                continue
+            
+            # 限制任务数量
+            if tasks_per_scenario > 0 and tasks_per_scenario < len(scenario_tasks):
+                rng = random.Random(GLOBAL_SEED)
+                selected_tasks = rng.sample(scenario_tasks, tasks_per_scenario)
+            else:
+                selected_tasks = scenario_tasks
+            
+            for task_data in selected_tasks:
+                task_description = task_data["task"]
+                
+                # 获取验证代码
+                verifier_key = (scenario_name, task_description)
+                verifier_data = verifiers_map.get(verifier_key, {})
+                verifier_code = verifier_data.get("verification", {}).get("code", "")
+                
+                # 构建环境数据
+                env_code = env_data.get("full_code", "")
+                db_schema = db_data.get("db_schema", {})
+                db_sample = sample_data.get("sample_data", {})
+                
+                # 构建原始数据字典
+                raw_data = {
+                    "scenario": scenario_name,
+                    "scenario_description": scenario_data.get("description", ""),
+                    "task": task_description,
+                    "env_code": env_code,
+                    "db_schema": db_schema,
+                    "db_sample": db_sample,
+                    "schema": db_schema,
+                    "sample_data": db_sample,
+                    "api_spec": spec_data.get("api_spec", {}),
+                    "verifier_code": verifier_code,
+                    "verification_mode": verification_mode,
+                    "task_type": "awm",
+                    "sub_source": "awm",
+                    "max_steps": 30,  # 默认最大步数
+                }
+                
+                # 注意: db_path 需要在环境初始化时动态创建
+                # 这里只存储 schema 和 sample 信息
+                
+                clean_d = create_standard_sample(
+                    prompt=task_description,
+                    response="",  # AWM 没有标准答案
+                    task_type="awm",
+                    raw_data=raw_data
+                )
+                processed_data.append(clean_d)
+        
+        # 打乱数据
+        rng = random.Random(GLOBAL_SEED)
+        rng.shuffle(processed_data)
+        
+        logger.info(f"Loaded {len(processed_data)} AWM tasks from {len(selected_scenarios)} scenarios.")
+        return processed_data
+        
+    except Exception as e:
+        logger.error(f"Failed to load AWM dataset: {e}", exc_info=True)
+        return []
+
+
+def normalize_awm_scenario_name(name: str) -> str:
+    """Normalize AWM scenario name for consistent lookup."""
+    import re
+    # 转换为小写，移除非字母数字字符，合并多个空格
+    normalized = re.sub(r'[^a-zA-Z0-9\s]', '', name.lower())
+    normalized = re.sub(r'\s+', '_', normalized.strip())
+    return normalized
+
+
 def load_tool_call_json_dataset(data_dir: str, split: str = "train", num_samples: int = 0) -> List[Dict]:
     """
     加载本地 Tool Call JSON 数据。
