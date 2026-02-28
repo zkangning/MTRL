@@ -5,6 +5,14 @@ from rllm.agents.tool_agent import ToolAgent
 __all__ = ["BaseAgent", "Action", "Step", "Trajectory", "Episode", "MathAgent", "ToolAgent"]
 
 
+# AWM Agent (always available)
+try:
+    from rllm.agents.awm_agent import AWMAgent
+    __all__.append("AWMAgent")
+except ImportError:
+    pass
+
+
 def safe_import(module_path, class_name):
     try:
         module = __import__(module_path, fromlist=[class_name])

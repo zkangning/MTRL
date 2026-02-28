@@ -29,7 +29,7 @@ from rllm.trainer.agent_trainer import AgentTrainer
 from rllm.rewards.reward_fn import awm_reward_fn
 from rllm.environments.awm import AWMEnvironment
 from rllm.agents.awm_prompts import AWM_SYSTEM_PROMPT
-from rllm.data.utils import load_awm_dataset, create_standard_sample
+from rllm.data.utils import load_awm_dataset
 
 
 # ============================================================
@@ -79,7 +79,7 @@ def prepare_awm_dataset(
     Returns:
         Dataset name for registry
     """
-    dataset_name = "awm_composite"
+    dataset_name = "awm_dataset"
     
     logger.info(">>> Preparing AWM Dataset...")
     logger.info(f">>> Dataset: {dataset_path}")
@@ -114,7 +114,7 @@ def prepare_awm_dataset(
     return dataset_name
 
 
-@hydra.main(config_path="configs", config_name="agent_ppo_trainer_awm", version_base=None)
+@hydra.main(config_path="../../rllm/trainer/config", config_name="agent_ppo_trainer", version_base="1.1")
 def main(config):
     """Main training function."""
     

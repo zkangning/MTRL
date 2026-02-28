@@ -507,17 +507,71 @@ When you have completed the task, provide your final answer directly without any
     
     @staticmethod
     def from_dict(env_args: Dict[str, Any]) -> "AWMEnvironment":
+        """
+        Create AWMEnvironment from task dictionary.
+        
+        The task dictionary contains:
+        - prompt: Task description
+        - extra_info: JSON string containing scenario, env_code, db_schema, etc.
+        - reward_fn: Passed separately in env_args
+        """
+        import json
+        
+        # Extract reward_fn from env_args (not from task data)
         reward_fn = env_args.pop("reward_fn", None)
+        max_steps = env_args.pop("max_steps", 30)
+        server_host = env_args.pop("server_host", "127.0.0.1")
+        server_start_timeout = env_args.pop("server_start_timeout", 30.0)
+        
+        # Parse extra_info if it's a string
+        extra_info = env_args.get("extra_info", "{}")
+        if isinstance(extra_info, str):
+            try:
+                extra_info = json.loads(extra_info)
+            except json.JSONDecodeError:
+                extra_info = {}
+        
+        # Get task description from prompt or extra_info
+        task_description = env_args.get("prompt", "")
+        if not task_description and isinstance(extra_info, dict):
+            task_description = extra_info.get("task", "")
+        
+        # Extract scenario name
+        scenario_name = "unknown"
+        if isinstance(extra_info, dict):
+            scenario_name = extra_info.get("scenario", "unknown")
+        
+        # Extract environment code
+        env_code = ""
+        if isinstance(extra_info, dict):
+            env_code = extra_info.get("env_code", "")
+        
+        # Extract database info
+        db_schema = None
+        db_sample = None
+        if isinstance(extra_info, dict):
+            db_schema = extra_info.get("db_schema") or extra_info.get("schema")
+            db_sample = extra_info.get("db_sample") or extra_info.get("sample_data")
+        
+        # Extract verifier code
+        verifier_code = None
+        if isinstance(extra_info, dict):
+            verifier_code = extra_info.get("verifier_code")
+        
+        # Get max_steps from extra_info if available
+        if isinstance(extra_info, dict) and "max_steps" in extra_info:
+            max_steps = extra_info.get("max_steps", max_steps)
+        
         return AWMEnvironment(
-            scenario_name=env_args.get("scenario_name", "unknown"),
-            task_description=env_args.get("task_description", ""),
-            env_code=env_args.get("env_code", ""),
-            db_path=env_args.get("db_path"),
-            db_schema=env_args.get("db_schema") or env_args.get("schema"),
-            db_sample=env_args.get("db_sample") or env_args.get("sample_data"),
-            verifier_code=env_args.get("verifier_code"),
-            max_steps=env_args.get("max_steps", 30),
+            scenario_name=scenario_name,
+            task_description=task_description,
+            env_code=env_code,
+            db_path=None,  # Will be created dynamically during reset
+            db_schema=db_schema,
+            db_sample=db_sample,
+            verifier_code=verifier_code,
+            max_steps=max_steps,
             reward_fn=reward_fn,
-            server_host=env_args.get("server_host", "127.0.0.1"),
-            server_start_timeout=env_args.get("server_start_timeout", 30.0),
+            server_host=server_host,
+            server_start_timeout=server_start_timeout,
         )
