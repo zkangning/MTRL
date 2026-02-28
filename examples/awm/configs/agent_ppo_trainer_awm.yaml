@@ -217,7 +217,6 @@ trainer:
   log_freq: 10
   
   # Checkpointing
-  save_freq: 100
   save_checkpoint_path: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   
   # Evaluation
