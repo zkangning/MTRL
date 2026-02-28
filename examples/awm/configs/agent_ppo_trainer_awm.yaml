@@ -3,11 +3,6 @@
 # This config is specifically designed for training agents on AWM-generated
 # virtual environments with MCP-based tool interactions.
 
-hydra:
-  searchpath:
-    - pkg://verl.trainer.config
-    - pkg://rllm.trainer.config
-
 defaults:
   - agent_ppo_trainer
   - _self_
