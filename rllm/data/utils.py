@@ -875,71 +875,100 @@ def load_awm_dataset(
     """
     加载 AWM (Agentic World Model) 数据集。
     
+    支持两种数据源：
+    1. 本地目录（如 "awm_data"）— 直接从 JSONL 文件加载
+    2. HuggingFace 数据集路径（如 "Snowflake/AgenticWorldModel"）
+    
     AWM 数据集包含以下文件:
     - gen_scenario.jsonl: 场景描述 (1000 scenarios)
-    - gen_tasks.jsonl: 用户任务 (10 tasks per scenario)
+      格式: {"name": "scenario_name", "description": "..."}
+    - gen_tasks.jsonl: 用户任务 (每个 scenario 一条记录，包含 10 个 tasks)
+      格式: {"scenario": "scenario_name", "tasks": ["task1", "task2", ...]}
     - gen_db.jsonl: 数据库 schema
+      格式: {"scenario": "scenario_name", "db_schema": {...}, "db_path": "..."}
     - gen_sample.jsonl: 初始数据库数据
+      格式: {"scenario": "scenario_name", "sample_data": {"tables": [...]}}
     - gen_spec.jsonl: API 规范
+      格式: {"scenario": "scenario_name", "api_spec": {...}}
     - gen_envs.jsonl: FastAPI + MCP Server 代码
+      格式: {"scenario": "scenario_name", "full_code": "..."}
     - gen_verifier.jsonl: 验证代码 (code-augmented LLM-as-Judge)
+      格式: {"scenario": "...", "task_idx": N, "task": "...", "verification": {"code": "..."}}
     - gen_verifier.pure_code.jsonl: 纯代码验证
+      格式: {"scenario": "...", "task_idx": N, "task": "...", "verification": {"code": "..."}}
     
     Args:
-        dataset_path: HuggingFace 数据集路径，默认为 "Snowflake/AgenticWorldModel"
-        split: "train" 或 "test"
+        dataset_path: 本地数据目录路径或 HuggingFace 数据集路径
+        split: "train" 或 "test"（用于 train/test 场景划分）
         num_scenarios: 要加载的场景数量 (0 表示全部)
         tasks_per_scenario: 每个场景加载的任务数量 (1-10)
         verification_mode: "pure_code" 或 "sql"
         
     Returns:
-        标准化的数据样本列表，每个样本包含:
-        - scenario: 场景名称
-        - task: 任务描述
-        - env_code: FastAPI/MCP 代码
-        - db_path: 数据库文件路径
-        - verifier_code: 验证代码
-        - max_steps: 最大交互步数
+        标准化的数据样本列表
     """
     logger.info(f"Loading AWM dataset from {dataset_path} ({split})...")
     logger.info(f"  num_scenarios={num_scenarios}, tasks_per_scenario={tasks_per_scenario}")
     logger.info(f"  verification_mode={verification_mode}")
     
     try:
-        from datasets import load_dataset as hf_load_dataset
+        # 判断是本地目录还是 HuggingFace 路径
+        is_local = os.path.isdir(dataset_path)
+        
+        def _load_jsonl(filename: str) -> List[Dict]:
+            """加载单个 JSONL 文件，支持本地和 HuggingFace 两种方式。"""
+            if is_local:
+                filepath = os.path.join(dataset_path, filename)
+                if not os.path.exists(filepath):
+                    logger.warning(f"File not found: {filepath}")
+                    return []
+                data = []
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            data.append(json.loads(line))
+                return data
+            else:
+                from datasets import load_dataset as hf_load_dataset
+                ds = hf_load_dataset(dataset_path, data_files=filename, split="train")
+                return list(ds)
         
         # 加载所有必要的文件
-        scenarios_ds = hf_load_dataset(dataset_path, data_files="gen_scenario.jsonl", split="train")
-        tasks_ds = hf_load_dataset(dataset_path, data_files="gen_tasks.jsonl", split="train")
-        dbs_ds = hf_load_dataset(dataset_path, data_files="gen_db.jsonl", split="train")
-        samples_ds = hf_load_dataset(dataset_path, data_files="gen_sample.jsonl", split="train")
-        specs_ds = hf_load_dataset(dataset_path, data_files="gen_spec.jsonl", split="train")
-        envs_ds = hf_load_dataset(dataset_path, data_files="gen_envs.jsonl", split="train")
+        scenarios = _load_jsonl("gen_scenario.jsonl")
+        tasks_raw = _load_jsonl("gen_tasks.jsonl")
+        dbs = _load_jsonl("gen_db.jsonl")
+        samples = _load_jsonl("gen_sample.jsonl")
+        specs = _load_jsonl("gen_spec.jsonl")
+        envs = _load_jsonl("gen_envs.jsonl")
         
         # 根据 verification_mode 选择验证文件
         if verification_mode == "pure_code":
             verifier_file = "gen_verifier.pure_code.jsonl"
         else:
             verifier_file = "gen_verifier.jsonl"
-        verifiers_ds = hf_load_dataset(dataset_path, data_files=verifier_file, split="train")
-        
-        # 转换为字典列表
-        scenarios = list(scenarios_ds)
-        tasks = list(tasks_ds)
-        dbs = list(dbs_ds)
-        samples = list(samples_ds)
-        specs = list(specs_ds)
-        envs = list(envs_ds)
-        verifiers = list(verifiers_ds)
+        verifiers = _load_jsonl(verifier_file)
         
         # 构建查找字典
-        scenario_map = {normalize_awm_scenario_name(s["scenario"]): s for s in scenarios}
-        tasks_map = {}
-        for t in tasks:
+        # gen_scenario.jsonl 使用 "name" 字段作为场景名称
+        scenario_map = {normalize_awm_scenario_name(s["name"]): s for s in scenarios}
+        
+        # gen_tasks.jsonl: 每条记录格式为 {"scenario": "xxx", "tasks": ["task1", "task2", ...]}
+        # 需要展开为按 scenario 分组的任务字符串列表
+        tasks_map = {}  # scenario_key -> List[str]
+        for t in tasks_raw:
             key = normalize_awm_scenario_name(t["scenario"])
-            if key not in tasks_map:
-                tasks_map[key] = []
-            tasks_map[key].append(t)
+            task_list = t.get("tasks", [])
+            if isinstance(task_list, list):
+                if key not in tasks_map:
+                    tasks_map[key] = []
+                tasks_map[key].extend(task_list)
+            else:
+                # 兼容可能的单任务格式
+                if key not in tasks_map:
+                    tasks_map[key] = []
+                tasks_map[key].append(str(task_list))
+        
         dbs_map = {normalize_awm_scenario_name(d["scenario"]): d for d in dbs}
         samples_map = {normalize_awm_scenario_name(s["scenario"]): s for s in samples}
         specs_map = {normalize_awm_scenario_name(s["scenario"]): s for s in specs}
@@ -961,9 +990,11 @@ def load_awm_dataset(
         processed_data = []
         
         for scenario_data in selected_scenarios:
-            scenario_name = normalize_awm_scenario_name(scenario_data["scenario"])
+            # gen_scenario.jsonl 使用 "name" 字段
+            scenario_raw_name = scenario_data["name"]
+            scenario_name = normalize_awm_scenario_name(scenario_raw_name)
             
-            # 获取该场景的数据
+            # 获取该场景的任务列表（字符串列表）
             scenario_tasks = tasks_map.get(scenario_name, [])
             db_data = dbs_map.get(scenario_name)
             sample_data = samples_map.get(scenario_name)
@@ -971,7 +1002,11 @@ def load_awm_dataset(
             env_data = envs_map.get(scenario_name)
             
             if not all([db_data, sample_data, spec_data, env_data]):
-                logger.warning(f"Missing data for scenario {scenario_name}, skipping...")
+                logger.warning(f"Missing data for scenario {scenario_raw_name}, skipping...")
+                continue
+            
+            if not scenario_tasks:
+                logger.warning(f"No tasks found for scenario {scenario_raw_name}, skipping...")
                 continue
             
             # 限制任务数量
@@ -981,8 +1016,8 @@ def load_awm_dataset(
             else:
                 selected_tasks = scenario_tasks
             
-            for task_data in selected_tasks:
-                task_description = task_data["task"]
+            for task_description in selected_tasks:
+                # task_description 现在就是任务字符串
                 
                 # 获取验证代码
                 verifier_key = (scenario_name, task_description)
@@ -996,7 +1031,7 @@ def load_awm_dataset(
                 
                 # 构建原始数据字典
                 raw_data = {
-                    "scenario": scenario_name,
+                    "scenario": scenario_raw_name,
                     "scenario_description": scenario_data.get("description", ""),
                     "task": task_description,
                     "env_code": env_code,
@@ -1036,12 +1071,12 @@ def load_awm_dataset(
 
 
 def normalize_awm_scenario_name(name: str) -> str:
-    """Normalize AWM scenario name for consistent lookup."""
-    import re
-    # 转换为小写，移除非字母数字字符，合并多个空格
-    normalized = re.sub(r'[^a-zA-Z0-9\s]', '', name.lower())
-    normalized = re.sub(r'\s+', '_', normalized.strip())
-    return normalized
+    """Normalize AWM scenario name for consistent cross-file lookup.
+    
+    所有数据文件中的 scenario 名称格式一致（如 "e_commerce_33"、"content_platform_1"），
+    直接转为小写并 strip 即可。不应移除下划线，因为它是名称的组成部分。
+    """
+    return name.strip().lower()
 
 
 def load_tool_call_json_dataset(data_dir: str, split: str = "train", num_samples: int = 0) -> List[Dict]:
