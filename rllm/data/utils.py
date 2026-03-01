@@ -875,37 +875,32 @@ def load_awm_dataset(
     """
     加载 AWM (Agentic World Model) 数据集。
     
-    支持两种数据源：
-    1. 本地目录（如 "awm_data"）— 直接从 JSONL 文件加载
-    2. HuggingFace 数据集路径（如 "Snowflake/AgenticWorldModel"）
+    【独立数据管道】不使用 create_standard_sample，直接生成 verl 兼容的扁平格式。
     
-    AWM 数据集包含以下文件:
-    - gen_scenario.jsonl: 场景描述 (1000 scenarios)
-      格式: {"name": "scenario_name", "description": "..."}
-    - gen_tasks.jsonl: 用户任务 (每个 scenario 一条记录，包含 10 个 tasks)
-      格式: {"scenario": "scenario_name", "tasks": ["task1", "task2", ...]}
-    - gen_db.jsonl: 数据库 schema
-      格式: {"scenario": "scenario_name", "db_schema": {...}, "db_path": "..."}
-    - gen_sample.jsonl: 初始数据库数据
-      格式: {"scenario": "scenario_name", "sample_data": {"tables": [...]}}
-    - gen_spec.jsonl: API 规范
-      格式: {"scenario": "scenario_name", "api_spec": {...}}
-    - gen_envs.jsonl: FastAPI + MCP Server 代码
-      格式: {"scenario": "scenario_name", "full_code": "..."}
-    - gen_verifier.jsonl: 验证代码 (code-augmented LLM-as-Judge)
-      格式: {"scenario": "...", "task_idx": N, "task": "...", "verification": {"code": "..."}}
-    - gen_verifier.pure_code.jsonl: 纯代码验证
-      格式: {"scenario": "...", "task_idx": N, "task": "...", "verification": {"code": "..."}}
+    verl 管道的数据流：
+      parquet -> RLHFDataset -> collate_fn -> DataProto
+      -> init_envs_and_agents -> batch.non_tensor_batch["extra_info"]
+      -> from_dict({**extra_info_dict, **base_env_args})
     
-    Args:
-        dataset_path: 本地数据目录路径或 HuggingFace 数据集路径
-        split: "train" 或 "test"（用于 train/test 场景划分）
-        num_scenarios: 要加载的场景数量 (0 表示全部)
-        tasks_per_scenario: 每个场景加载的任务数量 (1-10)
-        verification_mode: "pure_code" 或 "sql"
-        
-    Returns:
-        标准化的数据样本列表
+    因此 extra_info 字段必须是一个 dict，直接包含 AWMEnvironment.from_dict 所需的
+    所有字段（scenario, env_code, db_schema, db_sample, verifier_code 等）。
+    
+    输出格式（每条记录）：
+    {
+        "prompt": [{"role": "user", "content": task_description}],
+        "extra_info": {  # dict，直接被 from_dict 消费
+            "index": int,
+            "scenario": str,
+            "task": str,
+            "env_code": str,
+            "db_schema": dict,
+            "db_sample": dict,
+            "verifier_code": str,
+            "max_steps": int,
+            "task_type": "awm",
+        },
+        "data_source": "awm",
+    }
     """
     logger.info(f"Loading AWM dataset from {dataset_path} ({split})...")
     logger.info(f"  num_scenarios={num_scenarios}, tasks_per_scenario={tasks_per_scenario}")
@@ -950,11 +945,8 @@ def load_awm_dataset(
         verifiers = _load_jsonl(verifier_file)
         
         # 构建查找字典
-        # gen_scenario.jsonl 使用 "name" 字段作为场景名称
         scenario_map = {normalize_awm_scenario_name(s["name"]): s for s in scenarios}
         
-        # gen_tasks.jsonl: 每条记录格式为 {"scenario": "xxx", "tasks": ["task1", "task2", ...]}
-        # 需要展开为按 scenario 分组的任务字符串列表
         tasks_map = {}  # scenario_key -> List[str]
         for t in tasks_raw:
             key = normalize_awm_scenario_name(t["scenario"])
@@ -964,7 +956,6 @@ def load_awm_dataset(
                     tasks_map[key] = []
                 tasks_map[key].extend(task_list)
             else:
-                # 兼容可能的单任务格式
                 if key not in tasks_map:
                     tasks_map[key] = []
                 tasks_map[key].append(str(task_list))
@@ -974,7 +965,6 @@ def load_awm_dataset(
         specs_map = {normalize_awm_scenario_name(s["scenario"]): s for s in specs}
         envs_map = {normalize_awm_scenario_name(e["scenario"]): e for e in envs}
         
-        # 验证代码按 scenario + task 索引
         verifiers_map = {}
         for v in verifiers:
             key = (normalize_awm_scenario_name(v["scenario"]), v["task"])
@@ -988,13 +978,12 @@ def load_awm_dataset(
             selected_scenarios = scenarios
         
         processed_data = []
+        global_idx = 0
         
         for scenario_data in selected_scenarios:
-            # gen_scenario.jsonl 使用 "name" 字段
             scenario_raw_name = scenario_data["name"]
             scenario_name = normalize_awm_scenario_name(scenario_raw_name)
             
-            # 获取该场景的任务列表（字符串列表）
             scenario_tasks = tasks_map.get(scenario_name, [])
             db_data = dbs_map.get(scenario_name)
             sample_data = samples_map.get(scenario_name)
@@ -1017,46 +1006,43 @@ def load_awm_dataset(
                 selected_tasks = scenario_tasks
             
             for task_description in selected_tasks:
-                # task_description 现在就是任务字符串
-                
-                # 获取验证代码
                 verifier_key = (scenario_name, task_description)
                 verifier_data = verifiers_map.get(verifier_key, {})
                 verifier_code = verifier_data.get("verification", {}).get("code", "")
                 
-                # 构建环境数据
                 env_code = env_data.get("full_code", "")
                 db_schema = db_data.get("db_schema", {})
                 db_sample = sample_data.get("sample_data", {})
                 
-                # 构建原始数据字典
-                raw_data = {
+                # ============================================================
+                # 直接构造 verl 兼容的数据格式
+                # extra_info 是一个 dict，会被 verl 管道原样传递到
+                # init_envs_and_agents -> from_dict({**extra_info, **base_env_args})
+                #
+                # 【关键】：extra_info 中的字段需要全部可被 JSON 序列化，
+                # 因为 verl 会将其存入 parquet (Arrow) 格式。
+                # 复杂的嵌套 dict (db_schema, db_sample) 序列化为 JSON 字符串，
+                # 在 from_dict 中反序列化。
+                # ============================================================
+                extra_info = {
+                    "index": global_idx,
                     "scenario": scenario_raw_name,
-                    "scenario_description": scenario_data.get("description", ""),
                     "task": task_description,
                     "env_code": env_code,
-                    "db_schema": db_schema,
-                    "db_sample": db_sample,
-                    "schema": db_schema,
-                    "sample_data": db_sample,
-                    "api_spec": spec_data.get("api_spec", {}),
+                    "db_schema": json.dumps(db_schema, ensure_ascii=False),
+                    "db_sample": json.dumps(db_sample, ensure_ascii=False),
                     "verifier_code": verifier_code,
-                    "verification_mode": verification_mode,
+                    "max_steps": 30,
                     "task_type": "awm",
-                    "sub_source": "awm",
-                    "max_steps": 30,  # 默认最大步数
                 }
                 
-                # 注意: db_path 需要在环境初始化时动态创建
-                # 这里只存储 schema 和 sample 信息
-                
-                clean_d = create_standard_sample(
-                    prompt=task_description,
-                    response="",  # AWM 没有标准答案
-                    task_type="awm",
-                    raw_data=raw_data
-                )
-                processed_data.append(clean_d)
+                record = {
+                    "prompt": [{"role": "user", "content": task_description}],
+                    "extra_info": extra_info,
+                    "data_source": "awm",
+                }
+                processed_data.append(record)
+                global_idx += 1
         
         # 打乱数据
         rng = random.Random(GLOBAL_SEED)

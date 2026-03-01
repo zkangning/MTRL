@@ -576,46 +576,113 @@ When you have completed the task, provide your final answer directly without any
         """
         Create AWMEnvironment from task dictionary.
         
-        Called by the execution engine with: {**task, **self.env_args}
-        where task = {prompt, response, task_type, data_source, extra_info}
-        and env_args = {reward_fn, max_steps, server_host, server_start_timeout, ...}
+        【独立管道】数据流（绕开 DatasetRegistry / apply_verl_postprocessing）:
+        
+        1. load_awm_dataset() 生成:
+           extra_info = {
+               "index": int,
+               "scenario": str, "task": str,
+               "env_code": str,
+               "db_schema": str (JSON), "db_sample": str (JSON),
+               "verifier_code": str, "max_steps": int, "task_type": "awm"
+           }
+        
+        2. init_envs_and_agents() 调用:
+           env_args[i] = extra_info dict (parsed from JSON if str)
+           self.env_class.from_dict({**env_args[i], **base_env_args})
+        
+        3. 因此本方法收到的 env_args 顶层 key 包括:
+           - AWM 字段: scenario, task, env_code, db_schema, db_sample, verifier_code, ...
+           - base_env_args: reward_fn, server_host, server_start_timeout, ...
         
         The pop() pattern is consistent with other rllm environments (e.g. ToolEnvironment).
         Since the dict is a fresh merge ({**task, **self.env_args}), pop() is safe.
         """
-        # Pop env_args-level parameters (from trainer's env_args)
+        # Pop base env_args (from trainer's env_args)
         reward_fn = env_args.pop("reward_fn", None)
         server_host = env_args.pop("server_host", "127.0.0.1")
         server_start_timeout = env_args.pop("server_start_timeout", 30.0)
         
-        # Parse extra_info from task data
-        extra_info = env_args.pop("extra_info", "{}")
-        if isinstance(extra_info, str):
+        # ============================================================
+        # 提取 AWM 字段 — 兼容两种格式:
+        #   格式 A (独立管道): 字段直接在 env_args 顶层
+        #   格式 B (旧管道):   字段嵌套在 env_args["extra_info"] 中
+        # ============================================================
+        extra_info = env_args.pop("extra_info", None)
+        if extra_info is not None:
+            if isinstance(extra_info, str):
+                try:
+                    extra_info = json.loads(extra_info)
+                except json.JSONDecodeError:
+                    extra_info = {}
+            if isinstance(extra_info, dict):
+                # 旧管道兼容: 如果 extra_info 里有 original_data，从中恢复
+                if "original_data" in extra_info and "db_schema" not in extra_info:
+                    try:
+                        original = json.loads(extra_info["original_data"])
+                        if isinstance(original, dict):
+                            # original_data 中可能还有一层 extra_info
+                            nested_extra = original.get("extra_info", {})
+                            if isinstance(nested_extra, str):
+                                nested_extra = json.loads(nested_extra)
+                            if isinstance(nested_extra, dict) and "db_schema" in nested_extra:
+                                extra_info = nested_extra
+                            elif "db_schema" in original:
+                                extra_info = original
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        else:
+            extra_info = {}
+        
+        # 合并: 顶层 env_args 的 AWM 字段优先于 extra_info 中的
+        def _get(key, *alt_keys):
+            """从 env_args 或 extra_info 中获取值，支持备选 key。"""
+            val = env_args.pop(key, None)
+            if val is not None:
+                return val
+            for k in alt_keys:
+                val = env_args.pop(k, None)
+                if val is not None:
+                    return val
+            val = extra_info.get(key)
+            if val is not None:
+                return val
+            for k in alt_keys:
+                val = extra_info.get(k)
+                if val is not None:
+                    return val
+            return None
+
+        # 提取任务描述
+        task_description = _get("task", "prompt") or ""
+        
+        # 提取场景名
+        scenario_name = _get("scenario") or "unknown"
+        
+        # 提取环境代码
+        env_code = _get("env_code") or ""
+        
+        # 提取数据库 schema（可能是 JSON 字符串或 dict）
+        db_schema = _get("db_schema", "schema")
+        if isinstance(db_schema, str):
             try:
-                extra_info = json.loads(extra_info)
-            except json.JSONDecodeError:
-                extra_info = {}
+                db_schema = json.loads(db_schema)
+            except (json.JSONDecodeError, TypeError):
+                pass
         
-        # Get task description from prompt (standard field) or extra_info
-        task_description = env_args.pop("prompt", "")
-        if not task_description:
-            task_description = extra_info.get("task", "")
+        # 提取数据库样本数据
+        db_sample = _get("db_sample", "sample_data")
+        if isinstance(db_sample, str):
+            try:
+                db_sample = json.loads(db_sample)
+            except (json.JSONDecodeError, TypeError):
+                pass
         
-        # Extract scenario name
-        scenario_name = extra_info.get("scenario", "unknown")
+        # 提取验证代码
+        verifier_code = _get("verifier_code") or ""
         
-        # Extract environment code
-        env_code = extra_info.get("env_code", "")
-        
-        # Extract database info (support both field naming conventions)
-        db_schema = extra_info.get("db_schema") or extra_info.get("schema")
-        db_sample = extra_info.get("db_sample") or extra_info.get("sample_data")
-        
-        # Extract verifier code
-        verifier_code = extra_info.get("verifier_code")
-        
-        # max_steps priority: extra_info.task_max_steps > extra_info.max_steps > default 30
-        max_steps = extra_info.get("task_max_steps", extra_info.get("max_steps", 30))
+        # max_steps
+        max_steps = _get("max_steps", "task_max_steps") or 30
         
         return AWMEnvironment(
             scenario_name=scenario_name,
@@ -625,7 +692,7 @@ When you have completed the task, provide your final answer directly without any
             db_schema=db_schema,
             db_sample=db_sample,
             verifier_code=verifier_code,
-            max_steps=max_steps,
+            max_steps=int(max_steps),
             reward_fn=reward_fn,
             server_host=server_host,
             server_start_timeout=server_start_timeout,
