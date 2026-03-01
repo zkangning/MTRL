@@ -238,17 +238,100 @@ When you have completed the task, provide your final answer directly without any
     # Server lifecycle — mirrors awm/core/env.py::test_run_specific_env()
     # ------------------------------------------------------------------
 
-    def _read_server_log(self) -> str:
-        """Read the server log file content, flushing the write handle first."""
+    def _read_server_log(self, max_bytes: int = 50000) -> str:
+        """
+        Read the server log file content, flushing the write handle first.
+        
+        Args:
+            max_bytes: Maximum bytes to read (default 50KB). Set to -1 for no limit.
+        """
         try:
             if self.server_log_file and not self.server_log_file.closed:
                 self.server_log_file.flush()
             if self.server_log_path and os.path.exists(self.server_log_path):
+                file_size = os.path.getsize(self.server_log_path)
                 with open(self.server_log_path, "r") as f:
-                    return f.read()
+                    content = f.read()
+                    if max_bytes > 0 and len(content) > max_bytes:
+                        # Show last N bytes when truncating
+                        truncated_msg = f"\n... [TRUNCATED: showing last {max_bytes} of {file_size} bytes] ...\n"
+                        return truncated_msg + content[-max_bytes:]
+                    return content
         except Exception as e:
             return f"<failed to read server log: {e}>"
         return "<no server log available>"
+
+    def _get_diagnostic_info(self) -> str:
+        """
+        Collect comprehensive diagnostic information for debugging server startup issues.
+        """
+        diag = []
+        diag.append(f"\n{'=' * 60}")
+        diag.append(f"AWM SERVER DIAGNOSTIC REPORT")
+        diag.append(f"Scenario: {self.scenario_name}")
+        diag.append(f"{'=' * 60}")
+        
+        # Server process info
+        diag.append(f"\n[PROCESS INFO]")
+        if self.server_process:
+            poll_result = self.server_process.poll()
+            diag.append(f"  PID: {self.server_process.pid}")
+            diag.append(f"  Status: {'running' if poll_result is None else f'exited (code={poll_result})'}")
+        else:
+            diag.append(f"  No server process")
+        
+        # Network info
+        diag.append(f"\n[NETWORK INFO]")
+        diag.append(f"  Host: {self.server_host}")
+        diag.append(f"  Port: {self.server_port}")
+        
+        # Check if port is in use
+        try:
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1.0)
+                result = s.connect_ex((self.server_host, self.server_port))
+                diag.append(f"  Port reachable: {'yes' if result == 0 else 'no'}")
+        except Exception as e:
+            diag.append(f"  Port check error: {e}")
+        
+        # Temp directory info
+        diag.append(f"\n[TEMP DIRECTORY]")
+        diag.append(f"  Path: {self.temp_dir}")
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            diag.append(f"  Exists: yes")
+            try:
+                files = os.listdir(self.temp_dir)
+                diag.append(f"  Contents: {files}")
+                for f in files:
+                    fpath = os.path.join(self.temp_dir, f)
+                    if os.path.isfile(fpath):
+                        diag.append(f"    - {f}: {os.path.getsize(fpath)} bytes")
+            except Exception as e:
+                diag.append(f"  Error listing: {e}")
+        else:
+            diag.append(f"  Exists: no")
+        
+        # Database info
+        diag.append(f"\n[DATABASE INFO]")
+        diag.append(f"  Path: {self.current_db_path}")
+        if self.current_db_path and os.path.exists(self.current_db_path):
+            diag.append(f"  Exists: yes")
+            diag.append(f"  Size: {os.path.getsize(self.current_db_path)} bytes")
+        else:
+            diag.append(f"  Exists: no")
+        
+        # Environment code info
+        diag.append(f"\n[ENV CODE INFO]")
+        diag.append(f"  Code length: {len(self.env_code)} chars")
+        if self.env_code:
+            diag.append(f"  Has 'uvicorn.run': {'yes' if 'uvicorn.run' in self.env_code else 'NO - CRITICAL!'}")
+            diag.append(f"  Has 'create_engine': {'yes' if 'create_engine' in self.env_code else 'no'}")
+            diag.append(f"  Has 'FastAPI': {'yes' if 'FastAPI' in self.env_code else 'no'}")
+        
+        diag.append(f"\n{'=' * 60}")
+        
+        return "\n".join(diag)
 
     def _wait_for_server_http(self, port: int, timeout: float) -> bool:
         """
@@ -267,15 +350,23 @@ When you have completed the task, provide your final answer directly without any
 
         start_time = time.time()
         tcp_ready = False
+        http_attempts = 0
+        last_http_error = None
+        
+        logger.info(f"[{self.scenario_name}] Waiting for server HTTP readiness (timeout={timeout}s)...")
 
         while time.time() - start_time < timeout:
+            elapsed = time.time() - start_time
+            
             # Early crash detection
             if self.server_process and self.server_process.poll() is not None:
                 rc = self.server_process.returncode
                 log_content = self._read_server_log()
+                diag_info = self._get_diagnostic_info()
                 logger.error(
-                    f"[{self.scenario_name}] Server process CRASHED (exit code {rc}) on port {port}.\n"
-                    f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+                    f"[{self.scenario_name}] SERVER PROCESS CRASHED (exit code {rc}) after {elapsed:.1f}s on port {port}.\n"
+                    f"{diag_info}\n"
+                    f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
                 )
                 return False
 
@@ -285,29 +376,47 @@ When you have completed the task, provide your final answer directly without any
                         s.settimeout(1.0)
                         s.connect((self.server_host, port))
                         tcp_ready = True
-                        logger.info(f"[{self.scenario_name}] TCP port {port} is open, checking HTTP...")
-                except (socket.timeout, ConnectionRefusedError, OSError):
+                        logger.info(f"[{self.scenario_name}] TCP port {port} is open after {elapsed:.1f}s, checking HTTP...")
+                except (socket.timeout, ConnectionRefusedError, OSError) as e:
+                    # Log progress every 10 seconds
+                    if int(elapsed) % 10 == 0 and int(elapsed) > 0:
+                        logger.debug(f"[{self.scenario_name}] Still waiting for TCP port {port} ({elapsed:.0f}s elapsed): {e}")
                     time.sleep(0.3)
                     continue
 
             # HTTP health check — /docs is always available on FastAPI
+            http_attempts += 1
             try:
                 url = f"http://{self.server_host}:{port}/docs"
                 req = urllib.request.Request(url, method='GET')
                 with urllib.request.urlopen(req, timeout=3) as resp:
                     if resp.status == 200:
-                        logger.info(f"[{self.scenario_name}] Server HTTP ready on port {port}")
+                        logger.info(f"[{self.scenario_name}] Server HTTP ready on port {port} after {elapsed:.1f}s ({http_attempts} HTTP attempts)")
                         return True
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
+                last_http_error = str(e)
+                # Log progress every 10 seconds or every 5 attempts
+                if http_attempts % 5 == 0 or int(elapsed) % 10 == 0:
+                    logger.debug(f"[{self.scenario_name}] HTTP check attempt {http_attempts} failed ({elapsed:.0f}s elapsed): {e}")
                 time.sleep(0.5)
 
-        # Timeout
+        # Timeout - collect comprehensive diagnostic info
+        elapsed = time.time() - start_time
         log_content = self._read_server_log()
+        diag_info = self._get_diagnostic_info()
+        
         proc_status = "running" if (self.server_process and self.server_process.poll() is None) else "exited"
+        if self.server_process and self.server_process.poll() is not None:
+            proc_status = f"exited (code={self.server_process.returncode})"
+        
         logger.error(
-            f"[{self.scenario_name}] Server HTTP not ready within {timeout}s "
-            f"(process: {proc_status}, tcp_ready: {tcp_ready}).\n"
-            f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+            f"[{self.scenario_name}] SERVER STARTUP TIMEOUT after {elapsed:.1f}s\n"
+            f"  - Process status: {proc_status}\n"
+            f"  - TCP ready: {tcp_ready}\n"
+            f"  - HTTP attempts: {http_attempts}\n"
+            f"  - Last HTTP error: {last_http_error}\n"
+            f"{diag_info}\n"
+            f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
         )
         return False
 
@@ -389,27 +498,33 @@ When you have completed the task, provide your final answer directly without any
         logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
 
         # ── Step 5: Initial crash check (same 3s sleep as original) ──
+        logger.info(f"[{self.scenario_name}] Waiting 3s for initial startup...")
         time.sleep(3)
 
         if self.server_process.poll() is not None:
             rc = self.server_process.returncode
             log_content = self._read_server_log()
+            diag_info = self._get_diagnostic_info()
             logger.error(
-                f"[{self.scenario_name}] Server process exited prematurely (exit code {rc}).\n"
-                f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+                f"[{self.scenario_name}] SERVER CRASHED ON STARTUP (exit code {rc})\n"
+                f"{diag_info}\n"
+                f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
             )
             self._kill_server_process()
             raise RuntimeError(
                 f"AWM server crashed on startup for '{self.scenario_name}' (exit code {rc}). "
-                f"Temp dir preserved: {self.temp_dir}"
+                f"Temp dir preserved for debugging: {self.temp_dir}. "
+                f"Check server.log in temp dir for details."
             )
 
         # ── Step 6: Wait for HTTP readiness (thread-safe, no asyncio) ──
         if not self._wait_for_server_http(self.server_port, self.server_start_timeout):
+            # Note: _wait_for_server_http already logs detailed diagnostic info on failure
             self._kill_server_process()
             raise RuntimeError(
                 f"AWM server HTTP not ready within {self.server_start_timeout}s "
-                f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}"
+                f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}. "
+                f"Check the logs above for detailed diagnostic information."
             )
 
         # ── Step 7: Initialize MCP connection manager & verify tools ──
