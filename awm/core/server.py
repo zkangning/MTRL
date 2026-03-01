@@ -90,7 +90,112 @@ def run_server(args: Config):
     try:
         code = env["full_code"]
         original_lines = len(code.split("\n"))
-        new_code = ['import warnings', 'warnings.filterwarnings("ignore", category=DeprecationWarning)']
+        
+        # Add signal handling, resource monitoring, and shutdown logging at the beginning of the generated server
+        signal_handling_code = '''import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Signal handling and resource monitoring for debugging shutdown reasons
+import signal
+import sys
+import os
+import atexit
+import traceback
+import threading
+import time
+
+_shutdown_reason = "unknown"
+_resource_monitor_stop = False
+
+def _get_resource_info():
+    """Get current resource usage information."""
+    info = {}
+    try:
+        import resource
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        info['max_rss_mb'] = rusage.ru_maxrss / 1024  # Convert to MB (on Linux it's KB)
+        info['user_time'] = rusage.ru_utime
+        info['sys_time'] = rusage.ru_stime
+    except Exception as e:
+        info['rusage_error'] = str(e)
+    
+    try:
+        # Check memory from /proc/self/status
+        with open('/proc/self/status', 'r') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    info['vm_rss_kb'] = line.split()[1]
+                elif line.startswith('VmPeak:'):
+                    info['vm_peak_kb'] = line.split()[1]
+                elif line.startswith('Threads:'):
+                    info['threads'] = line.split()[1]
+    except Exception:
+        pass
+    
+    try:
+        # Check open file descriptors
+        fd_count = len(os.listdir('/proc/self/fd'))
+        info['open_fds'] = fd_count
+    except Exception:
+        pass
+    
+    try:
+        # Check ulimits
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        info['fd_limit_soft'] = soft
+        info['fd_limit_hard'] = hard
+        soft_mem, hard_mem = resource.getrlimit(resource.RLIMIT_AS)
+        info['mem_limit_soft'] = soft_mem if soft_mem != -1 else 'unlimited'
+        info['mem_limit_hard'] = hard_mem if hard_mem != -1 else 'unlimited'
+    except Exception:
+        pass
+    
+    return info
+
+def _resource_monitor_thread():
+    """Background thread to periodically log resource usage."""
+    global _resource_monitor_stop
+    last_log_time = time.time()
+    while not _resource_monitor_stop:
+        time.sleep(5)
+        if time.time() - last_log_time >= 30:  # Log every 30 seconds
+            info = _get_resource_info()
+            print(f"[AWM_SERVER] Resource status: {info}", flush=True)
+            last_log_time = time.time()
+
+def _signal_handler(signum, frame):
+    global _shutdown_reason, _resource_monitor_stop
+    _resource_monitor_stop = True
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    _shutdown_reason = f"signal_{sig_name}"
+    print(f"[AWM_SERVER] Received signal {sig_name} ({signum})", flush=True)
+    print(f"[AWM_SERVER] Resource at signal: {_get_resource_info()}", flush=True)
+    print(f"[AWM_SERVER] Stack trace at signal:", flush=True)
+    traceback.print_stack(frame)
+    sys.exit(0)
+
+def _atexit_handler():
+    global _shutdown_reason, _resource_monitor_stop
+    _resource_monitor_stop = True
+    print(f"[AWM_SERVER] Server shutdown - reason: {_shutdown_reason}", flush=True)
+    print(f"[AWM_SERVER] PID: {os.getpid()}", flush=True)
+    print(f"[AWM_SERVER] Final resource status: {_get_resource_info()}", flush=True)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+atexit.register(_atexit_handler)
+
+# Log initial resource info
+print(f"[AWM_SERVER] Server process started, PID: {os.getpid()}", flush=True)
+print(f"[AWM_SERVER] Initial resource status: {_get_resource_info()}", flush=True)
+
+# Start resource monitor thread
+_monitor_thread = threading.Thread(target=_resource_monitor_thread, daemon=True)
+_monitor_thread.start()
+'''
+        new_code = [signal_handling_code]
         
         create_engine_found = False
         uvicorn_found = False
@@ -109,14 +214,17 @@ def run_server(args: Config):
                 import os
                 host = os.environ.get('HOST', '{args.host}')
                 port = os.environ.get('PORT', {args.port})
-                print(f'Server starting on port={{port}}')
+                print(f'[AWM_SERVER] Server starting on host={{host}}, port={{port}}', flush=True)
                 """
                 lines = format_raw_code_to_lines(raw_code, indent=4)
                 raw_code = f"""
                 from fastapi_mcp import FastApiMCP
                 mcp = FastApiMCP(app)
                 mcp.mount_http()
-                print("MCP server enabled, please visit http://{args.host}:{args.port}/mcp for the MCP service")
+                print("[AWM_SERVER] MCP server enabled at /mcp", flush=True)
+                print("[AWM_SERVER] Health endpoints: /docs, /openapi.json", flush=True)
+                global _shutdown_reason
+                _shutdown_reason = "normal_exit"
                 """
                 lines += format_raw_code_to_lines(raw_code, indent=4)
 

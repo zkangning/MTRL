@@ -88,4 +88,5 @@ python3 -m examples.awm.train_awm \
     trainer.total_epochs=4 \
     \
     rllm.agent.max_steps=30 \
+    rllm.env.server_start_timeout=120.0 \
     rllm.stepwise_advantage.enable=False

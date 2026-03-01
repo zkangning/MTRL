@@ -202,7 +202,7 @@ When you have completed the task, provide your final answer directly without any
         max_steps: int = 30,
         reward_fn=None,
         server_host: str = "127.0.0.1",
-        server_start_timeout: float = 60.0,
+        server_start_timeout: float = 120.0,  # Increased from 60s for large scenarios with many DB tables
         **kwargs
     ):
         super().__init__()
@@ -329,6 +329,57 @@ When you have completed the task, provide your final answer directly without any
             diag.append(f"  Has 'create_engine': {'yes' if 'create_engine' in self.env_code else 'no'}")
             diag.append(f"  Has 'FastAPI': {'yes' if 'FastAPI' in self.env_code else 'no'}")
         
+        # System resource info (check for OOM or resource limits)
+        diag.append(f"\n[SYSTEM RESOURCE INFO]")
+        try:
+            import resource
+            rusage = resource.getrusage(resource.RUSAGE_CHILDREN)
+            diag.append(f"  Child processes max RSS: {rusage.ru_maxrss / 1024:.1f} MB")
+        except Exception as e:
+            diag.append(f"  Resource usage error: {e}")
+        
+        # Check dmesg for recent OOM kills (may require permissions)
+        if self.server_process:
+            pid = self.server_process.pid
+            diag.append(f"\n[OOM/KILL CHECK]")
+            try:
+                import subprocess as sp
+                # Check dmesg for recent OOM or kill events mentioning our process
+                result = sp.run(
+                    ['dmesg', '--time-format=reltime', '-T'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if result.returncode == 0:
+                    # Look for OOM or killed messages in the last few lines
+                    lines = result.stdout.strip().split('\n')[-50:]  # Last 50 lines
+                    oom_lines = [l for l in lines if 'oom' in l.lower() or 'killed' in l.lower() or str(pid) in l]
+                    if oom_lines:
+                        diag.append(f"  Recent OOM/kill events found:")
+                        for line in oom_lines[-5:]:  # Show last 5 relevant lines
+                            diag.append(f"    {line[:200]}")
+                    else:
+                        diag.append(f"  No recent OOM/kill events found in dmesg")
+                else:
+                    diag.append(f"  dmesg check failed (may need root)")
+            except Exception as e:
+                diag.append(f"  Could not check dmesg: {e}")
+        
+        # Check cgroup memory limits (for containerized environments)
+        diag.append(f"\n[CGROUP LIMITS]")
+        try:
+            cgroup_paths = [
+                '/sys/fs/cgroup/memory/memory.limit_in_bytes',
+                '/sys/fs/cgroup/memory.max',
+                '/proc/self/cgroup'
+            ]
+            for path in cgroup_paths:
+                if os.path.exists(path):
+                    with open(path, 'r') as f:
+                        content = f.read().strip()[:500]
+                        diag.append(f"  {path}: {content}")
+        except Exception as e:
+            diag.append(f"  Could not read cgroup info: {e}")
+        
         diag.append(f"\n{'=' * 60}")
         
         return "\n".join(diag)
@@ -343,6 +394,10 @@ When you have completed the task, provide your final answer directly without any
 
         Check flow: TCP connect -> HTTP GET /docs -> return True.
         Also checks for early process exit.
+        
+        Note on 503 errors: FastAPI may return 503 Service Unavailable during startup
+        while internal components (like MCP, database connections) are still initializing.
+        We treat 503 as "server is starting" and continue waiting.
         """
         import socket
         import urllib.request
@@ -352,8 +407,15 @@ When you have completed the task, provide your final answer directly without any
         tcp_ready = False
         http_attempts = 0
         last_http_error = None
+        last_http_status = None
+        http_503_count = 0
+        http_success_endpoints = []  # Track which endpoints responded successfully
         
-        logger.info(f"[{self.scenario_name}] Waiting for server HTTP readiness (timeout={timeout}s)...")
+        logger.info(f"[{self.scenario_name}] Waiting for server HTTP readiness on port {port} (timeout={timeout}s)...")
+
+        # Endpoints to check - /docs is standard FastAPI, /openapi.json is also always available
+        # We try multiple endpoints because some might be ready before others
+        check_endpoints = ["/docs", "/openapi.json"]
 
         while time.time() - start_time < timeout:
             elapsed = time.time() - start_time
@@ -384,21 +446,69 @@ When you have completed the task, provide your final answer directly without any
                     time.sleep(0.3)
                     continue
 
-            # HTTP health check — /docs is always available on FastAPI
+            # HTTP health check - try multiple endpoints
             http_attempts += 1
-            try:
-                url = f"http://{self.server_host}:{port}/docs"
-                req = urllib.request.Request(url, method='GET')
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    if resp.status == 200:
-                        logger.info(f"[{self.scenario_name}] Server HTTP ready on port {port} after {elapsed:.1f}s ({http_attempts} HTTP attempts)")
-                        return True
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as e:
-                last_http_error = str(e)
-                # Log progress every 10 seconds or every 5 attempts
-                if http_attempts % 5 == 0 or int(elapsed) % 10 == 0:
-                    logger.debug(f"[{self.scenario_name}] HTTP check attempt {http_attempts} failed ({elapsed:.0f}s elapsed): {e}")
-                time.sleep(0.5)
+            endpoint_success = False
+            
+            for endpoint in check_endpoints:
+                if endpoint in http_success_endpoints:
+                    continue  # Already succeeded on this endpoint
+                    
+                try:
+                    url = f"http://{self.server_host}:{port}{endpoint}"
+                    req = urllib.request.Request(url, method='GET')
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        last_http_status = resp.status
+                        if resp.status == 200:
+                            http_success_endpoints.append(endpoint)
+                            endpoint_success = True
+                            logger.info(
+                                f"[{self.scenario_name}] Endpoint {endpoint} ready on port {port} "
+                                f"after {elapsed:.1f}s ({http_attempts} attempts)"
+                            )
+                            # If /docs is ready, server is fully ready
+                            if endpoint == "/docs":
+                                logger.info(
+                                    f"[{self.scenario_name}] Server HTTP fully ready on port {port} "
+                                    f"after {elapsed:.1f}s ({http_attempts} HTTP attempts, {http_503_count} 503 errors)"
+                                )
+                                return True
+                except urllib.error.HTTPError as e:
+                    last_http_status = e.code
+                    last_http_error = f"HTTP Error {e.code}: {e.reason}"
+                    
+                    if e.code == 503:
+                        # 503 Service Unavailable - server is starting but not ready yet
+                        http_503_count += 1
+                        if http_503_count == 1 or http_503_count % 20 == 0:
+                            logger.info(
+                                f"[{self.scenario_name}] Server returning 503 (starting up) on {endpoint} "
+                                f"({http_503_count} total, {elapsed:.1f}s elapsed)"
+                            )
+                    elif e.code == 404:
+                        # 404 might mean the endpoint doesn't exist yet
+                        pass
+                    else:
+                        # Other HTTP errors
+                        if http_attempts % 10 == 0:
+                            logger.warning(
+                                f"[{self.scenario_name}] HTTP {e.code} on {endpoint} "
+                                f"(attempt {http_attempts}, {elapsed:.1f}s elapsed)"
+                            )
+                except (urllib.error.URLError, OSError, TimeoutError) as e:
+                    last_http_error = str(e)
+                    last_http_status = None
+
+            # Log progress every 10 seconds
+            if http_attempts % 20 == 0:
+                logger.debug(
+                    f"[{self.scenario_name}] HTTP check progress: {http_attempts} attempts, "
+                    f"{http_503_count} 503s, {elapsed:.0f}s elapsed, last status: {last_http_status}"
+                )
+            
+            # Sleep between attempts - shorter if we're getting 503s (server is responding)
+            sleep_time = 0.3 if http_503_count > 0 else 0.5
+            time.sleep(sleep_time)
 
         # Timeout - collect comprehensive diagnostic info
         elapsed = time.time() - start_time
@@ -409,12 +519,38 @@ When you have completed the task, provide your final answer directly without any
         if self.server_process and self.server_process.poll() is not None:
             proc_status = f"exited (code={self.server_process.returncode})"
         
+        # Provide specific advice based on the failure mode
+        advice = ""
+        if http_503_count > 0:
+            advice = (
+                "\n\n[ADVICE] Server returned 503 errors - it's starting but initialization is slow.\n"
+                "  Consider increasing server_start_timeout (current: {timeout}s).\n"
+                "  For large scenarios with many database tables, try timeout=120 or timeout=180."
+            )
+        elif tcp_ready and http_attempts > 0:
+            advice = (
+                "\n\n[ADVICE] TCP port is open but HTTP endpoints are not responding.\n"
+                "  Check the server log above for FastAPI/uvicorn startup errors.\n"
+                "  Common causes: import errors, database connection issues, MCP initialization failures."
+            )
+        elif not tcp_ready:
+            advice = (
+                "\n\n[ADVICE] TCP port never became reachable.\n"
+                "  Check if another process is using the port or if the server crashed silently.\n"
+                "  Check the server log above for early startup errors."
+            )
+        
         logger.error(
             f"[{self.scenario_name}] SERVER STARTUP TIMEOUT after {elapsed:.1f}s\n"
+            f"  - Port: {port}\n"
             f"  - Process status: {proc_status}\n"
             f"  - TCP ready: {tcp_ready}\n"
             f"  - HTTP attempts: {http_attempts}\n"
+            f"  - HTTP 503 count: {http_503_count}\n"
+            f"  - Last HTTP status: {last_http_status}\n"
             f"  - Last HTTP error: {last_http_error}\n"
+            f"  - Successful endpoints: {http_success_endpoints}"
+            f"{advice}\n"
             f"{diag_info}\n"
             f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
         )
@@ -510,7 +646,7 @@ When you have completed the task, provide your final answer directly without any
                 f"{diag_info}\n"
                 f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
             )
-            self._kill_server_process()
+            self._kill_server_process(reason="crashed_on_startup")
             raise RuntimeError(
                 f"AWM server crashed on startup for '{self.scenario_name}' (exit code {rc}). "
                 f"Temp dir preserved for debugging: {self.temp_dir}. "
@@ -520,7 +656,7 @@ When you have completed the task, provide your final answer directly without any
         # ── Step 6: Wait for HTTP readiness (thread-safe, no asyncio) ──
         if not self._wait_for_server_http(self.server_port, self.server_start_timeout):
             # Note: _wait_for_server_http already logs detailed diagnostic info on failure
-            self._kill_server_process()
+            self._kill_server_process(reason="http_readiness_timeout")
             raise RuntimeError(
                 f"AWM server HTTP not ready within {self.server_start_timeout}s "
                 f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}. "
@@ -553,7 +689,7 @@ When you have completed the task, provide your final answer directly without any
                 time.sleep(1.0 * attempt)
 
         # All retries exhausted
-        self._kill_server_process()
+        self._kill_server_process(reason="mcp_verification_failed")
         raise RuntimeError(
             f"MCP connection failed after {max_retries} attempts for '{self.scenario_name}': {last_error}. "
             f"Temp dir: {self.temp_dir}"
@@ -563,17 +699,38 @@ When you have completed the task, provide your final answer directly without any
     # Process management
     # ------------------------------------------------------------------
 
-    def _kill_server_process(self):
-        """Kill server process only (preserve temp dir for debugging)."""
+    def _kill_server_process(self, reason: str = "unspecified"):
+        """
+        Kill server process only (preserve temp dir for debugging).
+        
+        Args:
+            reason: Why the process is being killed (for logging)
+        """
         if self.server_process:
-            try:
-                os.killpg(os.getpgid(self.server_process.pid), signal.SIGTERM)
-                self.server_process.wait(timeout=5)
-            except Exception:
+            pid = self.server_process.pid
+            poll_result = self.server_process.poll()
+            
+            if poll_result is not None:
+                logger.info(
+                    f"[{self.scenario_name}] Server process (pid={pid}) already exited "
+                    f"(code={poll_result}), reason for kill call: {reason}"
+                )
+            else:
+                logger.info(
+                    f"[{self.scenario_name}] Killing server process (pid={pid}), reason: {reason}"
+                )
                 try:
-                    os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
-                except Exception:
-                    pass
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    self.server_process.wait(timeout=5)
+                    logger.info(f"[{self.scenario_name}] Server process terminated gracefully")
+                except Exception as e:
+                    logger.warning(f"[{self.scenario_name}] SIGTERM failed ({e}), sending SIGKILL...")
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                        logger.info(f"[{self.scenario_name}] Server process killed forcefully")
+                    except Exception as e2:
+                        logger.error(f"[{self.scenario_name}] Failed to kill server: {e2}")
+            
             self.server_process = None
 
         if self.server_log_file:
@@ -585,7 +742,7 @@ When you have completed the task, provide your final answer directly without any
 
     def _cleanup_server(self):
         """Clean up server process and temporary files."""
-        self._kill_server_process()
+        self._kill_server_process(reason="cleanup_called")
 
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
@@ -852,7 +1009,7 @@ When you have completed the task, provide your final answer directly without any
         # Pop base env_args (from trainer's env_args)
         reward_fn = env_args.pop("reward_fn", None)
         server_host = env_args.pop("server_host", "127.0.0.1")
-        server_start_timeout = env_args.pop("server_start_timeout", 60.0)
+        server_start_timeout = env_args.pop("server_start_timeout", 120.0)  # Increased from 60s for large scenarios
 
         # ============================================================
         # 提取 AWM 字段 — 兼容两种格式:
