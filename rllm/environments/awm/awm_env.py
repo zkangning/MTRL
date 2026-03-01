@@ -562,13 +562,14 @@ When you have completed the task, provide your final answer directly without any
     @staticmethod
     def is_multithread_safe() -> bool:
         """
-        AWM environments are NOT multithread-safe.
+        AWM environments are multithread-safe.
         
-        Each AWM task requires starting an independent FastAPI+MCP subprocess server
-        with unique port assignment. The server lifecycle (start/stop/cleanup) involves
-        OS-level process management that must not be shared across threads.
+        Each AWM task creates a fully independent environment instance via from_dict(),
+        with its own temporary directory, random port, subprocess server, and MCP
+        connection. There is no shared mutable state between instances, so concurrent
+        execution across threads is safe.
         """
-        return False
+        return True
 
     @staticmethod
     def from_dict(env_args: Dict[str, Any]) -> "AWMEnvironment":
