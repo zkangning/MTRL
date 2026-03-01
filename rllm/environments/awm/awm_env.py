@@ -6,6 +6,8 @@ for use in RLLM's agentic RL training pipeline.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
@@ -28,27 +30,33 @@ from awm.tools import normalize_scenario_name as normalize_awm_name
 
 logger = logging.getLogger(__name__)
 
+# Thread lock to protect isolated_mcp_env (which mutates os.environ globally)
+_MCP_ENV_LOCK = threading.Lock()
+
 
 class AWMMCPConnectionManager:
     """
     Manages connection to AWM MCP Server.
+    
+    与 awm.core.agent.MCPToolExecutor 对齐:
+    - __init__ 中创建 MCPApp 和 Agent（在 isolated_mcp_env 中，需持锁）
+    - list_tools / call_tool 每次都 async with app.run() + async with agent
+    - 使用 contextlib.redirect_stderr 屏蔽 mcp_agent 内部日志噪音
     """
     
     def __init__(self, mcp_url: str, timeout: float = 60.0):
+        from mcp_agent.app import MCPApp
+        from mcp_agent.agents.agent import Agent
+        from mcp_agent.config import Settings, MCPSettings, MCPServerSettings, LoggerSettings
+        from awm.tools import isolated_mcp_env
+        
         self.mcp_url = mcp_url
         self.timeout = timeout
         self._tools: List[Dict] = []
-        self._app = None
-        self._agent = None
         
-    async def initialize(self):
-        """Initialize connection to MCP server and fetch tools."""
-        try:
-            from mcp_agent.app import MCPApp
-            from mcp_agent.agents.agent import Agent
-            from mcp_agent.config import Settings, MCPSettings, MCPServerSettings, LoggerSettings
-            from awm.tools import isolated_mcp_env
-            
+        # 创建 MCPApp/Agent 需要在 isolated_mcp_env 中，
+        # 且 isolated_mcp_env 修改 os.environ，必须加锁
+        with _MCP_ENV_LOCK:
             with isolated_mcp_env():
                 settings = Settings(
                     execution_engine="asyncio",
@@ -67,55 +75,54 @@ class AWMMCPConnectionManager:
                         }
                     ),
                 )
-                
                 self._app = MCPApp(name="awm_agent", settings=settings)
                 self._agent = Agent(name="executor", server_names=["mcp_server"])
-                
-                async with self._app.run():
-                    async with self._agent:
-                        result = await asyncio.wait_for(
-                            self._agent.list_tools(), timeout=self.timeout
-                        )
-                        self._tools = []
-                        for t in result.tools:
-                            tool_info = {
-                                "name": t.name,
-                                "description": t.description or "",
-                                "inputSchema": t.inputSchema or {},
-                            }
-                            self._tools.append(tool_info)
-                        logger.info(f"AWM MCP: Loaded {len(self._tools)} tools from {self.mcp_url}")
-                        
-        except Exception as e:
-            logger.error(f"Failed to initialize AWM MCP connection: {e}")
-            raise
     
     async def list_tools(self) -> List[Dict]:
         """List available tools from MCP server."""
-        return self._tools
+        if self._tools:
+            return self._tools
+        
+        with contextlib.redirect_stderr(io.StringIO()):
+            async with self._app.run():
+                async with self._agent:
+                    result = await asyncio.wait_for(
+                        self._agent.list_tools(), timeout=self.timeout
+                    )
+                    self._tools = []
+                    for t in result.tools:
+                        tool_info = {
+                            "name": t.name,
+                            "description": t.description or "",
+                            "inputSchema": t.inputSchema or {},
+                        }
+                        self._tools.append(tool_info)
+                    logger.info(f"AWM MCP: Loaded {len(self._tools)} tools from {self.mcp_url}")
+                    return self._tools
     
     async def call_tool(self, tool_name: str, arguments: Dict) -> str:
         """Call a tool on the MCP server."""
         try:
-            async with self._app.run():
-                async with self._agent:
-                    result = await asyncio.wait_for(
-                        self._agent.call_tool(tool_name, arguments),
-                        timeout=self.timeout,
-                    )
-                    # Extract text from result content
-                    parts = []
-                    for c in result.content:
-                        if hasattr(c, 'text'):
-                            parts.append(c.text)
-                        else:
-                            parts.append(str(c))
-                    
-                    text = "\n".join(parts)
-                    
-                    if result.isError:
-                        return f"Error: {text}"
-                    return text
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    async with self._agent:
+                        result = await asyncio.wait_for(
+                            self._agent.call_tool(tool_name, arguments),
+                            timeout=self.timeout,
+                        )
+                        # Extract text from result content
+                        parts = []
+                        for c in result.content:
+                            if hasattr(c, 'text'):
+                                parts.append(c.text)
+                            else:
+                                parts.append(str(c))
+                        
+                        text = "\n".join(parts)
+                        
+                        if result.isError:
+                            return f"Error: {text}"
+                        return text
                     
         except asyncio.TimeoutError:
             return f"Error: Tool call timed out after {self.timeout}s"
@@ -220,16 +227,48 @@ When you have completed the task, provide your final answer directly without any
         return port
     
     def _wait_for_server(self, port: int, timeout: float = 30.0) -> bool:
+        """
+        Wait for the FastAPI server to be fully ready.
+        
+        使用 HTTP GET 请求检查（而非仅 TCP socket），确保 FastAPI 已完成路由挂载。
+        先用 TCP socket 快速检测端口绑定，再用 HTTP 请求验证应用就绪。
+        """
         import socket
+        import urllib.request
+        import urllib.error
+        
         start_time = time.time()
+        tcp_ready = False
+        
         while time.time() - start_time < timeout:
+            # 检查进程是否已经退出（提前失败检测）
+            if self.server_process and self.server_process.poll() is not None:
+                logger.error(f"Server process exited with code {self.server_process.returncode}")
+                return False
+            
+            if not tcp_ready:
+                # Phase 1: TCP port check (fast)
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(1.0)
+                        s.connect((self.server_host, port))
+                        tcp_ready = True
+                        logger.debug(f"TCP port {port} is open, checking HTTP readiness...")
+                except (socket.timeout, ConnectionRefusedError, OSError):
+                    time.sleep(0.3)
+                    continue
+            
+            # Phase 2: HTTP health check — 请求 /docs (FastAPI 自带) 来确认应用就绪
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(1.0)
-                    s.connect((self.server_host, port))
-                    return True
-            except (socket.timeout, ConnectionRefusedError):
+                url = f"http://{self.server_host}:{port}/docs"
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=2) as resp:
+                    if resp.status == 200:
+                        logger.debug(f"Server on port {port} is ready (HTTP 200)")
+                        return True
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
                 time.sleep(0.5)
+        
         return False
     
     def _start_server(self):
@@ -278,7 +317,10 @@ When you have completed the task, provide your final answer directly without any
         # Start server process
         logger.info(f"Starting AWM MCP server for {self.scenario_name} on port {self.server_port}...")
         
-        env = os.environ.copy()
+        # 使用独立的环境变量副本 — 必须加锁，因为其他线程的
+        # isolated_mcp_env() 可能正在修改 os.environ
+        with _MCP_ENV_LOCK:
+            env = os.environ.copy()
         env['PORT'] = str(self.server_port)
         env['HOST'] = self.server_host
         env['DATABASE_PATH'] = f"sqlite:///{self.current_db_path}"
@@ -292,24 +334,50 @@ When you have completed the task, provide your final answer directly without any
             start_new_session=True
         )
         
-        # Wait for server to be ready
+        # Wait for server to be ready (HTTP-level check)
         if not self._wait_for_server(self.server_port, self.server_start_timeout):
+            # 尝试读取 server 输出来帮助调试
+            if self.server_process:
+                try:
+                    stdout, _ = self.server_process.communicate(timeout=2)
+                    if stdout:
+                        logger.error(f"Server stdout:\n{stdout[:2000]}")
+                except:
+                    pass
             self._cleanup_server()
             raise RuntimeError(f"AWM MCP server failed to start within {self.server_start_timeout}s")
         
-        # Initialize MCP connection
+        # Initialize MCP connection manager (constructor acquires _MCP_ENV_LOCK)
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
         self.mcp_manager = AWMMCPConnectionManager(mcp_url)
         
-        # Initialize connection (run async init in sync context)
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.mcp_manager.initialize())
-            loop.close()
-        except Exception as e:
+        # Fetch tools (with retry) to verify MCP endpoint is working
+        max_retries = 3
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    tools = loop.run_until_complete(self.mcp_manager.list_tools())
+                finally:
+                    loop.close()
+                
+                if tools:
+                    logger.info(f"MCP connection verified: {len(tools)} tools on port {self.server_port}")
+                    break
+                else:
+                    last_error = "list_tools returned empty"
+                    logger.warning(f"MCP list_tools returned empty (attempt {attempt}/{max_retries})")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"MCP connection attempt {attempt}/{max_retries} failed: {e}")
+            
+            if attempt < max_retries:
+                time.sleep(1.0 * attempt)  # progressive backoff
+        else:
             self._cleanup_server()
-            raise RuntimeError(f"Failed to initialize MCP connection: {e}")
+            raise RuntimeError(f"Failed to initialize MCP connection after {max_retries} attempts: {last_error}")
     
     def _modify_env_code(self, code: str, db_path: str, port: int) -> str:
         """
@@ -442,6 +510,15 @@ When you have completed the task, provide your final answer directly without any
                 logger.warning(f"Failed to parse tool call JSON")
         return tool_calls
     
+    def _run_async(self, coro):
+        """Helper: run an async coroutine from sync context, safely managing the event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+    
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a tool call.
@@ -454,12 +531,8 @@ When you have completed the task, provide your final answer directly without any
         
         if name == "list_tools":
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                tools = loop.run_until_complete(self.mcp_manager.list_tools())
-                loop.close()
+                tools = self._run_async(self.mcp_manager.list_tools())
                 self.available_tools = tools
-                # Use the awm_prompts formatter for consistency
                 from rllm.agents.awm_prompts import format_awm_tools_for_prompt
                 formatted_tools = format_awm_tools_for_prompt(tools)
                 return {
@@ -477,14 +550,10 @@ When you have completed the task, provide your final answer directly without any
                 }
         
         elif name == "call_tool":
-            # Parse arguments matching native implementation (parse_call_tool_arguments)
             tool_name, tool_args = self._parse_call_tool_arguments(arguments)
             
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                result = loop.run_until_complete(self.mcp_manager.call_tool(tool_name, tool_args))
-                loop.close()
+                result = self._run_async(self.mcp_manager.call_tool(tool_name, tool_args))
                 return {
                     "tool": tool_name,
                     "tool_call_id": tool_call_id,
