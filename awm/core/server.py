@@ -77,7 +77,15 @@ def run_server(args: Config):
     
     os.environ['PORT'] = str(args.port)
     os.environ['DATABASE_PATH'] = f"sqlite:///{args.db_path}"
-    os.system(f"{sys.executable} {args.temp_server_path}")
+    
+    # Use os.execv to replace the current process with the server process.
+    # This avoids signal propagation issues that occur with os.system() when
+    # running as a subprocess with redirected stdout/stderr.
+    #
+    # When using subprocess.Popen from awm_env.py, os.system() would spawn
+    # a grandchild process that may not properly handle signals or I/O
+    # redirection, leading to premature server shutdown.
+    os.execv(sys.executable, [sys.executable, args.temp_server_path])
 
 
 def run(config: Config):
