@@ -81,6 +81,14 @@ DEFAULT_TASK_CONFIGS: Dict[str, TaskTypeConfig] = {
         max_response_length=4096,
         max_steps=5,
     ),
+    
+    # AWM: Agentic World Model 多轮 MCP 工具调用
+    # prompt 包含 system prompt + 任务描述，response 包含多轮 tool_call 交互
+    "awm": TaskTypeConfig(
+        max_prompt_length=2048,
+        max_response_length=15360,
+        max_steps=30,  # MCP 多轮交互，需要较多步
+    ),
 }
 
 

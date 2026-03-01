@@ -560,67 +560,67 @@ When you have completed the task, provide your final answer directly without any
         self._cleanup_server()
     
     @staticmethod
+    def is_multithread_safe() -> bool:
+        """
+        AWM environments are NOT multithread-safe.
+        
+        Each AWM task requires starting an independent FastAPI+MCP subprocess server
+        with unique port assignment. The server lifecycle (start/stop/cleanup) involves
+        OS-level process management that must not be shared across threads.
+        """
+        return False
+
+    @staticmethod
     def from_dict(env_args: Dict[str, Any]) -> "AWMEnvironment":
         """
         Create AWMEnvironment from task dictionary.
         
-        The task dictionary contains:
-        - prompt: Task description
-        - extra_info: JSON string containing scenario, env_code, db_schema, etc.
-        - reward_fn: Passed separately in env_args
-        """
-        import json
+        Called by the execution engine with: {**task, **self.env_args}
+        where task = {prompt, response, task_type, data_source, extra_info}
+        and env_args = {reward_fn, max_steps, server_host, server_start_timeout, ...}
         
-        # Extract reward_fn from env_args (not from task data)
+        The pop() pattern is consistent with other rllm environments (e.g. ToolEnvironment).
+        Since the dict is a fresh merge ({**task, **self.env_args}), pop() is safe.
+        """
+        # Pop env_args-level parameters (from trainer's env_args)
         reward_fn = env_args.pop("reward_fn", None)
-        max_steps = env_args.pop("max_steps", 30)
         server_host = env_args.pop("server_host", "127.0.0.1")
         server_start_timeout = env_args.pop("server_start_timeout", 30.0)
         
-        # Parse extra_info if it's a string
-        extra_info = env_args.get("extra_info", "{}")
+        # Parse extra_info from task data
+        extra_info = env_args.pop("extra_info", "{}")
         if isinstance(extra_info, str):
             try:
                 extra_info = json.loads(extra_info)
             except json.JSONDecodeError:
                 extra_info = {}
         
-        # Get task description from prompt or extra_info
-        task_description = env_args.get("prompt", "")
-        if not task_description and isinstance(extra_info, dict):
+        # Get task description from prompt (standard field) or extra_info
+        task_description = env_args.pop("prompt", "")
+        if not task_description:
             task_description = extra_info.get("task", "")
         
         # Extract scenario name
-        scenario_name = "unknown"
-        if isinstance(extra_info, dict):
-            scenario_name = extra_info.get("scenario", "unknown")
+        scenario_name = extra_info.get("scenario", "unknown")
         
         # Extract environment code
-        env_code = ""
-        if isinstance(extra_info, dict):
-            env_code = extra_info.get("env_code", "")
+        env_code = extra_info.get("env_code", "")
         
-        # Extract database info
-        db_schema = None
-        db_sample = None
-        if isinstance(extra_info, dict):
-            db_schema = extra_info.get("db_schema") or extra_info.get("schema")
-            db_sample = extra_info.get("db_sample") or extra_info.get("sample_data")
+        # Extract database info (support both field naming conventions)
+        db_schema = extra_info.get("db_schema") or extra_info.get("schema")
+        db_sample = extra_info.get("db_sample") or extra_info.get("sample_data")
         
         # Extract verifier code
-        verifier_code = None
-        if isinstance(extra_info, dict):
-            verifier_code = extra_info.get("verifier_code")
+        verifier_code = extra_info.get("verifier_code")
         
-        # Get max_steps from extra_info if available
-        if isinstance(extra_info, dict) and "max_steps" in extra_info:
-            max_steps = extra_info.get("max_steps", max_steps)
+        # max_steps priority: extra_info.task_max_steps > extra_info.max_steps > default 30
+        max_steps = extra_info.get("task_max_steps", extra_info.get("max_steps", 30))
         
         return AWMEnvironment(
             scenario_name=scenario_name,
             task_description=task_description,
             env_code=env_code,
-            db_path=None,  # Will be created dynamically during reset
+            db_path=None,  # DB is created dynamically from schema during reset()
             db_schema=db_schema,
             db_sample=db_sample,
             verifier_code=verifier_code,

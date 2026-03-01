@@ -100,20 +100,40 @@ class AWMMCPPureCodeRewardFn:
                 metadata={"execution_status": "exception", "error": str(e)}
             )
     
+    @staticmethod
+    def _detect_verify_function_name(python_code: str, default: str) -> str:
+        """
+        Detect the verification function name from the generated code.
+        
+        Matches AWM native logic (awm/core/verifier.py): looks for 'def verify_...'
+        and extracts the function name. Falls back to the default if not found.
+        """
+        for line in python_code.split('\n'):
+            line = line.strip()
+            if line.startswith('def verify_') and '(' in line:
+                return line.split('(')[0].replace('def ', '').strip()
+        return default
+
     def _execute_verification(
         self,
         python_code: str,
         db_path: str,
         final_answer: str,
-        function_name: str = "verify"
+        function_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute verification code using awm.core.verifier.
+        
+        Function name detection follows AWM native logic:
+        - Default for VerificationMode.code: "verify_task_completion"
+        - Auto-detect from code: looks for 'def verify_...()'
         """
+        if function_name is None:
+            function_name = self._detect_verify_function_name(
+                python_code, default="verify_task_completion"
+            )
+        
         try:
-            # Note: We currently don't pass final_answer to awm.core.verifier.execute_verification_code
-            # because it doesn't support it yet. It uses a placeholder.
-            # If AWM core is updated, we should pass final_answer here.
             return execute_verification_code(
                 python_code=python_code,
                 function_name=function_name,
@@ -237,11 +257,20 @@ class AWMMCPRewardFn:
         self,
         python_code: str,
         db_path: str,
-        function_name: str = "verify"
+        function_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute SQL-based verification code using awm.core.verifier.
+        
+        Function name detection follows AWM native logic:
+        - Default for VerificationMode.sql: "verify_task"
+        - Auto-detect from code: looks for 'def verify_...()'
         """
+        if function_name is None:
+            function_name = AWMMCPPureCodeRewardFn._detect_verify_function_name(
+                python_code, default="verify_task"
+            )
+        
         try:
             return execute_verification_code(
                 python_code=python_code,
