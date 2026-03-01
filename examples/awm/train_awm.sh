@@ -2,7 +2,7 @@ set -x
 
 # ================= 环境变量设置 =================
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export BASE_MODEL_PATH=/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/ckpt/Qwen3-4B
+export BASE_MODEL_PATH="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-4B"
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:False"
 export VLLM_USE_V1=1
