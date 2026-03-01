@@ -179,7 +179,7 @@ def main(config):
     env_args = {
         "reward_fn": awm_reward_fn,
         "server_host": "127.0.0.1",
-        "server_start_timeout": 30.0,
+        "server_start_timeout": 60.0,
     }
 
     # ============================================================

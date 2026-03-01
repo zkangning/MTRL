@@ -3,6 +3,12 @@ AWM Environment for RLLM
 
 This environment wraps AWM-generated virtual environments (FastAPI + MCP Server)
 for use in RLLM's agentic RL training pipeline.
+
+Server lifecycle strictly follows awm/core/env.py::test_run_specific_env():
+  1. Write env_config to temp jsonl
+  2. Copy / create database to temp dir
+  3. Launch `python -m awm.core.server` as subprocess
+  4. Wait via awm/tools.py::wait_for_server() (MCP-level check)
 """
 
 import asyncio
@@ -25,8 +31,11 @@ from rllm.rewards.reward_types import RewardOutput
 
 # AWM core imports
 from awm.core.db import create_sqlite_database
-from awm.core.server import format_raw_code_to_lines
-from awm.tools import normalize_scenario_name as normalize_awm_name
+from awm.tools import (
+    normalize_scenario_name as normalize_awm_name,
+    get_random_available_port,
+    tools_jsonl_save,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,25 +46,24 @@ _MCP_ENV_LOCK = threading.Lock()
 class AWMMCPConnectionManager:
     """
     Manages connection to AWM MCP Server.
-    
-    与 awm.core.agent.MCPToolExecutor 对齐:
-    - __init__ 中创建 MCPApp 和 Agent（在 isolated_mcp_env 中，需持锁）
-    - list_tools / call_tool 每次都 async with app.run() + async with agent
-    - 使用 contextlib.redirect_stderr 屏蔽 mcp_agent 内部日志噪音
+
+    Mirrors awm.core.agent.MCPToolExecutor exactly:
+    - __init__ creates MCPApp + Agent inside isolated_mcp_env (needs lock)
+    - list_tools / call_tool: each call does `async with app.run()` + `async with agent`
+    - contextlib.redirect_stderr suppresses mcp_agent internal log noise
     """
-    
+
     def __init__(self, mcp_url: str, timeout: float = 60.0):
         from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
         from mcp_agent.config import Settings, MCPSettings, MCPServerSettings, LoggerSettings
         from awm.tools import isolated_mcp_env
-        
+
         self.mcp_url = mcp_url
         self.timeout = timeout
         self._tools: List[Dict] = []
-        
-        # 创建 MCPApp/Agent 需要在 isolated_mcp_env 中，
-        # 且 isolated_mcp_env 修改 os.environ，必须加锁
+
+        # isolated_mcp_env mutates os.environ globally -> must hold lock
         with _MCP_ENV_LOCK:
             with isolated_mcp_env():
                 settings = Settings(
@@ -77,12 +85,12 @@ class AWMMCPConnectionManager:
                 )
                 self._app = MCPApp(name="awm_agent", settings=settings)
                 self._agent = Agent(name="executor", server_names=["mcp_server"])
-    
+
     async def list_tools(self) -> List[Dict]:
         """List available tools from MCP server."""
         if self._tools:
             return self._tools
-        
+
         with contextlib.redirect_stderr(io.StringIO()):
             async with self._app.run():
                 async with self._agent:
@@ -99,7 +107,7 @@ class AWMMCPConnectionManager:
                         self._tools.append(tool_info)
                     logger.info(f"AWM MCP: Loaded {len(self._tools)} tools from {self.mcp_url}")
                     return self._tools
-    
+
     async def call_tool(self, tool_name: str, arguments: Dict) -> str:
         """Call a tool on the MCP server."""
         try:
@@ -110,20 +118,18 @@ class AWMMCPConnectionManager:
                             self._agent.call_tool(tool_name, arguments),
                             timeout=self.timeout,
                         )
-                        # Extract text from result content
                         parts = []
                         for c in result.content:
                             if hasattr(c, 'text'):
                                 parts.append(c.text)
                             else:
                                 parts.append(str(c))
-                        
+
                         text = "\n".join(parts)
-                        
                         if result.isError:
                             return f"Error: {text}"
                         return text
-                    
+
         except asyncio.TimeoutError:
             return f"Error: Tool call timed out after {self.timeout}s"
         except Exception as e:
@@ -133,8 +139,10 @@ class AWMMCPConnectionManager:
 class AWMEnvironment(BaseEnv):
     """
     AWM Environment for RLLM Agentic RL Training.
+
+    Server lifecycle strictly follows awm/core/env.py::test_run_specific_env().
     """
-    
+
     AWM_SYSTEM_PROMPT = """You are an AI assistant interacting with a virtual environment through tools.
 
 Your goal is to complete the given task by using the available tools. You should:
@@ -175,7 +183,7 @@ or
 
 When you have completed the task, provide your final answer directly without any tool calls.
 """
-    
+
     def __init__(
         self,
         scenario_name: str,
@@ -188,11 +196,11 @@ When you have completed the task, provide your final answer directly without any
         max_steps: int = 30,
         reward_fn=None,
         server_host: str = "127.0.0.1",
-        server_start_timeout: float = 30.0,
+        server_start_timeout: float = 60.0,
         **kwargs
     ):
         super().__init__()
-        
+
         self.scenario_name = scenario_name
         self.task_description = task_description
         self.env_code = env_code
@@ -204,335 +212,294 @@ When you have completed the task, provide your final answer directly without any
         self.reward_fn = reward_fn
         self.server_host = server_host
         self.server_start_timeout = server_start_timeout
-        
+
         # Server management
         self.server_port: Optional[int] = None
         self.server_process: Optional[subprocess.Popen] = None
         self.server_log_file = None
+        self.server_log_path: Optional[str] = None
         self.temp_dir: Optional[str] = None
         self.mcp_manager: Optional[AWMMCPConnectionManager] = None
         self.current_db_path: Optional[str] = None
-        
+
         # State tracking
         self.current_step = 0
         self.history: List[Dict[str, Any]] = []
         self.done = False
         self.available_tools: List[Dict] = []
-        
-    def _get_random_port(self) -> int:
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
-            s.listen(1)
-            port = s.getsockname()[1]
-        return port
-    
-    def _wait_for_server(self, port: int, timeout: float = 30.0) -> bool:
-        """
-        Wait for the FastAPI server to be fully ready.
-        
-        使用 HTTP GET 请求检查（而非仅 TCP socket），确保 FastAPI 已完成路由挂载。
-        先用 TCP socket 快速检测端口绑定，再用 HTTP 请求验证应用就绪。
-        """
-        import socket
-        import urllib.request
-        import urllib.error
-        
-        start_time = time.time()
-        tcp_ready = False
-        
-        while time.time() - start_time < timeout:
-            # 检查进程是否已经退出（提前失败检测）
-            if self.server_process and self.server_process.poll() is not None:
-                logger.error(f"Server process exited with code {self.server_process.returncode}")
-                return False
-            
-            if not tcp_ready:
-                # Phase 1: TCP port check (fast)
-                try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                        s.settimeout(1.0)
-                        s.connect((self.server_host, port))
-                        tcp_ready = True
-                        logger.debug(f"TCP port {port} is open, checking HTTP readiness...")
-                except (socket.timeout, ConnectionRefusedError, OSError):
-                    time.sleep(0.3)
-                    continue
-            
-            # Phase 2: HTTP health check — 请求 /docs (FastAPI 自带) 来确认应用就绪
-            try:
-                url = f"http://{self.server_host}:{port}/docs"
-                req = urllib.request.Request(url, method='GET')
-                with urllib.request.urlopen(req, timeout=2) as resp:
-                    if resp.status == 200:
-                        logger.debug(f"Server on port {port} is ready (HTTP 200)")
-                        return True
-            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
-                time.sleep(0.5)
-        
-        return False
-    
+
+    # ------------------------------------------------------------------
+    # Server lifecycle — mirrors awm/core/env.py::test_run_specific_env()
+    # ------------------------------------------------------------------
+
+    def _read_server_log(self) -> str:
+        """Read the server log file content, flushing the write handle first."""
+        try:
+            if self.server_log_file and not self.server_log_file.closed:
+                self.server_log_file.flush()
+            if self.server_log_path and os.path.exists(self.server_log_path):
+                with open(self.server_log_path, "r") as f:
+                    return f.read()
+        except Exception as e:
+            return f"<failed to read server log: {e}>"
+        return "<no server log available>"
+
     def _start_server(self):
-        # Create temporary directory
-        self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{normalize_awm_name(self.scenario_name)}_")
-        
-        # Handle database initialization
+        """
+        Start AWM MCP server — follows awm/core/env.py::test_run_specific_env() exactly:
+
+        1. Create temp dir
+        2. Prepare database (copy or create from schema)
+        3. Write env_config as jsonl (so awm.core.server can read it)
+        4. Launch `python -m awm.core.server --scenario ... --port ... --db_path ... --envs_load_path ...`
+        5. Sleep 3s then check if process crashed (same as original)
+        6. Wait for MCP readiness via awm/tools.py::wait_for_server()
+        """
+        scenario_norm = normalize_awm_name(self.scenario_name)
+        self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{scenario_norm}_")
+
+        # ── Step 1: Prepare database ──
         if self.db_path and os.path.exists(self.db_path):
-            # Copy existing database
-            self.current_db_path = os.path.join(self.temp_dir, "environment.db")
-            shutil.copy2(self.db_path, self.current_db_path)
+            self.current_db_path = os.path.join(self.temp_dir, f"{scenario_norm}.db")
+            shutil.copyfile(self.db_path, self.current_db_path)
             os.chmod(self.current_db_path, 0o644)
-            logger.info(f"Using existing database copied from {self.db_path}")
+            logger.info(f"[{self.scenario_name}] Copied existing database from {self.db_path}")
         elif self.db_schema:
-            # Create database from schema using awm.core.db
-            logger.info(f"Creating fresh database from schema for {self.scenario_name}...")
-            # We combine db_schema and db_sample into one schema dict if they are separate
+            logger.info(f"[{self.scenario_name}] Creating database from schema...")
             full_schema = self.db_schema.copy()
             if self.db_sample:
-                # Add sample data to tables
                 for table in full_schema.get("tables", []):
                     table_name = table.get("name")
-                    if table_name in self.db_sample:
+                    if table_name and table_name in self.db_sample:
                         table["examples"] = self.db_sample[table_name]
-            
+
             db_path, successful, failed, errors = create_sqlite_database(
                 self.scenario_name, full_schema, self.temp_dir
             )
             self.current_db_path = db_path
             if failed > 0:
-                logger.warning(f"Database creation had {failed} failures: {errors}")
+                logger.warning(f"[{self.scenario_name}] Database creation had {failed} failures: {errors}")
         else:
             raise ValueError("Either db_path or db_schema must be provided for AWMEnvironment")
-        
-        # Get available port
-        self.server_port = self._get_random_port()
-        
-        # Modify environment code using shared logic
-        modified_code = self._modify_env_code(self.env_code, self.current_db_path, self.server_port)
-        
-        # Write server code to temp file
-        server_path = os.path.join(self.temp_dir, "server.py")
-        with open(server_path, 'w') as f:
-            f.write(modified_code)
-        
-        # Start server process
-        logger.info(f"Starting AWM MCP server for {self.scenario_name} on port {self.server_port}...")
-        
-        # 使用独立的环境变量副本 — 必须加锁，因为其他线程的
-        # isolated_mcp_env() 可能正在修改 os.environ
-        with _MCP_ENV_LOCK:
-            env = os.environ.copy()
-        env['PORT'] = str(self.server_port)
-        env['HOST'] = self.server_host
-        env['DATABASE_PATH'] = f"sqlite:///{self.current_db_path}"
-        
-        # Use a file for stdout/stderr to avoid PIPE buffer deadlocks and make debugging easier
+
+        # ── Step 2: Write env_config as jsonl (same format as awm/core/env.py) ──
+        env_config = {
+            "scenario": self.scenario_name,
+            "db_path": self.current_db_path,
+            "full_code": self.env_code,
+        }
+        temp_env_json = os.path.join(self.temp_dir, "env_config.jsonl")
+        tools_jsonl_save([env_config], temp_env_json)
+
+        # ── Step 3: Allocate port ──
+        self.server_port = get_random_available_port()
+
+        # Temp server path for awm.core.server to write the modified code
+        temp_server_path = os.path.join(self.temp_dir, "temp_server.py")
+
+        # ── Step 4: Launch subprocess — identical to awm/core/env.py:161-174 ──
+        logger.info(f"[{self.scenario_name}] Starting AWM server on port {self.server_port}...")
+
         self.server_log_path = os.path.join(self.temp_dir, "server.log")
         self.server_log_file = open(self.server_log_path, "w")
-        
+
         self.server_process = subprocess.Popen(
-            [sys.executable, "-u", server_path],  # Use unbuffered output
+            [
+                sys.executable, '-m', 'awm.core.server',
+                '--port', str(self.server_port),
+                '--scenario', scenario_norm,
+                '--db_path', self.current_db_path,
+                '--temp_server_path', temp_server_path,
+                '--envs_load_path', temp_env_json,
+            ],
             stdout=self.server_log_file,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
             text=True,
-            env=env,
-            start_new_session=True
         )
-        
-        # Wait for server to be ready (HTTP-level check)
-        if not self._wait_for_server(self.server_port, self.server_start_timeout):
-            # Read server log for debugging
-            self.server_log_file.flush()
-            with open(self.server_log_path, "r") as f:
-                log_content = f.read()
-            
-            logger.error(f"Server start failed. Log content from {self.server_log_path}:\n{log_content}")
-            
-            # Also log the server code around the uvicorn run to see if replacement worked
-            with open(server_path, "r") as f:
-                server_code = f.read()
-                if "uvicorn.run(app, host=host, port=int(port))" not in server_code:
-                    logger.error("CRITICAL: uvicorn.run replacement NOT FOUND in generated server code!")
-            
-            self._cleanup_server()
-            raise RuntimeError(f"AWM MCP server failed to start within {self.server_start_timeout}s. See logs above.")
-        
-        # Initialize MCP connection manager (constructor acquires _MCP_ENV_LOCK)
+
+        logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
+
+        # ── Step 5: Initial crash check (same 3s sleep as original) ──
+        time.sleep(3)
+
+        if self.server_process.poll() is not None:
+            rc = self.server_process.returncode
+            log_content = self._read_server_log()
+            logger.error(
+                f"[{self.scenario_name}] Server process exited prematurely (exit code {rc}).\n"
+                f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+            )
+            self._kill_server_process()
+            raise RuntimeError(
+                f"AWM server crashed on startup for '{self.scenario_name}' (exit code {rc}). "
+                f"Temp dir preserved: {self.temp_dir}"
+            )
+
+        # ── Step 6: Wait for MCP readiness — uses awm/tools.py::wait_for_server() ──
+        from awm.tools import wait_for_server as awm_wait_for_server
+
+        if not awm_wait_for_server(self.server_port, timeout=self.server_start_timeout):
+            log_content = self._read_server_log()
+            proc_status = "running" if self.server_process.poll() is None else f"exited({self.server_process.returncode})"
+            logger.error(
+                f"[{self.scenario_name}] MCP server not ready within {self.server_start_timeout}s "
+                f"(process: {proc_status}).\n"
+                f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+            )
+            self._kill_server_process()
+            raise RuntimeError(
+                f"AWM MCP server failed to start within {self.server_start_timeout}s "
+                f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}"
+            )
+
+        logger.info(f"[{self.scenario_name}] Server ready on port {self.server_port}")
+
+        # ── Step 7: Initialize MCP connection manager ──
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
         self.mcp_manager = AWMMCPConnectionManager(mcp_url)
-        
-        # Fetch tools (with retry) to verify MCP endpoint is working
-        max_retries = 3
-        last_error = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    tools = loop.run_until_complete(self.mcp_manager.list_tools())
-                finally:
-                    loop.close()
-                
-                if tools:
-                    logger.info(f"MCP connection verified: {len(tools)} tools on port {self.server_port}")
-                    break
-                else:
-                    last_error = "list_tools returned empty"
-                    logger.warning(f"MCP list_tools returned empty (attempt {attempt}/{max_retries})")
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"MCP connection attempt {attempt}/{max_retries} failed: {e}")
-            
-            if attempt < max_retries:
-                time.sleep(1.0 * attempt)  # progressive backoff
-        else:
-            self._cleanup_server()
-            raise RuntimeError(f"Failed to initialize MCP connection after {max_retries} attempts: {last_error}")
-    
-    def _modify_env_code(self, code: str, db_path: str, port: int) -> str:
-        """
-        Modify generated environment code using awm.core.server patterns.
-        """
-        new_code = ['import warnings', 'warnings.filterwarnings("ignore", category=DeprecationWarning)']
-        
-        uvicorn_replaced = False
-        
-        for line in code.split("\n"):
-            # Replace database connection
-            if 'create_engine(' in line:
-                left = line.split('create_engine(')[0]
-                sql_path = f"'sqlite:///{db_path}'"
-                right = f"create_engine({sql_path}, connect_args={{'check_same_thread': False}})"
-                line = f"{left}{right}"
-            
-            # Modify uvicorn.run to use environment variables and mount MCP
-            if 'uvicorn.run(app' in line:
-                uvicorn_replaced = True
-                # Use format_raw_code_to_lines from awm.core.server
-                raw_code = f"""
-                import os
-                host = os.environ.get('HOST', '{self.server_host}')
-                port = os.environ.get('PORT', {port})
-                print(f'Server starting on port={{port}}')
-                """
-                lines = format_raw_code_to_lines(raw_code, indent=4)
-                
-                raw_code_mcp = f"""
-                from fastapi_mcp import FastApiMCP
-                mcp = FastApiMCP(app)
-                mcp.mount_http()
-                print("MCP server enabled")
-                """
-                lines += format_raw_code_to_lines(raw_code_mcp, indent=4)
-                
-                new_code.extend(lines)
-                line = f'    uvicorn.run(app, host=host, port=int(port))'
-            
-            new_code.append(line)
-            
-        if not uvicorn_replaced:
-            logger.warning(f"Scenario {self.scenario_name}: 'uvicorn.run(app' not found in env_code. Server might not start on correct port or enable MCP.")
-        
-        return "\n".join(new_code)
-    
-    def _cleanup_server(self):
-        """Clean up server process and temporary files."""
+
+    # ------------------------------------------------------------------
+    # Process management
+    # ------------------------------------------------------------------
+
+    def _kill_server_process(self):
+        """Kill server process only (preserve temp dir for debugging)."""
         if self.server_process:
             try:
                 os.killpg(os.getpgid(self.server_process.pid), signal.SIGTERM)
                 self.server_process.wait(timeout=5)
-            except:
+            except Exception:
                 try:
                     os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
-                except:
+                except Exception:
                     pass
             self.server_process = None
-            
-        if hasattr(self, 'server_log_file') and self.server_log_file:
+
+        if self.server_log_file:
             try:
                 self.server_log_file.close()
-            except:
+            except Exception:
                 pass
             self.server_log_file = None
-        
+
+    def _cleanup_server(self):
+        """Clean up server process and temporary files."""
+        self._kill_server_process()
+
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
-            except:
+            except Exception:
                 pass
             self.temp_dir = None
-        
+
         self.mcp_manager = None
         self.server_port = None
         self.current_db_path = None
-    
+
+    # ------------------------------------------------------------------
+    # Gym-like interface
+    # ------------------------------------------------------------------
+
     def reset(self, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         self._cleanup_server()
-        
+
         self.current_step = 0
         self.history = []
         self.done = False
         self.available_tools = []
-        
+
         self._start_server()
-        
+
         observation = {
             "system_prompt": self.AWM_SYSTEM_PROMPT,
             "task": self.task_description,
             "scenario": self.scenario_name,
         }
-        
+
         info = {
             "scenario": self.scenario_name,
             "task": self.task_description,
             "max_steps": self.max_steps,
         }
-        
+
         return observation, info
-    
+
     def step(self, action: str) -> Tuple[Dict[str, Any], float, bool, Dict[str, Any]]:
         self.current_step += 1
         tool_calls = self._parse_tool_calls(action)
-        
+
         if not tool_calls:
             self.done = True
             reward = self._compute_final_reward(action)
             info = {"step": self.current_step, "action": action, "final_answer": action}
             return {}, reward, self.done, info
-        
+
         results = []
         for tc in tool_calls:
             result = self._execute_tool_call(tc)
             results.append(result)
-        
+
         if self.current_step >= self.max_steps:
             self.done = True
             reward = self._compute_final_reward(action)
         else:
             reward = 0.0
-        
+
         observation = {"tool_results": results, "step": self.current_step}
         info = {"step": self.current_step, "action": action, "tool_calls": tool_calls, "results": results}
         self.history.append(info)
-        
+
         return observation, reward, self.done, info
-    
+
+    # ------------------------------------------------------------------
+    # Tool call parsing & execution — mirrors awm/core/agent.py
+    # ------------------------------------------------------------------
+
     def _parse_tool_calls(self, action: str) -> List[Dict[str, Any]]:
+        """Parse tool calls from agent response — same as awm.core.agent.parse_tool_calls()."""
         import re
+        from awm.tools import tools_robust_json_loads
+
         tool_calls = []
         pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
         matches = re.findall(pattern, action, re.DOTALL)
-        for match in matches:
-            try:
-                data = json.loads(match.strip())
-                if isinstance(data, list) and len(data) > 0:
+
+        for i, match in enumerate(matches):
+            data = tools_robust_json_loads(match.strip())
+            if not data:
+                logger.warning(f"Failed to parse tool call JSON: {match[:100]}")
+                continue
+
+            if isinstance(data, list):
+                if len(data) > 0 and isinstance(data[0], dict):
                     data = data[0]
-                if isinstance(data, dict):
-                    tool_calls.append({"name": data.get("name", ""), "arguments": data.get("arguments", {})})
-            except json.JSONDecodeError:
-                logger.warning(f"Failed to parse tool call JSON")
+                else:
+                    continue
+
+            if not isinstance(data, dict):
+                continue
+
+            name = data.get("name", "")
+            arguments = data.get("arguments", {})
+
+            # Handle mcp_tool_ prefix (same as original agent.py:120-125)
+            if name.startswith("mcp_tool_"):
+                arguments = {
+                    "tool_name": name,
+                    "arguments": arguments if arguments else {},
+                }
+                name = "call_tool"
+
+            tool_calls.append({
+                "id": f"call_{int(time.time() * 1000)}_{i}",
+                "name": name,
+                "arguments": arguments,
+            })
+
         return tool_calls
-    
+
     def _run_async(self, coro):
         """Helper: run an async coroutine from sync context, safely managing the event loop."""
         loop = asyncio.new_event_loop()
@@ -541,23 +508,22 @@ When you have completed the task, provide your final answer directly without any
             return loop.run_until_complete(coro)
         finally:
             loop.close()
-    
+
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Execute a tool call.
-        
-        Compatible with AWM native implementation (awm/core/agent.py).
+        Execute a tool call — mirrors awm/core/agent.py::run_agent() tool dispatch.
         """
         name = tool_call.get("name", "")
         arguments = tool_call.get("arguments", {})
         tool_call_id = tool_call.get("id", "")
-        
+
         if name == "list_tools":
             try:
                 tools = self._run_async(self.mcp_manager.list_tools())
                 self.available_tools = tools
-                from rllm.agents.awm_prompts import format_awm_tools_for_prompt
-                formatted_tools = format_awm_tools_for_prompt(tools)
+                # Use awm.core.agent.format_tools_for_response for formatting
+                from awm.core.agent import format_tools_for_response
+                formatted_tools = format_tools_for_response(tools)
                 return {
                     "tool": "list_tools",
                     "tool_call_id": tool_call_id,
@@ -571,10 +537,10 @@ When you have completed the task, provide your final answer directly without any
                     "result": f"Error listing tools: {e}",
                     "success": False
                 }
-        
+
         elif name == "call_tool":
             tool_name, tool_args = self._parse_call_tool_arguments(arguments)
-            
+
             try:
                 result = self._run_async(self.mcp_manager.call_tool(tool_name, tool_args))
                 return {
@@ -592,46 +558,42 @@ When you have completed the task, provide your final answer directly without any
                     "result": f"Error: {e}",
                     "success": False
                 }
-        
+
         return {"tool": name, "tool_call_id": tool_call_id, "result": f"Unknown tool: {name}", "success": False}
-    
+
     def _parse_call_tool_arguments(self, arguments: Any) -> tuple[str, dict]:
         """
-        Parse call_tool arguments matching AWM native implementation.
-        
-        Args:
-            arguments: Can be dict, str, or None
-            
-        Returns:
-            Tuple of (tool_name, tool_args)
+        Parse call_tool arguments — identical to awm.core.agent.parse_call_tool_arguments().
         """
         from awm.tools import tools_robust_json_loads
-        
+
         if isinstance(arguments, str):
             arguments = tools_robust_json_loads(arguments)
         if not isinstance(arguments, dict):
             return "", {}
-        
+
         tool_name = arguments.get("tool_name", "")
         inner_args = arguments.get("arguments", {})
-        
-        # Handle mcp_tool_ prefix
+
         if tool_name.startswith("mcp_tool_"):
             tool_name = tool_name[len("mcp_tool_"):]
-        
-        # Parse inner arguments if string
+
         if isinstance(inner_args, str):
             parsed = tools_robust_json_loads(inner_args) if inner_args.strip() else {}
             if isinstance(parsed, dict):
                 inner_args = parsed
             else:
                 inner_args = {}
-        
+
         if not isinstance(inner_args, dict):
             inner_args = {}
-        
+
         return tool_name, inner_args
-    
+
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
+
     def _compute_final_reward(self, final_answer: str) -> float:
         if self.reward_fn:
             task_info = {
@@ -647,15 +609,15 @@ When you have completed the task, provide your final answer directly without any
                 return reward_output.reward
             return float(reward_output)
         return 0.0
-    
+
     def close(self):
         self._cleanup_server()
-    
+
     @staticmethod
     def is_multithread_safe() -> bool:
         """
         AWM environments are multithread-safe.
-        
+
         Each AWM task creates a fully independent environment instance via from_dict(),
         with its own temporary directory, random port, subprocess server, and MCP
         connection. There is no shared mutable state between instances, so concurrent
@@ -667,9 +629,9 @@ When you have completed the task, provide your final answer directly without any
     def from_dict(env_args: Dict[str, Any]) -> "AWMEnvironment":
         """
         Create AWMEnvironment from task dictionary.
-        
+
         【独立管道】数据流（绕开 DatasetRegistry / apply_verl_postprocessing）:
-        
+
         1. load_awm_dataset() 生成:
            extra_info = {
                "index": int,
@@ -678,23 +640,20 @@ When you have completed the task, provide your final answer directly without any
                "db_schema": str (JSON), "db_sample": str (JSON),
                "verifier_code": str, "max_steps": int, "task_type": "awm"
            }
-        
+
         2. init_envs_and_agents() 调用:
            env_args[i] = extra_info dict (parsed from JSON if str)
            self.env_class.from_dict({**env_args[i], **base_env_args})
-        
+
         3. 因此本方法收到的 env_args 顶层 key 包括:
            - AWM 字段: scenario, task, env_code, db_schema, db_sample, verifier_code, ...
            - base_env_args: reward_fn, server_host, server_start_timeout, ...
-        
-        The pop() pattern is consistent with other rllm environments (e.g. ToolEnvironment).
-        Since the dict is a fresh merge ({**task, **self.env_args}), pop() is safe.
         """
         # Pop base env_args (from trainer's env_args)
         reward_fn = env_args.pop("reward_fn", None)
         server_host = env_args.pop("server_host", "127.0.0.1")
-        server_start_timeout = env_args.pop("server_start_timeout", 30.0)
-        
+        server_start_timeout = env_args.pop("server_start_timeout", 60.0)
+
         # ============================================================
         # 提取 AWM 字段 — 兼容两种格式:
         #   格式 A (独立管道): 字段直接在 env_args 顶层
@@ -708,12 +667,10 @@ When you have completed the task, provide your final answer directly without any
                 except json.JSONDecodeError:
                     extra_info = {}
             if isinstance(extra_info, dict):
-                # 旧管道兼容: 如果 extra_info 里有 original_data，从中恢复
                 if "original_data" in extra_info and "db_schema" not in extra_info:
                     try:
                         original = json.loads(extra_info["original_data"])
                         if isinstance(original, dict):
-                            # original_data 中可能还有一层 extra_info
                             nested_extra = original.get("extra_info", {})
                             if isinstance(nested_extra, str):
                                 nested_extra = json.loads(nested_extra)
@@ -725,8 +682,7 @@ When you have completed the task, provide your final answer directly without any
                         pass
         else:
             extra_info = {}
-        
-        # 合并: 顶层 env_args 的 AWM 字段优先于 extra_info 中的
+
         def _get(key, *alt_keys):
             """从 env_args 或 extra_info 中获取值，支持备选 key。"""
             val = env_args.pop(key, None)
@@ -745,42 +701,32 @@ When you have completed the task, provide your final answer directly without any
                     return val
             return None
 
-        # 提取任务描述
         task_description = _get("task", "prompt") or ""
-        
-        # 提取场景名
         scenario_name = _get("scenario") or "unknown"
-        
-        # 提取环境代码
         env_code = _get("env_code") or ""
-        
-        # 提取数据库 schema（可能是 JSON 字符串或 dict）
+
         db_schema = _get("db_schema", "schema")
         if isinstance(db_schema, str):
             try:
                 db_schema = json.loads(db_schema)
             except (json.JSONDecodeError, TypeError):
                 pass
-        
-        # 提取数据库样本数据
+
         db_sample = _get("db_sample", "sample_data")
         if isinstance(db_sample, str):
             try:
                 db_sample = json.loads(db_sample)
             except (json.JSONDecodeError, TypeError):
                 pass
-        
-        # 提取验证代码
+
         verifier_code = _get("verifier_code") or ""
-        
-        # max_steps
         max_steps = _get("max_steps", "task_max_steps") or 30
-        
+
         return AWMEnvironment(
             scenario_name=scenario_name,
             task_description=task_description,
             env_code=env_code,
-            db_path=None,  # DB is created dynamically from schema during reset()
+            db_path=None,
             db_schema=db_schema,
             db_sample=db_sample,
             verifier_code=verifier_code,
