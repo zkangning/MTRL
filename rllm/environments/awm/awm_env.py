@@ -4,11 +4,17 @@ AWM Environment for RLLM
 This environment wraps AWM-generated virtual environments (FastAPI + MCP Server)
 for use in RLLM's agentic RL training pipeline.
 
-Server lifecycle strictly follows awm/core/env.py::test_run_specific_env():
+Server lifecycle follows awm/core/env.py::test_run_specific_env():
   1. Write env_config to temp jsonl
   2. Copy / create database to temp dir
   3. Launch `python -m awm.core.server` as subprocess
-  4. Wait via awm/tools.py::wait_for_server() (MCP-level check)
+  4. Wait for server readiness via HTTP + MCP tool verification
+
+NOTE on threading:  Original AWM uses ProcessPoolExecutor (each env in its own
+process).  RLLM uses ThreadPoolExecutor (all envs share one process).  Therefore
+awm/tools.py::wait_for_server() (which calls asyncio.run() in a loop) cannot be
+used directly — it creates event-loop-bound asyncio.Lock conflicts.  We use a
+pure-sync HTTP readiness check instead, then verify MCP via AWMMCPConnectionManager.
 """
 
 import asyncio
@@ -244,16 +250,78 @@ When you have completed the task, provide your final answer directly without any
             return f"<failed to read server log: {e}>"
         return "<no server log available>"
 
+    def _wait_for_server_http(self, port: int, timeout: float) -> bool:
+        """
+        Wait for the FastAPI server to be ready using pure-sync HTTP checks.
+
+        Unlike awm/tools.py::wait_for_server() which uses asyncio.run() (incompatible
+        with ThreadPoolExecutor), this uses only stdlib urllib — no asyncio, no
+        event-loop-bound locks, fully thread-safe.
+
+        Check flow: TCP connect -> HTTP GET /docs -> return True.
+        Also checks for early process exit.
+        """
+        import socket
+        import urllib.request
+        import urllib.error
+
+        start_time = time.time()
+        tcp_ready = False
+
+        while time.time() - start_time < timeout:
+            # Early crash detection
+            if self.server_process and self.server_process.poll() is not None:
+                rc = self.server_process.returncode
+                log_content = self._read_server_log()
+                logger.error(
+                    f"[{self.scenario_name}] Server process CRASHED (exit code {rc}) on port {port}.\n"
+                    f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+                )
+                return False
+
+            if not tcp_ready:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(1.0)
+                        s.connect((self.server_host, port))
+                        tcp_ready = True
+                        logger.info(f"[{self.scenario_name}] TCP port {port} is open, checking HTTP...")
+                except (socket.timeout, ConnectionRefusedError, OSError):
+                    time.sleep(0.3)
+                    continue
+
+            # HTTP health check — /docs is always available on FastAPI
+            try:
+                url = f"http://{self.server_host}:{port}/docs"
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        logger.info(f"[{self.scenario_name}] Server HTTP ready on port {port}")
+                        return True
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError):
+                time.sleep(0.5)
+
+        # Timeout
+        log_content = self._read_server_log()
+        proc_status = "running" if (self.server_process and self.server_process.poll() is None) else "exited"
+        logger.error(
+            f"[{self.scenario_name}] Server HTTP not ready within {timeout}s "
+            f"(process: {proc_status}, tcp_ready: {tcp_ready}).\n"
+            f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
+        )
+        return False
+
     def _start_server(self):
         """
-        Start AWM MCP server — follows awm/core/env.py::test_run_specific_env() exactly:
+        Start AWM MCP server — follows awm/core/env.py::test_run_specific_env():
 
         1. Create temp dir
         2. Prepare database (copy or create from schema)
         3. Write env_config as jsonl (so awm.core.server can read it)
-        4. Launch `python -m awm.core.server --scenario ... --port ... --db_path ... --envs_load_path ...`
+        4. Launch `python -m awm.core.server` as subprocess
         5. Sleep 3s then check if process crashed (same as original)
-        6. Wait for MCP readiness via awm/tools.py::wait_for_server()
+        6. Wait for HTTP readiness (thread-safe, no asyncio)
+        7. Verify MCP connectivity via AWMMCPConnectionManager.list_tools()
         """
         scenario_norm = normalize_awm_name(self.scenario_name)
         self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{scenario_norm}_")
@@ -336,28 +404,45 @@ When you have completed the task, provide your final answer directly without any
                 f"Temp dir preserved: {self.temp_dir}"
             )
 
-        # ── Step 6: Wait for MCP readiness — uses awm/tools.py::wait_for_server() ──
-        from awm.tools import wait_for_server as awm_wait_for_server
-
-        if not awm_wait_for_server(self.server_port, timeout=self.server_start_timeout):
-            log_content = self._read_server_log()
-            proc_status = "running" if self.server_process.poll() is None else f"exited({self.server_process.returncode})"
-            logger.error(
-                f"[{self.scenario_name}] MCP server not ready within {self.server_start_timeout}s "
-                f"(process: {proc_status}).\n"
-                f"--- server.log ---\n{log_content[:3000]}\n--- end server.log ---"
-            )
+        # ── Step 6: Wait for HTTP readiness (thread-safe, no asyncio) ──
+        if not self._wait_for_server_http(self.server_port, self.server_start_timeout):
             self._kill_server_process()
             raise RuntimeError(
-                f"AWM MCP server failed to start within {self.server_start_timeout}s "
+                f"AWM server HTTP not ready within {self.server_start_timeout}s "
                 f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}"
             )
 
-        logger.info(f"[{self.scenario_name}] Server ready on port {self.server_port}")
-
-        # ── Step 7: Initialize MCP connection manager ──
+        # ── Step 7: Initialize MCP connection manager & verify tools ──
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
         self.mcp_manager = AWMMCPConnectionManager(mcp_url)
+
+        # Verify MCP connectivity with retry
+        max_retries = 3
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                tools = self._run_async(self.mcp_manager.list_tools())
+                if tools:
+                    logger.info(
+                        f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                    )
+                    return  # Success!
+                else:
+                    last_error = "list_tools returned empty"
+                    logger.warning(f"[{self.scenario_name}] MCP list_tools empty (attempt {attempt}/{max_retries})")
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"[{self.scenario_name}] MCP verify attempt {attempt}/{max_retries} failed: {e}")
+
+            if attempt < max_retries:
+                time.sleep(1.0 * attempt)
+
+        # All retries exhausted
+        self._kill_server_process()
+        raise RuntimeError(
+            f"MCP connection failed after {max_retries} attempts for '{self.scenario_name}': {last_error}. "
+            f"Temp dir: {self.temp_dir}"
+        )
 
     # ------------------------------------------------------------------
     # Process management
