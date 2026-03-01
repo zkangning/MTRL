@@ -208,6 +208,7 @@ When you have completed the task, provide your final answer directly without any
         # Server management
         self.server_port: Optional[int] = None
         self.server_process: Optional[subprocess.Popen] = None
+        self.server_log_file = None
         self.temp_dir: Optional[str] = None
         self.mcp_manager: Optional[AWMMCPConnectionManager] = None
         self.current_db_path: Optional[str] = None
@@ -325,9 +326,13 @@ When you have completed the task, provide your final answer directly without any
         env['HOST'] = self.server_host
         env['DATABASE_PATH'] = f"sqlite:///{self.current_db_path}"
         
+        # Use a file for stdout/stderr to avoid PIPE buffer deadlocks and make debugging easier
+        self.server_log_path = os.path.join(self.temp_dir, "server.log")
+        self.server_log_file = open(self.server_log_path, "w")
+        
         self.server_process = subprocess.Popen(
-            [sys.executable, server_path],
-            stdout=subprocess.PIPE,
+            [sys.executable, "-u", server_path],  # Use unbuffered output
+            stdout=self.server_log_file,
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
@@ -336,16 +341,21 @@ When you have completed the task, provide your final answer directly without any
         
         # Wait for server to be ready (HTTP-level check)
         if not self._wait_for_server(self.server_port, self.server_start_timeout):
-            # 尝试读取 server 输出来帮助调试
-            if self.server_process:
-                try:
-                    stdout, _ = self.server_process.communicate(timeout=2)
-                    if stdout:
-                        logger.error(f"Server stdout:\n{stdout[:2000]}")
-                except:
-                    pass
+            # Read server log for debugging
+            self.server_log_file.flush()
+            with open(self.server_log_path, "r") as f:
+                log_content = f.read()
+            
+            logger.error(f"Server start failed. Log content from {self.server_log_path}:\n{log_content}")
+            
+            # Also log the server code around the uvicorn run to see if replacement worked
+            with open(server_path, "r") as f:
+                server_code = f.read()
+                if "uvicorn.run(app, host=host, port=int(port))" not in server_code:
+                    logger.error("CRITICAL: uvicorn.run replacement NOT FOUND in generated server code!")
+            
             self._cleanup_server()
-            raise RuntimeError(f"AWM MCP server failed to start within {self.server_start_timeout}s")
+            raise RuntimeError(f"AWM MCP server failed to start within {self.server_start_timeout}s. See logs above.")
         
         # Initialize MCP connection manager (constructor acquires _MCP_ENV_LOCK)
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
@@ -385,6 +395,8 @@ When you have completed the task, provide your final answer directly without any
         """
         new_code = ['import warnings', 'warnings.filterwarnings("ignore", category=DeprecationWarning)']
         
+        uvicorn_replaced = False
+        
         for line in code.split("\n"):
             # Replace database connection
             if 'create_engine(' in line:
@@ -395,6 +407,7 @@ When you have completed the task, provide your final answer directly without any
             
             # Modify uvicorn.run to use environment variables and mount MCP
             if 'uvicorn.run(app' in line:
+                uvicorn_replaced = True
                 # Use format_raw_code_to_lines from awm.core.server
                 raw_code = f"""
                 import os
@@ -416,6 +429,9 @@ When you have completed the task, provide your final answer directly without any
                 line = f'    uvicorn.run(app, host=host, port=int(port))'
             
             new_code.append(line)
+            
+        if not uvicorn_replaced:
+            logger.warning(f"Scenario {self.scenario_name}: 'uvicorn.run(app' not found in env_code. Server might not start on correct port or enable MCP.")
         
         return "\n".join(new_code)
     
@@ -431,6 +447,13 @@ When you have completed the task, provide your final answer directly without any
                 except:
                     pass
             self.server_process = None
+            
+        if hasattr(self, 'server_log_file') and self.server_log_file:
+            try:
+                self.server_log_file.close()
+            except:
+                pass
+            self.server_log_file = None
         
         if self.temp_dir and os.path.exists(self.temp_dir):
             try:
