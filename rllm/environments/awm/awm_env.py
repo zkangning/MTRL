@@ -44,6 +44,7 @@ from awm.tools import (
     normalize_scenario_name as normalize_awm_name,
     get_random_available_port,
     tools_jsonl_save,
+    isolated_mcp_env,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,7 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
     """
 
     _MCP_SERVER_NAME = "mcp_server"
+    _settings_lock = threading.Lock()
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
         from mcp_agent.config import (
@@ -83,30 +85,35 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         self.timeout = timeout
         self._tools: list[dict] = []
 
-        class _InitOnlySettings(Settings):
-            @classmethod
-            def settings_customise_sources(
-                cls, settings_cls, init_settings, *args, **kwargs
-            ):
-                return (init_settings,)
+        # Keep mcp-agent Settings construction isolated from training env vars.
+        # isolated_mcp_env() mutates process-wide os.environ, so guard it with
+        # a lock to avoid cross-thread interference.
+        with self._settings_lock:
+            with isolated_mcp_env():
+                class _InitOnlySettings(Settings):
+                    @classmethod
+                    def settings_customise_sources(
+                        cls, settings_cls, init_settings, *args, **kwargs
+                    ):
+                        return (init_settings,)
 
-        self._settings = _InitOnlySettings(
-            execution_engine="asyncio",
-            logger=LoggerSettings(
-                type="none",
-                transports=["none"],
-                progress_display=False,
-                level="error",
-            ),
-            mcp=MCPSettings(
-                servers={
-                    self._MCP_SERVER_NAME: MCPServerSettings(
-                        transport="streamable_http",
-                        url=self.mcp_url,
+                self._settings = _InitOnlySettings(
+                    execution_engine="asyncio",
+                    logger=LoggerSettings(
+                        type="none",
+                        transports=["none"],
+                        progress_display=False,
+                        level="error",
                     ),
-                }
-            ),
-        )
+                    mcp=MCPSettings(
+                        servers={
+                            self._MCP_SERVER_NAME: MCPServerSettings(
+                                transport="streamable_http",
+                                url=self.mcp_url,
+                            ),
+                        }
+                    ),
+                )
 
     async def list_tools(self) -> list[dict]:
         from mcp_agent.app import MCPApp
