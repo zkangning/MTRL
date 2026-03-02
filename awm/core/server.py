@@ -104,8 +104,15 @@ import traceback
 import threading
 import time
 
-_shutdown_reason = "unknown"
-_resource_monitor_stop = False
+# Use a mutable container to avoid global declaration issues
+_awm_server_state = {
+    "shutdown_reason": "unknown",
+    "monitor_stop": False
+}
+
+def _set_shutdown_reason(reason):
+    """Set the shutdown reason (called before uvicorn.run)."""
+    _awm_server_state["shutdown_reason"] = reason
 
 def _get_resource_info():
     """Get current resource usage information."""
@@ -155,9 +162,8 @@ def _get_resource_info():
 
 def _resource_monitor_thread():
     """Background thread to periodically log resource usage."""
-    global _resource_monitor_stop
     last_log_time = time.time()
-    while not _resource_monitor_stop:
+    while not _awm_server_state["monitor_stop"]:
         time.sleep(5)
         if time.time() - last_log_time >= 30:  # Log every 30 seconds
             info = _get_resource_info()
@@ -165,10 +171,9 @@ def _resource_monitor_thread():
             last_log_time = time.time()
 
 def _signal_handler(signum, frame):
-    global _shutdown_reason, _resource_monitor_stop
-    _resource_monitor_stop = True
+    _awm_server_state["monitor_stop"] = True
     sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
-    _shutdown_reason = f"signal_{sig_name}"
+    _awm_server_state["shutdown_reason"] = f"signal_{sig_name}"
     print(f"[AWM_SERVER] Received signal {sig_name} ({signum})", flush=True)
     print(f"[AWM_SERVER] Resource at signal: {_get_resource_info()}", flush=True)
     print(f"[AWM_SERVER] Stack trace at signal:", flush=True)
@@ -176,9 +181,8 @@ def _signal_handler(signum, frame):
     sys.exit(0)
 
 def _atexit_handler():
-    global _shutdown_reason, _resource_monitor_stop
-    _resource_monitor_stop = True
-    print(f"[AWM_SERVER] Server shutdown - reason: {_shutdown_reason}", flush=True)
+    _awm_server_state["monitor_stop"] = True
+    print(f"[AWM_SERVER] Server shutdown - reason: {_awm_server_state['shutdown_reason']}", flush=True)
     print(f"[AWM_SERVER] PID: {os.getpid()}", flush=True)
     print(f"[AWM_SERVER] Final resource status: {_get_resource_info()}", flush=True)
 
@@ -208,28 +212,34 @@ _monitor_thread.start()
                 right = f"create_engine({sql_path}, connect_args={{'check_same_thread': False}})"
                 line = f"{left}{right}"
                         
-            if 'uvicorn.run(app' in line:
+            if 'uvicorn.run(app' in line and not uvicorn_found:
                 uvicorn_found = True
-                raw_code = f"""
-                import os
-                host = os.environ.get('HOST', '{args.host}')
-                port = os.environ.get('PORT', {args.port})
-                print(f'[AWM_SERVER] Server starting on host={{host}}, port={{port}}', flush=True)
-                """
-                lines = format_raw_code_to_lines(raw_code, indent=4)
-                raw_code = f"""
-                from fastapi_mcp import FastApiMCP
-                mcp = FastApiMCP(app)
-                mcp.mount_http()
-                print("[AWM_SERVER] MCP server enabled at /mcp", flush=True)
-                print("[AWM_SERVER] Health endpoints: /docs, /openapi.json", flush=True)
-                global _shutdown_reason
-                _shutdown_reason = "normal_exit"
-                """
-                lines += format_raw_code_to_lines(raw_code, indent=4)
-
-                line = f'    uvicorn.run(app, host=host, port=int(port))'
-                new_code.extend(lines)
+                
+                # Detect the indentation of the original uvicorn.run line
+                original_indent = len(line) - len(line.lstrip())
+                indent_str = ' ' * original_indent
+                
+                # Generate the code to insert BEFORE uvicorn.run, using the same indentation
+                pre_uvicorn_code = f'''
+{indent_str}# AWM Server initialization
+{indent_str}host = os.environ.get('HOST', '{args.host}')
+{indent_str}port = os.environ.get('PORT', {args.port})
+{indent_str}print(f'[AWM_SERVER] Server starting on host={{host}}, port={{port}}', flush=True)
+{indent_str}
+{indent_str}# Enable MCP server
+{indent_str}from fastapi_mcp import FastApiMCP
+{indent_str}mcp = FastApiMCP(app)
+{indent_str}mcp.mount_http()
+{indent_str}print("[AWM_SERVER] MCP server enabled at /mcp", flush=True)
+{indent_str}print("[AWM_SERVER] Health endpoints: /docs, /openapi.json", flush=True)
+{indent_str}
+{indent_str}# Mark shutdown reason as normal (will be overwritten by signal handler if killed)
+{indent_str}_set_shutdown_reason("normal_exit")
+'''
+                new_code.append(pre_uvicorn_code)
+                
+                # Replace the uvicorn.run line with our version that uses host/port variables
+                line = f'{indent_str}uvicorn.run(app, host=host, port=int(port))'
                 
             new_code.append(line)
 

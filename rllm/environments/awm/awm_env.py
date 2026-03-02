@@ -604,8 +604,25 @@ When you have completed the task, provide your final answer directly without any
         temp_env_json = os.path.join(self.temp_dir, "env_config.jsonl")
         tools_jsonl_save([env_config], temp_env_json)
 
-        # ── Step 3: Allocate port ──
-        self.server_port = get_random_available_port()
+        # ── Step 3: Allocate port with retry ──
+        # In high-concurrency environments, the port might be taken between allocation and use
+        max_port_retries = 3
+        for port_attempt in range(max_port_retries):
+            self.server_port = get_random_available_port()
+            # Quick check if port is still available
+            try:
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind((self.server_host, self.server_port))
+                    # Port is available, we can use it
+                    break
+            except OSError as e:
+                if port_attempt < max_port_retries - 1:
+                    logger.warning(f"[{self.scenario_name}] Port {self.server_port} unavailable, retrying...")
+                    continue
+                else:
+                    raise RuntimeError(f"Failed to allocate available port after {max_port_retries} attempts: {e}")
 
         # Temp server path for awm.core.server to write the modified code
         temp_server_path = os.path.join(self.temp_dir, "temp_server.py")
@@ -633,9 +650,12 @@ When you have completed the task, provide your final answer directly without any
 
         logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
 
-        # ── Step 5: Initial crash check (same 3s sleep as original) ──
-        logger.info(f"[{self.scenario_name}] Waiting 3s for initial startup...")
-        time.sleep(3)
+        # ── Step 5: Initial crash check ──
+        # Wait time scales with code size: base 3s + 1s per 50KB of code
+        code_size_kb = len(self.env_code) / 1024
+        initial_wait = min(3.0 + (code_size_kb / 50), 10.0)  # Cap at 10 seconds
+        logger.info(f"[{self.scenario_name}] Waiting {initial_wait:.1f}s for initial startup (code: {code_size_kb:.0f}KB)...")
+        time.sleep(initial_wait)
 
         if self.server_process.poll() is not None:
             rc = self.server_process.returncode
