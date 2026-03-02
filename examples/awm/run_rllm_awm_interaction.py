@@ -162,6 +162,10 @@ async def _run(args):
         rollout_engine_args=rollout_engine_args,
         sampling_params=sampling_params,
     )
+    # Keep interaction path consistent with examples.awm.test_single_scenario:
+    # force OpenAI-compatible chat/completions instead of completions endpoint.
+    if args.force_chat_completions:
+        engine.rollout_engine._use_chat_completions = True
 
     try:
         trajectories = await engine.execute_tasks(tasks)
@@ -195,6 +199,12 @@ def build_parser():
     parser.add_argument("--api_key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"), help="API key for OpenAI-compatible endpoint")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Max tokens per model response")
+    parser.add_argument(
+        "--force_chat_completions",
+        action="store_true",
+        default=True,
+        help="Force /v1/chat/completions path for model calls",
+    )
 
     parser.add_argument("--max_steps", type=int, default=10, help="Max env interaction steps")
     parser.add_argument("--trajectory_timeout", type=int, default=900, help="Per-trajectory timeout seconds")
