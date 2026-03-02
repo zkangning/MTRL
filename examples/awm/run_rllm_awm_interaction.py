@@ -55,10 +55,15 @@ def _pick_tasks(
     tasks_per_scenario: int,
     max_tasks: int,
 ) -> list[dict]:
+    # If a specific scenario is requested, load all scenarios first and then
+    # filter deterministically. Otherwise random scenario sampling may exclude
+    # the target scenario before filtering.
+    effective_num_scenarios = 0 if scenario else num_scenarios
+
     records = load_awm_dataset(
         dataset_path=dataset_path,
         split=split,
-        num_scenarios=num_scenarios,
+        num_scenarios=effective_num_scenarios,
         tasks_per_scenario=tasks_per_scenario,
         verification_mode="pure_code",
     )
@@ -124,6 +129,18 @@ async def _run(args):
             extra_info = json.loads(extra_info)
         print(f"  {i}. scenario={extra_info.get('scenario')} | {_format_task_preview(t)}")
 
+    tokenizer_name = args.tokenizer_name_or_path or args.model
+    logger.info("Loading tokenizer: %s", tokenizer_name)
+    try:
+        from transformers import AutoTokenizer  # pyright: ignore[reportMissingImports]
+
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load tokenizer from '{tokenizer_name}'. "
+            "Please provide --tokenizer_name_or_path with a valid local path or HF model id."
+        ) from e
+
     n_parallel = min(args.n_parallel_agents, len(tasks))
     env_args = {
         "reward_fn": awm_reward_fn if args.enable_reward else None,
@@ -147,7 +164,7 @@ async def _run(args):
 
     engine = AgentExecutionEngine(
         engine_name="openai",
-        tokenizer=None,  # use chat/completions endpoint
+        tokenizer=tokenizer,
         n_parallel_agents=n_parallel,
         trajectory_timeout=args.trajectory_timeout,
         max_steps=args.max_steps,
@@ -184,6 +201,11 @@ def build_parser():
 
     parser.add_argument("--vllm_url", required=True, help="OpenAI-compatible vLLM URL, e.g. http://127.0.0.1:8803/v1")
     parser.add_argument("--model", required=True, help="Served model name in vLLM")
+    parser.add_argument(
+        "--tokenizer_name_or_path",
+        default="",
+        help="Tokenizer name/path for RLLM parser & token accounting (defaults to --model)",
+    )
     parser.add_argument("--api_key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"), help="API key for OpenAI-compatible endpoint")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--max_new_tokens", type=int, default=1024, help="Max tokens per model response")
