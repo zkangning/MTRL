@@ -28,13 +28,7 @@ def _normalize_scenario_name(name: str) -> str:
 
 
 def _format_task_preview(task: dict[str, Any], max_len: int = 140) -> str:
-    extra_info = task.get("extra_info", {})
-    if isinstance(extra_info, str):
-        try:
-            extra_info = json.loads(extra_info)
-        except Exception:
-            extra_info = {}
-    text = str(extra_info.get("task", ""))
+    text = str(task.get("task", ""))
     return text if len(text) <= max_len else f"{text[:max_len]}..."
 
 
@@ -66,19 +60,14 @@ def _pick_tasks(
         num_scenarios=effective_num_scenarios,
         tasks_per_scenario=tasks_per_scenario,
         verification_mode="pure_code",
+        output_format="flat",
     )
 
     if scenario:
         scenario_norm = _normalize_scenario_name(scenario)
         filtered = []
         for r in records:
-            extra_info = r.get("extra_info", {})
-            if isinstance(extra_info, str):
-                try:
-                    extra_info = json.loads(extra_info)
-                except Exception:
-                    extra_info = {}
-            scenario_name = _normalize_scenario_name(str(extra_info.get("scenario", "")))
+            scenario_name = _normalize_scenario_name(str(r.get("scenario", "")))
             if scenario_name == scenario_norm:
                 filtered.append(r)
         records = filtered
@@ -124,10 +113,7 @@ async def _run(args):
 
     print("Loaded tasks:")
     for i, t in enumerate(tasks, 1):
-        extra_info = t.get("extra_info", {})
-        if isinstance(extra_info, str):
-            extra_info = json.loads(extra_info)
-        print(f"  {i}. scenario={extra_info.get('scenario')} | {_format_task_preview(t)}")
+        print(f"  {i}. scenario={t.get('scenario')} | {_format_task_preview(t)}")
 
     tokenizer_name = args.tokenizer_name_or_path or args.model
     logger.info("Loading tokenizer: %s", tokenizer_name)

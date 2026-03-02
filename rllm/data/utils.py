@@ -870,7 +870,8 @@ def load_awm_dataset(
     split: str = "train",
     num_scenarios: int = 0,
     tasks_per_scenario: int = 10,
-    verification_mode: str = "pure_code"  # "pure_code" or "sql"
+    verification_mode: str = "pure_code",  # "pure_code" or "sql"
+    output_format: str = "verl",  # "verl" (default) or "flat"
 ) -> List[Dict]:
     """
     加载 AWM (Agentic World Model) 数据集。
@@ -885,26 +886,17 @@ def load_awm_dataset(
     因此 extra_info 字段必须是一个 dict，直接包含 AWMEnvironment.from_dict 所需的
     所有字段（scenario, env_code, db_schema, db_sample, verifier_code 等）。
     
-    输出格式（每条记录）：
-    {
-        "prompt": [{"role": "user", "content": task_description}],
-        "extra_info": {  # dict，直接被 from_dict 消费
-            "index": int,
-            "scenario": str,
-            "task": str,
-            "env_code": str,
-            "db_schema": dict,
-            "db_sample": dict,
-            "verifier_code": str,
-            "max_steps": int,
-            "task_type": "awm",
-        },
-        "data_source": "awm",
-    }
+    output_format:
+      - "verl": 兼容训练管道，返回 {"prompt", "extra_info", "data_source"}
+      - "flat": 简化交互脚本使用，返回扁平字段（不含 extra_info）
     """
     logger.info(f"Loading AWM dataset from {dataset_path} ({split})...")
     logger.info(f"  num_scenarios={num_scenarios}, tasks_per_scenario={tasks_per_scenario}")
     logger.info(f"  verification_mode={verification_mode}")
+    logger.info(f"  output_format={output_format}")
+
+    if output_format not in {"verl", "flat"}:
+        raise ValueError(f"Unsupported output_format: {output_format}. Use 'verl' or 'flat'.")
     
     try:
         # 判断是本地目录还是 HuggingFace 路径
@@ -1036,11 +1028,25 @@ def load_awm_dataset(
                     "task_type": "awm",
                 }
                 
-                record = {
-                    "prompt": [{"role": "user", "content": task_description}],
-                    "extra_info": extra_info,
-                    "data_source": "awm",
-                }
+                if output_format == "flat":
+                    record = {
+                        "index": global_idx,
+                        "scenario": scenario_raw_name,
+                        "task": task_description,
+                        "env_code": env_code,
+                        "db_schema": db_schema,
+                        "db_sample": db_sample,
+                        "verifier_code": verifier_code,
+                        "max_steps": 30,
+                        "task_type": "awm",
+                        "data_source": "awm",
+                    }
+                else:
+                    record = {
+                        "prompt": [{"role": "user", "content": task_description}],
+                        "extra_info": extra_info,
+                        "data_source": "awm",
+                    }
                 processed_data.append(record)
                 global_idx += 1
         
