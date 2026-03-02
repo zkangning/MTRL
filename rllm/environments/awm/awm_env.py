@@ -384,20 +384,26 @@ When you have completed the task, provide your final answer directly without any
         
         return "\n".join(diag)
 
-    def _wait_for_server_http(self, port: int, timeout: float) -> bool:
+    def _wait_for_server_ready(self, port: int, timeout: float) -> bool:
         """
-        Wait for the FastAPI server to be ready using pure-sync HTTP checks.
+        Wait for the FastAPI + MCP server to be ready.
 
         Unlike awm/tools.py::wait_for_server() which uses asyncio.run() (incompatible
-        with ThreadPoolExecutor), this uses only stdlib urllib — no asyncio, no
-        event-loop-bound locks, fully thread-safe.
+        with ThreadPoolExecutor), this uses only stdlib urllib for TCP/HTTP checks
+        and a dedicated MCP verification step — no event-loop-bound locks, fully
+        thread-safe.
 
-        Check flow: TCP connect -> HTTP GET /docs -> return True.
-        Also checks for early process exit.
-        
-        Note on 503 errors: FastAPI may return 503 Service Unavailable during startup
-        while internal components (like MCP, database connections) are still initializing.
-        We treat 503 as "server is starting" and continue waiting.
+        Check flow:
+          1. TCP connect (fast, low-level)
+          2. HTTP GET /awm_health (dedicated health endpoint injected by server.py)
+          3. If /awm_health fails (e.g. due to global middleware in generated code),
+             fall back to TCP-only readiness
+
+        AWM-generated code sometimes includes global middlewares or lifespan handlers
+        that cause standard endpoints (/docs, /openapi.json) to return 503 even after
+        uvicorn reports "Application startup complete". The /awm_health endpoint is
+        injected after all generated routes to work around this, but if a global
+        middleware intercepts all requests, we fall back to TCP-only.
         """
         import socket
         import urllib.request
@@ -408,14 +414,11 @@ When you have completed the task, provide your final answer directly without any
         http_attempts = 0
         last_http_error = None
         last_http_status = None
-        http_503_count = 0
-        http_success_endpoints = []  # Track which endpoints responded successfully
+        http_non_200_count = 0
         
-        logger.info(f"[{self.scenario_name}] Waiting for server HTTP readiness on port {port} (timeout={timeout}s)...")
+        logger.info(f"[{self.scenario_name}] Waiting for server readiness on port {port} (timeout={timeout}s)...")
 
-        # Endpoints to check - /docs is standard FastAPI, /openapi.json is also always available
-        # We try multiple endpoints because some might be ready before others
-        check_endpoints = ["/docs", "/openapi.json"]
+        health_endpoint = "/awm_health"
 
         while time.time() - start_time < timeout:
             elapsed = time.time() - start_time
@@ -438,77 +441,62 @@ When you have completed the task, provide your final answer directly without any
                         s.settimeout(1.0)
                         s.connect((self.server_host, port))
                         tcp_ready = True
-                        logger.info(f"[{self.scenario_name}] TCP port {port} is open after {elapsed:.1f}s, checking HTTP...")
+                        logger.info(f"[{self.scenario_name}] TCP port {port} is open after {elapsed:.1f}s, checking HTTP health...")
                 except (socket.timeout, ConnectionRefusedError, OSError) as e:
-                    # Log progress every 10 seconds
                     if int(elapsed) % 10 == 0 and int(elapsed) > 0:
                         logger.debug(f"[{self.scenario_name}] Still waiting for TCP port {port} ({elapsed:.0f}s elapsed): {e}")
                     time.sleep(0.3)
                     continue
 
-            # HTTP health check - try multiple endpoints
+            # HTTP health check on dedicated endpoint
             http_attempts += 1
-            endpoint_success = False
             
-            for endpoint in check_endpoints:
-                if endpoint in http_success_endpoints:
-                    continue  # Already succeeded on this endpoint
-                    
-                try:
-                    url = f"http://{self.server_host}:{port}{endpoint}"
-                    req = urllib.request.Request(url, method='GET')
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        last_http_status = resp.status
-                        if resp.status == 200:
-                            http_success_endpoints.append(endpoint)
-                            endpoint_success = True
-                            logger.info(
-                                f"[{self.scenario_name}] Endpoint {endpoint} ready on port {port} "
-                                f"after {elapsed:.1f}s ({http_attempts} attempts)"
-                            )
-                            # If /docs is ready, server is fully ready
-                            if endpoint == "/docs":
-                                logger.info(
-                                    f"[{self.scenario_name}] Server HTTP fully ready on port {port} "
-                                    f"after {elapsed:.1f}s ({http_attempts} HTTP attempts, {http_503_count} 503 errors)"
-                                )
-                                return True
-                except urllib.error.HTTPError as e:
-                    last_http_status = e.code
-                    last_http_error = f"HTTP Error {e.code}: {e.reason}"
-                    
-                    if e.code == 503:
-                        # 503 Service Unavailable - server is starting but not ready yet
-                        http_503_count += 1
-                        if http_503_count == 1 or http_503_count % 20 == 0:
-                            logger.info(
-                                f"[{self.scenario_name}] Server returning 503 (starting up) on {endpoint} "
-                                f"({http_503_count} total, {elapsed:.1f}s elapsed)"
-                            )
-                    elif e.code == 404:
-                        # 404 might mean the endpoint doesn't exist yet
-                        pass
-                    else:
-                        # Other HTTP errors
-                        if http_attempts % 10 == 0:
-                            logger.warning(
-                                f"[{self.scenario_name}] HTTP {e.code} on {endpoint} "
-                                f"(attempt {http_attempts}, {elapsed:.1f}s elapsed)"
-                            )
-                except (urllib.error.URLError, OSError, TimeoutError) as e:
-                    last_http_error = str(e)
-                    last_http_status = None
+            try:
+                url = f"http://{self.server_host}:{port}{health_endpoint}"
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    last_http_status = resp.status
+                    if resp.status == 200:
+                        logger.info(
+                            f"[{self.scenario_name}] Server HTTP ready on port {port} "
+                            f"after {elapsed:.1f}s ({http_attempts} HTTP attempts)"
+                        )
+                        return True
+            except urllib.error.HTTPError as e:
+                last_http_status = e.code
+                last_http_error = f"HTTP Error {e.code}: {e.reason}"
+                http_non_200_count += 1
+                
+                if http_non_200_count == 1 or http_non_200_count % 20 == 0:
+                    logger.info(
+                        f"[{self.scenario_name}] Health check returned {e.code} on {health_endpoint} "
+                        f"({http_non_200_count} total non-200, {elapsed:.1f}s elapsed)"
+                    )
+                
+                # If we're getting consistent non-200 responses after the server has been
+                # running for a while, the generated code likely has a global middleware
+                # blocking all HTTP responses. Fall back to TCP-only readiness check.
+                # The MCP verification in _start_server Step 7 will do the real validation.
+                if http_non_200_count >= 10 and elapsed >= 15.0:
+                    logger.warning(
+                        f"[{self.scenario_name}] Health endpoint consistently returning {e.code} "
+                        f"({http_non_200_count} times over {elapsed:.1f}s). "
+                        f"Generated code likely has a global middleware. "
+                        f"Proceeding with TCP-only readiness — MCP verification will follow."
+                    )
+                    return True
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                last_http_error = str(e)
+                last_http_status = None
 
-            # Log progress every 10 seconds
+            # Log progress every 20 attempts
             if http_attempts % 20 == 0:
                 logger.debug(
                     f"[{self.scenario_name}] HTTP check progress: {http_attempts} attempts, "
-                    f"{http_503_count} 503s, {elapsed:.0f}s elapsed, last status: {last_http_status}"
+                    f"{elapsed:.0f}s elapsed, last status: {last_http_status}"
                 )
             
-            # Sleep between attempts - shorter if we're getting 503s (server is responding)
-            sleep_time = 0.3 if http_503_count > 0 else 0.5
-            time.sleep(sleep_time)
+            time.sleep(0.5)
 
         # Timeout - collect comprehensive diagnostic info
         elapsed = time.time() - start_time
@@ -521,15 +509,15 @@ When you have completed the task, provide your final answer directly without any
         
         # Provide specific advice based on the failure mode
         advice = ""
-        if http_503_count > 0:
+        if http_non_200_count > 0:
             advice = (
-                "\n\n[ADVICE] Server returned 503 errors - it's starting but initialization is slow.\n"
-                "  Consider increasing server_start_timeout (current: {timeout}s).\n"
-                "  For large scenarios with many database tables, try timeout=120 or timeout=180."
+                f"\n\n[ADVICE] Health endpoint returned non-200 responses ({http_non_200_count} times).\n"
+                f"  Consider increasing server_start_timeout (current: {timeout}s).\n"
+                f"  For large scenarios with many database tables, try timeout=180 or timeout=300."
             )
         elif tcp_ready and http_attempts > 0:
             advice = (
-                "\n\n[ADVICE] TCP port is open but HTTP endpoints are not responding.\n"
+                "\n\n[ADVICE] TCP port is open but health endpoint is not responding.\n"
                 "  Check the server log above for FastAPI/uvicorn startup errors.\n"
                 "  Common causes: import errors, database connection issues, MCP initialization failures."
             )
@@ -546,10 +534,9 @@ When you have completed the task, provide your final answer directly without any
             f"  - Process status: {proc_status}\n"
             f"  - TCP ready: {tcp_ready}\n"
             f"  - HTTP attempts: {http_attempts}\n"
-            f"  - HTTP 503 count: {http_503_count}\n"
+            f"  - Non-200 count: {http_non_200_count}\n"
             f"  - Last HTTP status: {last_http_status}\n"
-            f"  - Last HTTP error: {last_http_error}\n"
-            f"  - Successful endpoints: {http_success_endpoints}"
+            f"  - Last HTTP error: {last_http_error}"
             f"{advice}\n"
             f"{diag_info}\n"
             f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
@@ -565,7 +552,7 @@ When you have completed the task, provide your final answer directly without any
         3. Write env_config as jsonl (so awm.core.server can read it)
         4. Launch `python -m awm.core.server` as subprocess
         5. Sleep 3s then check if process crashed (same as original)
-        6. Wait for HTTP readiness (thread-safe, no asyncio)
+        6. Wait for server readiness (TCP + HTTP /awm_health, with middleware fallback)
         7. Verify MCP connectivity via AWMMCPConnectionManager.list_tools()
         """
         scenario_norm = normalize_awm_name(self.scenario_name)
@@ -673,12 +660,12 @@ When you have completed the task, provide your final answer directly without any
                 f"Check server.log in temp dir for details."
             )
 
-        # ── Step 6: Wait for HTTP readiness (thread-safe, no asyncio) ──
-        if not self._wait_for_server_http(self.server_port, self.server_start_timeout):
-            # Note: _wait_for_server_http already logs detailed diagnostic info on failure
-            self._kill_server_process(reason="http_readiness_timeout")
+        # ── Step 6: Wait for server readiness (TCP + HTTP health check) ──
+        if not self._wait_for_server_ready(self.server_port, self.server_start_timeout):
+            # Note: _wait_for_server_ready already logs detailed diagnostic info on failure
+            self._kill_server_process(reason="server_readiness_timeout")
             raise RuntimeError(
-                f"AWM server HTTP not ready within {self.server_start_timeout}s "
+                f"AWM server not ready within {self.server_start_timeout}s "
                 f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}. "
                 f"Check the logs above for detailed diagnostic information."
             )
@@ -687,8 +674,10 @@ When you have completed the task, provide your final answer directly without any
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
         self.mcp_manager = AWMMCPConnectionManager(mcp_url)
 
-        # Verify MCP connectivity with retry
-        max_retries = 3
+        # Verify MCP connectivity with retry.
+        # Use more retries since _wait_for_server_ready may have passed via TCP-only
+        # fallback (when generated code middleware blocks HTTP health checks).
+        max_retries = 5
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -706,7 +695,7 @@ When you have completed the task, provide your final answer directly without any
                 logger.warning(f"[{self.scenario_name}] MCP verify attempt {attempt}/{max_retries} failed: {e}")
 
             if attempt < max_retries:
-                time.sleep(1.0 * attempt)
+                time.sleep(2.0 * attempt)  # Longer backoff for MCP initialization
 
         # All retries exhausted
         self._kill_server_process(reason="mcp_verification_failed")
