@@ -590,10 +590,10 @@ When you have completed the task, provide your final answer directly without any
         temp_env_json = os.path.join(self.temp_dir, "env_config.jsonl")
         tools_jsonl_save([env_config], temp_env_json)
 
-        # ── Steps 3-7: Port allocation, server launch, and verification ──
-        # Wrapped in retry loop for robustness against port conflicts.
-        # Primary defense: _allocate_port() tracks active ports across threads.
-        # Retry handles rare conflicts with non-AWM processes.
+        # ── Steps 3-6: Server launch with retry ──
+        # Retry loop handles server startup failures (crashes, port conflicts).
+        # MCP verification (step 7) is separate — MCP client issues should NOT
+        # cause server restarts since the server itself is healthy.
         temp_server_path = os.path.join(self.temp_dir, "temp_server.py")
         max_launch_retries = 3
         last_launch_error = None
@@ -660,36 +660,7 @@ When you have completed the task, provide your final answer directly without any
                         f"Check the logs above for detailed diagnostic information."
                     )
 
-                # ── Step 7: Initialize persistent event loop & MCP executor ──
-                self._ensure_event_loop()
-                mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
-                self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
-
-                max_mcp_retries = 5
-                last_mcp_error = None
-                for mcp_attempt in range(1, max_mcp_retries + 1):
-                    try:
-                        tools = self._run_async(self._mcp_executor.list_tools())
-                        if tools:
-                            logger.info(
-                                f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
-                            )
-                            return  # Success!
-                        else:
-                            last_mcp_error = "list_tools returned empty"
-                            logger.warning(f"[{self.scenario_name}] MCP list_tools empty (attempt {mcp_attempt}/{max_mcp_retries})")
-                    except Exception as e:
-                        last_mcp_error = str(e)
-                        logger.warning(f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}")
-
-                    if mcp_attempt < max_mcp_retries:
-                        time.sleep(2.0 * mcp_attempt)
-
-                self._kill_server_process(reason="mcp_verification_failed")
-                raise RuntimeError(
-                    f"MCP connection failed after {max_mcp_retries} attempts for '{self.scenario_name}': {last_mcp_error}. "
-                    f"Temp dir: {self.temp_dir}"
-                )
+                break  # Server is up and healthy!
 
             except RuntimeError as e:
                 last_launch_error = e
@@ -703,7 +674,44 @@ When you have completed the task, provide your final answer directly without any
                     continue
                 raise
 
-        raise last_launch_error  # Should not reach here, but safety net
+        # ── Step 7: MCP verification (separate from server launch) ──
+        # MCP issues are client-side — do NOT kill a healthy server for them.
+        # Re-create the executor between retries to avoid stale mcp_agent state.
+        self._ensure_event_loop()
+        mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
+        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+
+        max_mcp_retries = 5
+        last_mcp_error = None
+        for mcp_attempt in range(1, max_mcp_retries + 1):
+            try:
+                tools = self._run_async(self._mcp_executor.list_tools())
+                if tools:
+                    logger.info(
+                        f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"[{self.scenario_name}] MCP tools list is empty — "
+                        f"proceeding anyway (FastApiMCP may not discover tools for this scenario)"
+                    )
+                    return
+            except Exception as e:
+                last_mcp_error = str(e)
+                logger.warning(f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}")
+
+            if mcp_attempt < max_mcp_retries:
+                time.sleep(2.0 * mcp_attempt)
+                try:
+                    self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+                except Exception:
+                    pass
+
+        logger.warning(
+            f"[{self.scenario_name}] MCP verification failed after {max_mcp_retries} attempts: {last_mcp_error}. "
+            f"Server is healthy — proceeding anyway. Agent tool calls may fail at runtime."
+        )
 
     # ------------------------------------------------------------------
     # Process management
