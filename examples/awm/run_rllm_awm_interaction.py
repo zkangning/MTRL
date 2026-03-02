@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import statistics
 from typing import Any
 
 from rllm.agents.awm_agent import AWMAgent
@@ -97,6 +98,27 @@ def _save_trajectories(path: str, trajectories: list):
     logger.info("Saved trajectories to %s", path)
 
 
+def _print_reward_stats(trajectories: list):
+    rewards = [float(t.reward) for t in trajectories]
+    if not rewards:
+        print("\nReward stats: no trajectories.")
+        return
+
+    mean_reward = sum(rewards) / len(rewards)
+    min_reward = min(rewards)
+    max_reward = max(rewards)
+    std_reward = statistics.pstdev(rewards) if len(rewards) > 1 else 0.0
+    positive_ratio = sum(1 for r in rewards if r > 0) / len(rewards)
+
+    print("\n=== Reward Statistics ===")
+    print(f"count          : {len(rewards)}")
+    print(f"mean_reward    : {mean_reward:.6f}")
+    print(f"std_reward     : {std_reward:.6f}")
+    print(f"min_reward     : {min_reward:.6f}")
+    print(f"max_reward     : {max_reward:.6f}")
+    print(f"positive_ratio : {positive_ratio:.2%}")
+
+
 async def _run(args):
     _maybe_set_local_no_proxy(args.vllm_url, args.no_proxy_local)
 
@@ -173,8 +195,10 @@ async def _run(args):
         engine.shutdown()
 
     print(f"\nCompleted trajectories: {len(trajectories)}")
-    for i, traj in enumerate(trajectories, 1):
-        _print_trajectory_summary(traj, i)
+    _print_reward_stats(trajectories)
+    if args.print_trajectories:
+        for i, traj in enumerate(trajectories, 1):
+            _print_trajectory_summary(traj, i)
 
     if args.save_jsonl:
         _save_trajectories(args.save_jsonl, trajectories)
@@ -212,6 +236,7 @@ def build_parser():
     parser.add_argument("--n_parallel_agents", type=int, default=1, help="Parallel active agents")
     parser.add_argument("--max_workers", type=int, default=4, help="ThreadPool workers for env ops")
     parser.add_argument("--enable_reward", action="store_true", help="Enable awm_reward_fn")
+    parser.add_argument("--print_trajectories", action="store_true", help="Print per-trajectory full summary")
     parser.add_argument("--no_proxy_local", action="store_true", help="Force NO_PROXY for localhost/127.0.0.1")
     parser.add_argument("--save_jsonl", default="", help="Optional output path for trajectory JSONL")
     return parser
