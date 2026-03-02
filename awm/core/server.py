@@ -226,17 +226,23 @@ _monitor_thread.start()
 {indent_str}port = os.environ.get('PORT', {args.port})
 {indent_str}print(f'[AWM_SERVER] Server starting on host={{host}}, port={{port}}', flush=True)
 {indent_str}
-{indent_str}# Add a dedicated health endpoint that is independent of generated code
-{indent_str}# This ensures health checks work reliably regardless of what the generated
-{indent_str}# FastAPI app code does (middlewares, lifespan, error handlers, etc.)
+{indent_str}# Build an outer gateway app so /mcp and /awm_health are isolated from
+{indent_str}# generated app middlewares that may intercept all requests and return 503.
+{indent_str}from fastapi import FastAPI
+{indent_str}api_app = app
+{indent_str}app = FastAPI()
+{indent_str}
 {indent_str}@app.get("/awm_health", include_in_schema=False)
 {indent_str}async def _awm_health_check():
 {indent_str}    return {{"status": "ok"}}
 {indent_str}
-{indent_str}# Enable MCP server
+{indent_str}# Enable MCP server from api_app, but mount it on the outer app.
 {indent_str}from fastapi_mcp import FastApiMCP
-{indent_str}mcp = FastApiMCP(app)
-{indent_str}mcp.mount_http()
+{indent_str}mcp = FastApiMCP(api_app)
+{indent_str}mcp.mount_http(app)
+{indent_str}
+{indent_str}# Mount generated API app last so explicit /mcp and /awm_health routes win.
+{indent_str}app.mount("/", api_app)
 {indent_str}print("[AWM_SERVER] MCP server enabled at /mcp", flush=True)
 {indent_str}print("[AWM_SERVER] Health endpoint: /awm_health", flush=True)
 {indent_str}
