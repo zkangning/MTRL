@@ -11,15 +11,15 @@ Server lifecycle follows awm/core/env.py::test_run_specific_env():
   4. Wait for server readiness via HTTP + MCP tool verification
 
 NOTE on threading:  Original AWM uses ProcessPoolExecutor (each env in its own
-process).  RLLM uses ThreadPoolExecutor (all envs share one process).  Therefore
-awm/tools.py::wait_for_server() (which calls asyncio.run() in a loop) cannot be
-used directly — it creates event-loop-bound asyncio.Lock conflicts.  We use a
-pure-sync HTTP readiness check instead, then verify MCP via AWMMCPConnectionManager.
+process).  RLLM uses ThreadPoolExecutor (all envs share one process).  Each
+AWMEnvironment instance maintains a *persistent* background event loop so that
+all MCP operations (list_tools / call_tool) run on the same loop — this keeps
+httpx connection pools and mcp_agent session state valid across calls.
+A _ThreadSafeMCPExecutor (subclass of awm.core.agent.MCPToolExecutor) avoids
+the thread-unsafe isolated_mcp_env() that the parent class uses.
 """
 
 import asyncio
-import contextlib
-import io
 import json
 import logging
 import os
@@ -37,6 +37,7 @@ from rllm.rewards.reward_types import RewardOutput
 
 # AWM core imports
 from awm.core.db import create_sqlite_database
+from awm.core.agent import MCPToolExecutor, format_tools_for_response
 from awm.tools import (
     normalize_scenario_name as normalize_awm_name,
     get_random_available_port,
@@ -45,101 +46,47 @@ from awm.tools import (
 
 logger = logging.getLogger(__name__)
 
-# Thread lock to protect isolated_mcp_env (which mutates os.environ globally)
-_MCP_ENV_LOCK = threading.Lock()
-
-
-class AWMMCPConnectionManager:
+class _ThreadSafeMCPExecutor(MCPToolExecutor):
     """
-    Manages connection to AWM MCP Server.
+    Thread-safe MCPToolExecutor for use in ThreadPoolExecutor.
 
-    Mirrors awm.core.agent.MCPToolExecutor exactly:
-    - __init__ creates MCPApp + Agent inside isolated_mcp_env (needs lock)
-    - list_tools / call_tool: each call does `async with app.run()` + `async with agent`
-    - contextlib.redirect_stderr suppresses mcp_agent internal log noise
+    AWM native MCPToolExecutor.__init__ calls isolated_mcp_env() which modifies
+    os.environ globally — unsafe when multiple threads share the same process.
+    This subclass constructs MCPApp / Agent with explicit Settings, avoiding any
+    global environment mutation.  All async methods (list_tools, call_tool) are
+    inherited from the parent class unchanged.
     """
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
         from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
-        from mcp_agent.config import Settings, MCPSettings, MCPServerSettings, LoggerSettings
-        from awm.tools import isolated_mcp_env
+        from mcp_agent.config import (
+            Settings, MCPSettings, MCPServerSettings, LoggerSettings,
+        )
 
         self.mcp_url = mcp_url
         self.timeout = timeout
-        self._tools: List[Dict] = []
+        self._tools: list[dict] = []
 
-        # isolated_mcp_env mutates os.environ globally -> must hold lock
-        with _MCP_ENV_LOCK:
-            with isolated_mcp_env():
-                settings = Settings(
-                    execution_engine="asyncio",
-                    logger=LoggerSettings(
-                        type="none",
-                        transports=["none"],
-                        progress_display=False,
-                        level="error",
+        settings = Settings(
+            execution_engine="asyncio",
+            logger=LoggerSettings(
+                type="none",
+                transports=["none"],
+                progress_display=False,
+                level="error",
+            ),
+            mcp=MCPSettings(
+                servers={
+                    "mcp_server": MCPServerSettings(
+                        transport="streamable_http",
+                        url=self.mcp_url,
                     ),
-                    mcp=MCPSettings(
-                        servers={
-                            "mcp_server": MCPServerSettings(
-                                transport='streamable_http',
-                                url=self.mcp_url,
-                            ),
-                        }
-                    ),
-                )
-                self._app = MCPApp(name="awm_agent", settings=settings)
-                self._agent = Agent(name="executor", server_names=["mcp_server"])
-
-    async def list_tools(self) -> List[Dict]:
-        """List available tools from MCP server."""
-        if self._tools:
-            return self._tools
-
-        with contextlib.redirect_stderr(io.StringIO()):
-            async with self._app.run():
-                async with self._agent:
-                    result = await asyncio.wait_for(
-                        self._agent.list_tools(), timeout=self.timeout
-                    )
-                    self._tools = []
-                    for t in result.tools:
-                        tool_info = {
-                            "name": t.name,
-                            "description": t.description or "",
-                            "inputSchema": t.inputSchema or {},
-                        }
-                        self._tools.append(tool_info)
-                    logger.info(f"AWM MCP: Loaded {len(self._tools)} tools from {self.mcp_url}")
-                    return self._tools
-
-    async def call_tool(self, tool_name: str, arguments: Dict) -> str:
-        """Call a tool on the MCP server."""
-        try:
-            with contextlib.redirect_stderr(io.StringIO()):
-                async with self._app.run():
-                    async with self._agent:
-                        result = await asyncio.wait_for(
-                            self._agent.call_tool(tool_name, arguments),
-                            timeout=self.timeout,
-                        )
-                        parts = []
-                        for c in result.content:
-                            if hasattr(c, 'text'):
-                                parts.append(c.text)
-                            else:
-                                parts.append(str(c))
-
-                        text = "\n".join(parts)
-                        if result.isError:
-                            return f"Error: {text}"
-                        return text
-
-        except asyncio.TimeoutError:
-            return f"Error: Tool call timed out after {self.timeout}s"
-        except Exception as e:
-            return f"Error: {e}"
+                }
+            ),
+        )
+        self._app = MCPApp(name="awm_agent", settings=settings)
+        self._agent = Agent(name="executor", server_names=["mcp_server"])
 
 
 class AWMEnvironment(BaseEnv):
@@ -225,8 +172,14 @@ When you have completed the task, provide your final answer directly without any
         self.server_log_file = None
         self.server_log_path: Optional[str] = None
         self.temp_dir: Optional[str] = None
-        self.mcp_manager: Optional[AWMMCPConnectionManager] = None
+        self._mcp_executor: Optional[_ThreadSafeMCPExecutor] = None
         self.current_db_path: Optional[str] = None
+
+        # Persistent event loop for MCP operations — shared across all tool
+        # calls for this environment instance so that httpx connection pools
+        # and mcp_agent internal state remain valid.
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._event_loop_thread: Optional[threading.Thread] = None
 
         # State tracking
         self.current_step = 0
@@ -553,7 +506,7 @@ When you have completed the task, provide your final answer directly without any
         4. Launch `python -m awm.core.server` as subprocess
         5. Sleep 3s then check if process crashed (same as original)
         6. Wait for server readiness (TCP + HTTP /awm_health, with middleware fallback)
-        7. Verify MCP connectivity via AWMMCPConnectionManager.list_tools()
+        7. Verify MCP connectivity via _ThreadSafeMCPExecutor.list_tools()
         """
         scenario_norm = normalize_awm_name(self.scenario_name)
         self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{scenario_norm}_")
@@ -670,9 +623,10 @@ When you have completed the task, provide your final answer directly without any
                 f"Check the logs above for detailed diagnostic information."
             )
 
-        # ── Step 7: Initialize MCP connection manager & verify tools ──
+        # ── Step 7: Initialize persistent event loop & MCP executor ──
+        self._ensure_event_loop()
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
-        self.mcp_manager = AWMMCPConnectionManager(mcp_url)
+        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
 
         # Verify MCP connectivity with retry.
         # Use more retries since _wait_for_server_ready may have passed via TCP-only
@@ -681,7 +635,7 @@ When you have completed the task, provide your final answer directly without any
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                tools = self._run_async(self.mcp_manager.list_tools())
+                tools = self._run_async(self._mcp_executor.list_tools())
                 if tools:
                     logger.info(
                         f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
@@ -760,7 +714,8 @@ When you have completed the task, provide your final answer directly without any
                 pass
             self.temp_dir = None
 
-        self.mcp_manager = None
+        self._mcp_executor = None
+        self._stop_event_loop()
         self.server_port = None
         self.current_db_path = None
 
@@ -866,14 +821,46 @@ When you have completed the task, provide your final answer directly without any
 
         return tool_calls
 
-    def _run_async(self, coro):
-        """Helper: run an async coroutine from sync context, safely managing the event loop."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            return loop.run_until_complete(coro)
-        finally:
-            loop.close()
+    # ------------------------------------------------------------------
+    # Persistent event loop — avoids creating / destroying a loop per
+    # MCP call which corrupts httpx / mcp_agent internal state.
+    # ------------------------------------------------------------------
+
+    def _ensure_event_loop(self):
+        """Start a persistent event loop in a background daemon thread."""
+        if self._event_loop is not None and self._event_loop.is_running():
+            return
+        self._event_loop = asyncio.new_event_loop()
+        self._event_loop_thread = threading.Thread(
+            target=self._event_loop.run_forever,
+            daemon=True,
+            name=f"awm-loop-{normalize_awm_name(self.scenario_name)[:30]}",
+        )
+        self._event_loop_thread.start()
+
+    def _stop_event_loop(self):
+        """Stop the persistent event loop and join its thread."""
+        if self._event_loop is not None and self._event_loop.is_running():
+            self._event_loop.call_soon_threadsafe(self._event_loop.stop)
+            if self._event_loop_thread is not None:
+                self._event_loop_thread.join(timeout=10)
+            try:
+                self._event_loop.close()
+            except Exception:
+                pass
+        self._event_loop = None
+        self._event_loop_thread = None
+
+    def _run_async(self, coro, timeout: float = 120.0):
+        """Submit *coro* to the persistent event loop and block for the result.
+
+        All MCP operations for this environment instance share the same loop
+        so that httpx connection pools and mcp_agent session state stay valid
+        across successive list_tools / call_tool invocations.
+        """
+        self._ensure_event_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+        return future.result(timeout=timeout)
 
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -885,10 +872,8 @@ When you have completed the task, provide your final answer directly without any
 
         if name == "list_tools":
             try:
-                tools = self._run_async(self.mcp_manager.list_tools())
+                tools = self._run_async(self._mcp_executor.list_tools())
                 self.available_tools = tools
-                # Use awm.core.agent.format_tools_for_response for formatting
-                from awm.core.agent import format_tools_for_response
                 formatted_tools = format_tools_for_response(tools)
                 return {
                     "tool": "list_tools",
@@ -908,7 +893,7 @@ When you have completed the task, provide your final answer directly without any
             tool_name, tool_args = self._parse_call_tool_arguments(arguments)
 
             try:
-                result = self._run_async(self.mcp_manager.call_tool(tool_name, tool_args))
+                result = self._run_async(self._mcp_executor.call_tool(tool_name, tool_args))
                 return {
                     "tool": tool_name,
                     "tool_call_id": tool_call_id,

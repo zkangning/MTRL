@@ -215,3 +215,4 @@ trajectories/*
 verl_agent_examples/*
 local_search_cache/*
 awm_data/*
+awm_old/*
