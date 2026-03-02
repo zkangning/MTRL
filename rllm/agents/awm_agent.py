@@ -122,7 +122,7 @@ class AWMAgent(BaseAgent):
         
         self.current_step = info.get("step", self.current_step) if info else self.current_step
 
-    def _extract_tool_calls(self, response: str) -> List[Dict[str, Any]]:
+    def _extract_tool_calls(self, response: Any) -> List[Dict[str, Any]]:
         """
         Extract tool calls from the model response.
         
@@ -139,6 +139,17 @@ class AWMAgent(BaseAgent):
         Returns:
             List of tool call dictionaries with id, name, and arguments
         """
+        # Be tolerant to non-string model outputs (e.g., None or structured
+        # objects returned by some OpenAI-compatible backends).
+        if response is None:
+            response = ""
+        elif not isinstance(response, str):
+            logger.warning(
+                "AWMAgent received non-string model response (%s); coercing to string.",
+                type(response).__name__,
+            )
+            response = str(response)
+
         tool_calls = []
         pattern = r'<tool_call>\s*(.*?)\s*</tool_call>'
         matches = re.findall(pattern, response, re.DOTALL)
@@ -178,7 +189,7 @@ class AWMAgent(BaseAgent):
         
         return tool_calls
 
-    def update_from_model(self, response: str, **kwargs) -> Action:
+    def update_from_model(self, response: Any, **kwargs) -> Action:
         """
         Update the agent's state based on the model's response.
         
@@ -189,6 +200,12 @@ class AWMAgent(BaseAgent):
         Returns:
             Action object representing the action to take
         """
+        # Normalize to string before storing in chat history and parsing.
+        if response is None:
+            response = ""
+        elif not isinstance(response, str):
+            response = str(response)
+
         # Add assistant message to chat history
         self.messages.append({"role": "assistant", "content": response})
         
