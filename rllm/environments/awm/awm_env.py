@@ -20,6 +20,8 @@ the thread-unsafe isolated_mcp_env() that the parent class uses.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import logging
 import os
@@ -60,13 +62,19 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
 
     Solution: subclass Settings with settings_customise_sources() that only
     accepts values passed via __init__, completely ignoring os.environ and
-    .env files.  All async methods (list_tools, call_tool) are inherited from
-    the parent class unchanged.
+    .env files.
+
+    CRITICAL: The mcp_agent Agent must be created INSIDE the MCPApp.run()
+    async context — Agent resolves server configurations from the app
+    context at creation time.  Creating Agent outside app.run() causes
+    silent MCP handshake failures (only SSE GET, no POST initialize).
+    list_tools() and call_tool() are overridden to follow the same pattern
+    as awm.tools.check_mcp_server() which creates Agent inside app.run().
     """
 
+    _MCP_SERVER_NAME = "mcp_server"
+
     def __init__(self, mcp_url: str, timeout: float = 60.0):
-        from mcp_agent.app import MCPApp
-        from mcp_agent.agents.agent import Agent
         from mcp_agent.config import (
             Settings, MCPSettings, MCPServerSettings, LoggerSettings,
         )
@@ -75,8 +83,6 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         self.timeout = timeout
         self._tools: list[dict] = []
 
-        # Subclass Settings to prevent pydantic_settings from reading
-        # os.environ.  Only values passed to __init__ are used.
         class _InitOnlySettings(Settings):
             @classmethod
             def settings_customise_sources(
@@ -84,7 +90,7 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
             ):
                 return (init_settings,)
 
-        settings = _InitOnlySettings(
+        self._settings = _InitOnlySettings(
             execution_engine="asyncio",
             logger=LoggerSettings(
                 type="none",
@@ -94,15 +100,65 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
             ),
             mcp=MCPSettings(
                 servers={
-                    "mcp_server": MCPServerSettings(
+                    self._MCP_SERVER_NAME: MCPServerSettings(
                         transport="streamable_http",
                         url=self.mcp_url,
                     ),
                 }
             ),
         )
-        self._app = MCPApp(name="awm_agent", settings=settings)
-        self._agent = Agent(name="executor", server_names=["mcp_server"])
+
+    async def list_tools(self) -> list[dict]:
+        from mcp_agent.app import MCPApp
+        from mcp_agent.agents.agent import Agent
+
+        app = MCPApp(name="awm_agent", settings=self._settings)
+        with contextlib.redirect_stderr(io.StringIO()):
+            async with app.run():
+                agent = Agent(
+                    name="executor",
+                    server_names=[self._MCP_SERVER_NAME],
+                )
+                async with agent:
+                    result = await asyncio.wait_for(
+                        agent.list_tools(), timeout=self.timeout
+                    )
+                    self._tools = []
+                    for t in result.tools:
+                        tool_info = {
+                            "name": t.name,
+                            "description": t.description or "",
+                            "inputSchema": t.inputSchema or {},
+                        }
+                        self._tools.append(tool_info)
+                    return self._tools
+
+    async def call_tool(self, tool_name: str, arguments: dict) -> str:
+        from mcp_agent.app import MCPApp
+        from mcp_agent.agents.agent import Agent
+
+        app = MCPApp(name="awm_agent", settings=self._settings)
+        with contextlib.redirect_stderr(io.StringIO()):
+            async with app.run():
+                agent = Agent(
+                    name="executor",
+                    server_names=[self._MCP_SERVER_NAME],
+                )
+                async with agent:
+                    result = await asyncio.wait_for(
+                        agent.call_tool(tool_name, arguments),
+                        timeout=self.timeout,
+                    )
+                    parts = []
+                    for c in result.content:
+                        if hasattr(c, "text"):
+                            parts.append(c.text)
+                        else:
+                            parts.append(str(c))
+                    text = "\n".join(parts)
+                    if result.isError:
+                        return f"Error: {text}"
+                    return text
 
 
 class AWMEnvironment(BaseEnv):
