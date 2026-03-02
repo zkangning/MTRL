@@ -50,11 +50,18 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
     """
     Thread-safe MCPToolExecutor for use in ThreadPoolExecutor.
 
-    AWM native MCPToolExecutor.__init__ calls isolated_mcp_env() which modifies
-    os.environ globally — unsafe when multiple threads share the same process.
-    This subclass constructs MCPApp / Agent with explicit Settings, avoiding any
-    global environment mutation.  All async methods (list_tools, call_tool) are
-    inherited from the parent class unchanged.
+    Two problems with the native MCPToolExecutor.__init__:
+
+    1. It calls isolated_mcp_env() which modifies os.environ globally —
+       unsafe when multiple threads share the same process.
+    2. mcp_agent.config.Settings inherits from pydantic_settings.BaseSettings,
+       which auto-reads os.environ.  Training env vars like ENV, DATABASE_PATH
+       collide with Settings fields and cause JSON parse errors.
+
+    Solution: subclass Settings with settings_customise_sources() that only
+    accepts values passed via __init__, completely ignoring os.environ and
+    .env files.  All async methods (list_tools, call_tool) are inherited from
+    the parent class unchanged.
     """
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
@@ -68,7 +75,16 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         self.timeout = timeout
         self._tools: list[dict] = []
 
-        settings = Settings(
+        # Subclass Settings to prevent pydantic_settings from reading
+        # os.environ.  Only values passed to __init__ are used.
+        class _InitOnlySettings(Settings):
+            @classmethod
+            def settings_customise_sources(
+                cls, settings_cls, init_settings, *args, **kwargs
+            ):
+                return (init_settings,)
+
+        settings = _InitOnlySettings(
             execution_engine="asyncio",
             logger=LoggerSettings(
                 type="none",
