@@ -73,7 +73,8 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
     as awm.tools.check_mcp_server() which creates Agent inside app.run().
     """
 
-    _MCP_SERVER_NAME = "mcp_server"
+    # Keep server alias consistent with awm.tools.check_mcp_server()
+    _MCP_SERVER_NAME = "mcp_tool"
     _settings_lock = threading.Lock()
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
@@ -90,14 +91,9 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         # a lock to avoid cross-thread interference.
         with self._settings_lock:
             with isolated_mcp_env():
-                class _InitOnlySettings(Settings):
-                    @classmethod
-                    def settings_customise_sources(
-                        cls, settings_cls, init_settings, *args, **kwargs
-                    ):
-                        return (init_settings,)
-
-                self._settings = _InitOnlySettings(
+                # Use the same Settings construction pattern as
+                # awm.tools.check_mcp_server() for maximum compatibility.
+                self._settings = Settings(
                     execution_engine="asyncio",
                     logger=LoggerSettings(
                         type="none",
