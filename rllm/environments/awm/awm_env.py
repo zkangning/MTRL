@@ -12,9 +12,9 @@ Server lifecycle follows awm/core/env.py::test_run_specific_env():
 
 NOTE on threading:  Original AWM uses ProcessPoolExecutor (each env in its own
 process).  RLLM uses ThreadPoolExecutor (all envs share one process).  Each
-AWMEnvironment instance maintains a *persistent* background event loop so that
-all MCP operations (list_tools / call_tool) run on the same loop — this keeps
-httpx connection pools and mcp_agent session state valid across calls.
+MCP operation (list_tools / call_tool) uses asyncio.run() to create a fresh
+event loop — the mcp_agent library requires this; persistent background loops
+cause the MCP initialization handshake to fail silently.
 A _ThreadSafeMCPExecutor (subclass of awm.core.agent.MCPToolExecutor) avoids
 the thread-unsafe isolated_mcp_env() that the parent class uses.
 """
@@ -195,12 +195,6 @@ When you have completed the task, provide your final answer directly without any
         self.temp_dir: Optional[str] = None
         self._mcp_executor: Optional[_ThreadSafeMCPExecutor] = None
         self.current_db_path: Optional[str] = None
-
-        # Persistent event loop for MCP operations — shared across all tool
-        # calls for this environment instance so that httpx connection pools
-        # and mcp_agent internal state remain valid.
-        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._event_loop_thread: Optional[threading.Thread] = None
 
         # State tracking
         self.current_step = 0
@@ -677,7 +671,6 @@ When you have completed the task, provide your final answer directly without any
         # ── Step 7: MCP verification (separate from server launch) ──
         # MCP issues are client-side — do NOT kill a healthy server for them.
         # Re-create the executor between retries to avoid stale mcp_agent state.
-        self._ensure_event_loop()
         mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
         self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
 
@@ -770,7 +763,6 @@ When you have completed the task, provide your final answer directly without any
             self.temp_dir = None
 
         self._mcp_executor = None
-        self._stop_event_loop()
         self._release_port()
         self.server_port = None
         self.current_db_path = None
@@ -878,45 +870,22 @@ When you have completed the task, provide your final answer directly without any
         return tool_calls
 
     # ------------------------------------------------------------------
-    # Persistent event loop — avoids creating / destroying a loop per
-    # MCP call which corrupts httpx / mcp_agent internal state.
+    # Async execution — each MCP call uses asyncio.run() with a fresh
+    # event loop.  The mcp_agent library does not work correctly on
+    # persistent background event loops (only SSE GET is sent; the
+    # initialization POSTs never fire).  This is safe because each
+    # list_tools / call_tool call creates entirely new async contexts
+    # (async with self._app.run(), async with self._agent).
     # ------------------------------------------------------------------
 
-    def _ensure_event_loop(self):
-        """Start a persistent event loop in a background daemon thread."""
-        if self._event_loop is not None and self._event_loop.is_running():
-            return
-        self._event_loop = asyncio.new_event_loop()
-        self._event_loop_thread = threading.Thread(
-            target=self._event_loop.run_forever,
-            daemon=True,
-            name=f"awm-loop-{normalize_awm_name(self.scenario_name)[:30]}",
-        )
-        self._event_loop_thread.start()
+    def _run_async(self, coro, timeout: float = 120.0):  # noqa: ARG002
+        """Run *coro* in a fresh event loop via asyncio.run().
 
-    def _stop_event_loop(self):
-        """Stop the persistent event loop and join its thread."""
-        if self._event_loop is not None and self._event_loop.is_running():
-            self._event_loop.call_soon_threadsafe(self._event_loop.stop)
-            if self._event_loop_thread is not None:
-                self._event_loop_thread.join(timeout=10)
-            try:
-                self._event_loop.close()
-            except Exception:
-                pass
-        self._event_loop = None
-        self._event_loop_thread = None
-
-    def _run_async(self, coro, timeout: float = 120.0):
-        """Submit *coro* to the persistent event loop and block for the result.
-
-        All MCP operations for this environment instance share the same loop
-        so that httpx connection pools and mcp_agent session state stay valid
-        across successive list_tools / call_tool invocations.
+        Called from ThreadPoolExecutor worker threads (no existing event loop),
+        so asyncio.run() works directly.  The individual coroutines (list_tools,
+        call_tool) already contain their own asyncio.wait_for timeouts.
         """
-        self._ensure_event_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
-        return future.result(timeout=timeout)
+        return asyncio.run(coro)
 
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """

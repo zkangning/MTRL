@@ -181,14 +181,8 @@ def diagnose_rllm_executor(host: str, port: int):
     mcp_url = f"http://{host}:{port}/mcp"
     executor = _ThreadSafeMCPExecutor(mcp_url)
 
-    loop = asyncio.new_event_loop()
-    import threading
-    t = threading.Thread(target=loop.run_forever, daemon=True)
-    t.start()
-
     try:
-        future = asyncio.run_coroutine_threadsafe(executor.list_tools(), loop)
-        tools = future.result(timeout=30)
+        tools = asyncio.run(executor.list_tools())
         print(f"  Tools returned: {len(tools)}")
         if tools:
             for i, tool in enumerate(tools[:10], 1):
@@ -196,15 +190,11 @@ def diagnose_rllm_executor(host: str, port: int):
             if len(tools) > 10:
                 print(f"    ... and {len(tools) - 10} more")
         else:
-            print("  *** EMPTY — this is the bug that causes server kills ***")
+            print("  *** EMPTY — executor did not discover tools ***")
         return tools
     except Exception as e:
         print(f"  EXCEPTION: {type(e).__name__}: {e}")
         return []
-    finally:
-        loop.call_soon_threadsafe(loop.stop)
-        t.join(timeout=5)
-        loop.close()
 
 
 def diagnose_awm_environment(scenario_data: dict):
