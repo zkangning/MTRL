@@ -61,9 +61,10 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
        which auto-reads os.environ.  Training env vars like ENV, DATABASE_PATH
        collide with Settings fields and cause JSON parse errors.
 
-    Solution: subclass Settings with settings_customise_sources() that only
-    accepts values passed via __init__, completely ignoring os.environ and
-    .env files.
+    Solution: use isolated_mcp_env() with a process-wide lock, and construct
+    mcp-agent Settings inside the isolated context for each request. This keeps
+    behavior aligned with awm.tools.check_mcp_server() while remaining
+    thread-safe for RLLM's ThreadPoolExecutor.
 
     CRITICAL: The mcp_agent Agent must be created INSIDE the MCPApp.run()
     async context — Agent resolves server configurations from the app
@@ -78,90 +79,158 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
     _settings_lock = threading.Lock()
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
-        from mcp_agent.config import (
-            Settings, MCPSettings, MCPServerSettings, LoggerSettings,
-        )
-
         self.mcp_url = mcp_url
         self.timeout = timeout
         self._tools: list[dict] = []
+        # Legacy implementation (kept as comments per request):
+        # from mcp_agent.config import (
+        #     Settings, MCPSettings, MCPServerSettings, LoggerSettings,
+        # )
+        # with self._settings_lock:
+        #     with isolated_mcp_env():
+        #         self._settings = Settings(
+        #             execution_engine="asyncio",
+        #             logger=LoggerSettings(
+        #                 type="none",
+        #                 transports=["none"],
+        #                 progress_display=False,
+        #                 level="error",
+        #             ),
+        #             mcp=MCPSettings(
+        #                 servers={
+        #                     self._MCP_SERVER_NAME: MCPServerSettings(
+        #                         transport="streamable_http",
+        #                         url=self.mcp_url,
+        #                     ),
+        #                 }
+        #             ),
+        #         )
 
-        # Keep mcp-agent Settings construction isolated from training env vars.
-        # isolated_mcp_env() mutates process-wide os.environ, so guard it with
-        # a lock to avoid cross-thread interference.
-        with self._settings_lock:
-            with isolated_mcp_env():
-                # Use the same Settings construction pattern as
-                # awm.tools.check_mcp_server() for maximum compatibility.
-                self._settings = Settings(
-                    execution_engine="asyncio",
-                    logger=LoggerSettings(
-                        type="none",
-                        transports=["none"],
-                        progress_display=False,
-                        level="error",
+    def _build_settings(self):
+        from mcp_agent.config import (
+            Settings, MCPSettings, MCPServerSettings, LoggerSettings,
+        )
+        return Settings(
+            execution_engine="asyncio",
+            logger=LoggerSettings(
+                type="none",
+                transports=["none"],
+                progress_display=False,
+                level="error",
+            ),
+            mcp=MCPSettings(
+                servers={
+                    self._MCP_SERVER_NAME: MCPServerSettings(
+                        transport="streamable_http",
+                        url=self.mcp_url,
                     ),
-                    mcp=MCPSettings(
-                        servers={
-                            self._MCP_SERVER_NAME: MCPServerSettings(
-                                transport="streamable_http",
-                                url=self.mcp_url,
-                            ),
-                        }
-                    ),
-                )
+                }
+            ),
+        )
 
     async def list_tools(self) -> list[dict]:
         from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
 
-        app = MCPApp(name="awm_agent", settings=self._settings)
-        with contextlib.redirect_stderr(io.StringIO()):
-            async with app.run():
-                agent = Agent(
-                    name="executor",
-                    server_names=[self._MCP_SERVER_NAME],
-                )
-                async with agent:
-                    result = await asyncio.wait_for(
-                        agent.list_tools(), timeout=self.timeout
-                    )
-                    self._tools = []
-                    for t in result.tools:
-                        tool_info = {
-                            "name": t.name,
-                            "description": t.description or "",
-                            "inputSchema": t.inputSchema or {},
-                        }
-                        self._tools.append(tool_info)
-                    return self._tools
+        # Legacy implementation (kept as comments per request):
+        # app = MCPApp(name="awm_agent", settings=self._settings)
+        # with contextlib.redirect_stderr(io.StringIO()):
+        #     async with app.run():
+        #         agent = Agent(
+        #             name="executor",
+        #             server_names=[self._MCP_SERVER_NAME],
+        #         )
+        #         async with agent:
+        #             result = await asyncio.wait_for(
+        #                 agent.list_tools(), timeout=self.timeout
+        #             )
+        #             self._tools = []
+        #             for t in result.tools:
+        #                 tool_info = {
+        #                     "name": t.name,
+        #                     "description": t.description or "",
+        #                     "inputSchema": t.inputSchema or {},
+        #                 }
+        #                 self._tools.append(tool_info)
+        #             return self._tools
+
+        # Match awm.tools.check_mcp_server() lifecycle:
+        # isolate env -> build settings -> app.run() -> create Agent -> list_tools.
+        with self._settings_lock:
+            with isolated_mcp_env():
+                app = MCPApp(name="awm_agent", settings=self._build_settings())
+                with contextlib.redirect_stderr(io.StringIO()):
+                    async with app.run():
+                        agent = Agent(
+                            name="executor",
+                            server_names=[self._MCP_SERVER_NAME],
+                        )
+                        async with agent:
+                            result = await asyncio.wait_for(
+                                agent.list_tools(), timeout=self.timeout
+                            )
+                            self._tools = []
+                            for t in result.tools:
+                                tool_info = {
+                                    "name": t.name,
+                                    "description": t.description or "",
+                                    "inputSchema": t.inputSchema or {},
+                                }
+                                self._tools.append(tool_info)
+                            return self._tools
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
         from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
 
-        app = MCPApp(name="awm_agent", settings=self._settings)
-        with contextlib.redirect_stderr(io.StringIO()):
-            async with app.run():
-                agent = Agent(
-                    name="executor",
-                    server_names=[self._MCP_SERVER_NAME],
-                )
-                async with agent:
-                    result = await asyncio.wait_for(
-                        agent.call_tool(tool_name, arguments),
-                        timeout=self.timeout,
-                    )
-                    parts = []
-                    for c in result.content:
-                        if hasattr(c, "text"):
-                            parts.append(c.text)
-                        else:
-                            parts.append(str(c))
-                    text = "\n".join(parts)
-                    if result.isError:
-                        return f"Error: {text}"
-                    return text
+        # Legacy implementation (kept as comments per request):
+        # app = MCPApp(name="awm_agent", settings=self._settings)
+        # with contextlib.redirect_stderr(io.StringIO()):
+        #     async with app.run():
+        #         agent = Agent(
+        #             name="executor",
+        #             server_names=[self._MCP_SERVER_NAME],
+        #         )
+        #         async with agent:
+        #             result = await asyncio.wait_for(
+        #                 agent.call_tool(tool_name, arguments),
+        #                 timeout=self.timeout,
+        #             )
+        #             parts = []
+        #             for c in result.content:
+        #                 if hasattr(c, "text"):
+        #                     parts.append(c.text)
+        #                 else:
+        #                     parts.append(str(c))
+        #             text = "\n".join(parts)
+        #             if result.isError:
+        #                 return f"Error: {text}"
+        #             return text
+
+        with self._settings_lock:
+            with isolated_mcp_env():
+                app = MCPApp(name="awm_agent", settings=self._build_settings())
+                with contextlib.redirect_stderr(io.StringIO()):
+                    async with app.run():
+                        agent = Agent(
+                            name="executor",
+                            server_names=[self._MCP_SERVER_NAME],
+                        )
+                        async with agent:
+                            result = await asyncio.wait_for(
+                                agent.call_tool(tool_name, arguments),
+                                timeout=self.timeout,
+                            )
+                            parts = []
+                            for c in result.content:
+                                if hasattr(c, "text"):
+                                    parts.append(c.text)
+                                else:
+                                    parts.append(str(c))
+                            text = "\n".join(parts)
+                            if result.isError:
+                                return f"Error: {text}"
+                            return text
 
 
 class AWMEnvironment(BaseEnv):
