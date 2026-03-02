@@ -153,6 +153,11 @@ or
 When you have completed the task, provide your final answer directly without any tool calls.
 """
 
+    # Process-level port management: prevents duplicate port allocation
+    # across concurrent threads in ThreadPoolExecutor.
+    _port_lock = threading.Lock()
+    _active_ports: set = set()
+
     def __init__(
         self,
         scenario_name: str,
@@ -512,6 +517,31 @@ When you have completed the task, provide your final answer directly without any
         )
         return False
 
+    def _allocate_port(self) -> int:
+        """Allocate a unique port not used by any other AWMEnvironment instance in this process."""
+        with AWMEnvironment._port_lock:
+            max_attempts = 50
+            for _ in range(max_attempts):
+                port = get_random_available_port()
+                if port not in AWMEnvironment._active_ports:
+                    AWMEnvironment._active_ports.add(port)
+                    logger.info(
+                        f"[{self.scenario_name}] Allocated port {port} "
+                        f"({len(AWMEnvironment._active_ports)} active)"
+                    )
+                    return port
+            raise RuntimeError(
+                f"Failed to allocate unique port after {max_attempts} attempts "
+                f"({len(AWMEnvironment._active_ports)} ports active)"
+            )
+
+    def _release_port(self):
+        """Release the allocated port back to the available pool."""
+        if self.server_port is not None:
+            with AWMEnvironment._port_lock:
+                AWMEnvironment._active_ports.discard(self.server_port)
+            logger.debug(f"[{self.scenario_name}] Released port {self.server_port}")
+
     def _start_server(self):
         """
         Start AWM MCP server — follows awm/core/env.py::test_run_specific_env():
@@ -560,119 +590,120 @@ When you have completed the task, provide your final answer directly without any
         temp_env_json = os.path.join(self.temp_dir, "env_config.jsonl")
         tools_jsonl_save([env_config], temp_env_json)
 
-        # ── Step 3: Allocate port with retry ──
-        # In high-concurrency environments, the port might be taken between allocation and use
-        max_port_retries = 3
-        for port_attempt in range(max_port_retries):
-            self.server_port = get_random_available_port()
-            # Quick check if port is still available
-            try:
-                import socket
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.bind((self.server_host, self.server_port))
-                    # Port is available, we can use it
-                    break
-            except OSError as e:
-                if port_attempt < max_port_retries - 1:
-                    logger.warning(f"[{self.scenario_name}] Port {self.server_port} unavailable, retrying...")
-                    continue
-                else:
-                    raise RuntimeError(f"Failed to allocate available port after {max_port_retries} attempts: {e}")
-
-        # Temp server path for awm.core.server to write the modified code
+        # ── Steps 3-7: Port allocation, server launch, and verification ──
+        # Wrapped in retry loop for robustness against port conflicts.
+        # Primary defense: _allocate_port() tracks active ports across threads.
+        # Retry handles rare conflicts with non-AWM processes.
         temp_server_path = os.path.join(self.temp_dir, "temp_server.py")
+        max_launch_retries = 3
+        last_launch_error = None
 
-        # ── Step 4: Launch subprocess — identical to awm/core/env.py:161-174 ──
-        logger.info(f"[{self.scenario_name}] Starting AWM server on port {self.server_port}...")
-
-        self.server_log_path = os.path.join(self.temp_dir, "server.log")
-        self.server_log_file = open(self.server_log_path, "w")
-
-        self.server_process = subprocess.Popen(
-            [
-                sys.executable, '-m', 'awm.core.server',
-                '--port', str(self.server_port),
-                '--scenario', scenario_norm,
-                '--db_path', self.current_db_path,
-                '--temp_server_path', temp_server_path,
-                '--envs_load_path', temp_env_json,
-            ],
-            stdout=self.server_log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            text=True,
-        )
-
-        logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
-
-        # ── Step 5: Initial crash check ──
-        # Wait time scales with code size: base 3s + 1s per 50KB of code
-        code_size_kb = len(self.env_code) / 1024
-        initial_wait = min(3.0 + (code_size_kb / 50), 10.0)  # Cap at 10 seconds
-        logger.info(f"[{self.scenario_name}] Waiting {initial_wait:.1f}s for initial startup (code: {code_size_kb:.0f}KB)...")
-        time.sleep(initial_wait)
-
-        if self.server_process.poll() is not None:
-            rc = self.server_process.returncode
-            log_content = self._read_server_log()
-            diag_info = self._get_diagnostic_info()
-            logger.error(
-                f"[{self.scenario_name}] SERVER CRASHED ON STARTUP (exit code {rc})\n"
-                f"{diag_info}\n"
-                f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
-            )
-            self._kill_server_process(reason="crashed_on_startup")
-            raise RuntimeError(
-                f"AWM server crashed on startup for '{self.scenario_name}' (exit code {rc}). "
-                f"Temp dir preserved for debugging: {self.temp_dir}. "
-                f"Check server.log in temp dir for details."
-            )
-
-        # ── Step 6: Wait for server readiness (TCP + HTTP health check) ──
-        if not self._wait_for_server_ready(self.server_port, self.server_start_timeout):
-            # Note: _wait_for_server_ready already logs detailed diagnostic info on failure
-            self._kill_server_process(reason="server_readiness_timeout")
-            raise RuntimeError(
-                f"AWM server not ready within {self.server_start_timeout}s "
-                f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}. "
-                f"Check the logs above for detailed diagnostic information."
-            )
-
-        # ── Step 7: Initialize persistent event loop & MCP executor ──
-        self._ensure_event_loop()
-        mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
-        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
-
-        # Verify MCP connectivity with retry.
-        # Use more retries since _wait_for_server_ready may have passed via TCP-only
-        # fallback (when generated code middleware blocks HTTP health checks).
-        max_retries = 5
-        last_error = None
-        for attempt in range(1, max_retries + 1):
+        for launch_attempt in range(1, max_launch_retries + 1):
             try:
-                tools = self._run_async(self._mcp_executor.list_tools())
-                if tools:
-                    logger.info(
-                        f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                # ── Step 3: Allocate port (thread-safe, unique across instances) ──
+                self.server_port = self._allocate_port()
+
+                # ── Step 4: Launch subprocess ──
+                logger.info(
+                    f"[{self.scenario_name}] Starting AWM server on port {self.server_port} "
+                    f"(attempt {launch_attempt}/{max_launch_retries})..."
+                )
+
+                self.server_log_path = os.path.join(self.temp_dir, "server.log")
+                self.server_log_file = open(self.server_log_path, "w")
+
+                self.server_process = subprocess.Popen(
+                    [
+                        sys.executable, '-m', 'awm.core.server',
+                        '--port', str(self.server_port),
+                        '--scenario', scenario_norm,
+                        '--db_path', self.current_db_path,
+                        '--temp_server_path', temp_server_path,
+                        '--envs_load_path', temp_env_json,
+                    ],
+                    stdout=self.server_log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    text=True,
+                )
+
+                logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
+
+                # ── Step 5: Initial crash check ──
+                code_size_kb = len(self.env_code) / 1024
+                initial_wait = min(3.0 + (code_size_kb / 50), 10.0)
+                logger.info(f"[{self.scenario_name}] Waiting {initial_wait:.1f}s for initial startup (code: {code_size_kb:.0f}KB)...")
+                time.sleep(initial_wait)
+
+                if self.server_process.poll() is not None:
+                    rc = self.server_process.returncode
+                    log_content = self._read_server_log()
+                    diag_info = self._get_diagnostic_info()
+                    logger.error(
+                        f"[{self.scenario_name}] SERVER CRASHED ON STARTUP (exit code {rc})\n"
+                        f"{diag_info}\n"
+                        f"--- SERVER LOG (server.log) ---\n{log_content}\n--- END SERVER LOG ---"
                     )
-                    return  # Success!
-                else:
-                    last_error = "list_tools returned empty"
-                    logger.warning(f"[{self.scenario_name}] MCP list_tools empty (attempt {attempt}/{max_retries})")
-            except Exception as e:
-                last_error = str(e)
-                logger.warning(f"[{self.scenario_name}] MCP verify attempt {attempt}/{max_retries} failed: {e}")
+                    self._kill_server_process(reason="crashed_on_startup")
+                    raise RuntimeError(
+                        f"AWM server crashed on startup for '{self.scenario_name}' (exit code {rc}). "
+                        f"Temp dir preserved for debugging: {self.temp_dir}. "
+                        f"Check server.log in temp dir for details."
+                    )
 
-            if attempt < max_retries:
-                time.sleep(2.0 * attempt)  # Longer backoff for MCP initialization
+                # ── Step 6: Wait for server readiness (TCP + HTTP health check) ──
+                if not self._wait_for_server_ready(self.server_port, self.server_start_timeout):
+                    self._kill_server_process(reason="server_readiness_timeout")
+                    raise RuntimeError(
+                        f"AWM server not ready within {self.server_start_timeout}s "
+                        f"for scenario '{self.scenario_name}'. Temp dir: {self.temp_dir}. "
+                        f"Check the logs above for detailed diagnostic information."
+                    )
 
-        # All retries exhausted
-        self._kill_server_process(reason="mcp_verification_failed")
-        raise RuntimeError(
-            f"MCP connection failed after {max_retries} attempts for '{self.scenario_name}': {last_error}. "
-            f"Temp dir: {self.temp_dir}"
-        )
+                # ── Step 7: Initialize persistent event loop & MCP executor ──
+                self._ensure_event_loop()
+                mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
+                self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+
+                max_mcp_retries = 5
+                last_mcp_error = None
+                for mcp_attempt in range(1, max_mcp_retries + 1):
+                    try:
+                        tools = self._run_async(self._mcp_executor.list_tools())
+                        if tools:
+                            logger.info(
+                                f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                            )
+                            return  # Success!
+                        else:
+                            last_mcp_error = "list_tools returned empty"
+                            logger.warning(f"[{self.scenario_name}] MCP list_tools empty (attempt {mcp_attempt}/{max_mcp_retries})")
+                    except Exception as e:
+                        last_mcp_error = str(e)
+                        logger.warning(f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}")
+
+                    if mcp_attempt < max_mcp_retries:
+                        time.sleep(2.0 * mcp_attempt)
+
+                self._kill_server_process(reason="mcp_verification_failed")
+                raise RuntimeError(
+                    f"MCP connection failed after {max_mcp_retries} attempts for '{self.scenario_name}': {last_mcp_error}. "
+                    f"Temp dir: {self.temp_dir}"
+                )
+
+            except RuntimeError as e:
+                last_launch_error = e
+                self._kill_server_process(reason=f"launch_retry_{launch_attempt}")
+                self._release_port()
+                if launch_attempt < max_launch_retries:
+                    logger.warning(
+                        f"[{self.scenario_name}] Server launch attempt {launch_attempt}/{max_launch_retries} "
+                        f"failed: {e}. Retrying with new port..."
+                    )
+                    continue
+                raise
+
+        raise last_launch_error  # Should not reach here, but safety net
 
     # ------------------------------------------------------------------
     # Process management
@@ -732,6 +763,7 @@ When you have completed the task, provide your final answer directly without any
 
         self._mcp_executor = None
         self._stop_event_loop()
+        self._release_port()
         self.server_port = None
         self.current_db_path = None
 
