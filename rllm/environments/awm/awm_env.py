@@ -303,6 +303,16 @@ When you have completed the task, provide your final answer directly without any
     _port_lock = threading.Lock()
     _active_ports: set = set()
 
+    # Process-level MCP initialization lock: serializes MCP executor creation
+    # and tool verification across all AWMEnvironment instances.
+    #
+    # When multiple threads concurrently create MCP connections (e.g. same
+    # scenario with tasks_per_scenario > 1), the underlying mcp_agent library
+    # can deadlock inside asyncio.run() due to global state / event-loop
+    # interactions. Serializing MCP verification eliminates this race at the
+    # cost of slightly slower startup for parallel environments.
+    _mcp_init_lock = threading.Lock()
+
     def __init__(
         self,
         scenario_name: str,
@@ -878,14 +888,24 @@ When you have completed the task, provide your final answer directly without any
                     )
 
                 # ── Step 7: MCP verification (must discover non-empty tools) ──
+                #
+                # CRITICAL: Serialize MCP initialization across all AWMEnvironment
+                # instances using a process-level lock. When multiple threads
+                # concurrently create MCP connections (e.g. tasks_per_scenario > 1),
+                # the mcp_agent library can deadlock inside asyncio.run() due to
+                # global state / event-loop interactions. The lock scope covers
+                # only the executor creation + first list_tools() verification;
+                # subsequent call_tool() / list_tools() calls during agent
+                # interaction run without this lock.
                 mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
-                self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
                 last_mcp_error = None
 
                 for mcp_attempt in range(1, max_mcp_retries + 1):
                     try:
-                        # Give explicit timeout here to prevent hidden hangs in MCP startup.
-                        tools = self._run_async(self._mcp_executor.list_tools(), timeout=60.0)
+                        with AWMEnvironment._mcp_init_lock:
+                            self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+                            # Give explicit timeout here to prevent hidden hangs in MCP startup.
+                            tools = self._run_async(self._mcp_executor.list_tools(), timeout=60.0)
                         if tools:
                             logger.info(
                                 f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
@@ -906,15 +926,13 @@ When you have completed the task, provide your final answer directly without any
 
                     if mcp_attempt < max_mcp_retries:
                         time.sleep(2.0 * mcp_attempt)
-                        # Re-create executor between attempts to avoid stale mcp_agent state.
-                        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
 
                 raise RuntimeError(
                     f"MCP verification failed after {max_mcp_retries} attempts "
                     f"(last_error={last_mcp_error})"
                 )
 
-            except RuntimeError as e:
+            except (RuntimeError, TimeoutError) as e:
                 self._kill_server_process(reason=f"launch_retry_{launch_attempt}")
                 self._release_port()
                 if launch_attempt < max_launch_retries:
@@ -923,7 +941,7 @@ When you have completed the task, provide your final answer directly without any
                         f"failed: {e}. Retrying with new port..."
                     )
                     continue
-                raise
+                raise RuntimeError(str(e)) from e
 
     def prestart(self):
         """
@@ -1124,13 +1142,54 @@ When you have completed the task, provide your final answer directly without any
     # ------------------------------------------------------------------
 
     def _run_async(self, coro, timeout: float = 120.0):
-        """Run *coro* in a fresh event loop via asyncio.run().
+        """Run *coro* in a fresh event loop via asyncio.run(), with a thread-level
+        hard timeout as a safety net.
 
         Called from ThreadPoolExecutor worker threads (no existing event loop),
         so asyncio.run() works directly.  The individual coroutines (list_tools,
         call_tool) already contain their own asyncio.wait_for timeouts.
+
+        However, when multiple ThreadPoolExecutor threads concurrently create
+        MCP connections (e.g. same scenario with tasks_per_scenario > 1), the
+        underlying mcp_agent library can occasionally deadlock inside
+        asyncio.run(), causing the asyncio-level timeout to never fire.
+
+        To guard against this, we run asyncio.run() inside a daemon thread with
+        a hard wall-clock timeout.  If the inner call doesn't return within
+        *timeout* seconds, the daemon thread is abandoned and a TimeoutError
+        is raised, allowing the caller (_start_server retry loop) to recover.
         """
-        return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+        result_container: dict = {}
+
+        def _target():
+            try:
+                result_container["value"] = asyncio.run(
+                    asyncio.wait_for(coro, timeout=timeout)
+                )
+            except Exception as e:
+                result_container["error"] = e
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        # Use a generous multiplier so the inner asyncio timeout fires first
+        # under normal circumstances; the hard timeout only kicks in on deadlocks.
+        hard_timeout = timeout + 30.0
+        t.join(timeout=hard_timeout)
+
+        if t.is_alive():
+            logger.error(
+                f"[{self.scenario_name}] _run_async hard timeout after {hard_timeout:.0f}s — "
+                f"asyncio.run() likely deadlocked. Abandoning coroutine."
+            )
+            raise TimeoutError(
+                f"_run_async hard timeout ({hard_timeout:.0f}s) for scenario "
+                f"'{self.scenario_name}'. MCP connection likely deadlocked."
+            )
+
+        if "error" in result_container:
+            raise result_container["error"]
+
+        return result_container.get("value")
 
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """

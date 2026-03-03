@@ -199,7 +199,19 @@ class AgentExecutionEngine:
 
         # Reset environment with the task using the executor
         loop = asyncio.get_event_loop()
-        observation, info = await loop.run_in_executor(self.executor, env.reset)
+        try:
+            observation, info = await asyncio.wait_for(
+                loop.run_in_executor(self.executor, env.reset),
+                timeout=self.trajectory_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Trajectory {idx}: env.reset() timed out after {self.trajectory_timeout}s")
+            # Ensure environment is cleaned up even on timeout
+            try:
+                await loop.run_in_executor(self.executor, env.close)
+            except Exception:
+                pass
+            raise RuntimeError(f"Trajectory {idx}: env.reset() timed out after {self.trajectory_timeout}s")
         
         # 【新增】从 info 中获取任务级别的配置参数
         # 优先使用任务级别配置，如果不存在则使用全局默认值
@@ -586,16 +598,54 @@ class AgentExecutionEngine:
                     if completed % 10 == 0: # 减少打印频率
                         colorful_print(f"Progress: {completed}/{total} trajectories completed", "cyan")
                     return task_id, res
-                    
+
+                except Exception as e:
+                    # Ensure environment is cleaned up on failure to prevent
+                    # leaked server processes and ports.
+                    logger.error(f"Task {task_id} failed: {e}")
+                    if self.envs[index] is not None:
+                        try:
+                            self.envs[index].close()
+                        except Exception:
+                            pass
+                    raise
+
                 finally:
                     # Put the index back in the queue when done
                     await index_queue.put(index)
 
-        # Run all tasks concurrently
-        results = await asyncio.gather(*[sem_wrapper(task_id, task) for task_id, task in task_queue])
+        # Run all tasks concurrently.  Use return_exceptions=True so that one
+        # failed/timed-out trajectory does not cancel the other concurrent tasks.
+        raw_results = await asyncio.gather(
+            *[sem_wrapper(task_id, task) for task_id, task in task_queue],
+            return_exceptions=True,
+        )
+
+        # Separate successes from failures
+        results = []
+        for i, r in enumerate(raw_results):
+            if isinstance(r, BaseException):
+                logger.error(f"Task {i} raised an exception: {r}")
+            else:
+                results.append(r)
+
+        if not results:
+            raise RuntimeError(
+                f"All {len(raw_results)} trajectories failed. "
+                f"Check logs above for individual error details."
+            )
 
         all_trajectories = {task_id: trajectory for task_id, trajectory in results}
-        ordered_trajectories = [all_trajectories[i] for i in range(len(all_trajectories))]
+        # Preserve ordering for successful tasks; failed tasks are excluded.
+        ordered_trajectories = [
+            all_trajectories[i] for i in sorted(all_trajectories.keys())
+        ]
+
+        if len(ordered_trajectories) < total:
+            colorful_print(
+                f"Warning: {total - len(ordered_trajectories)}/{total} trajectories failed and were excluded.",
+                "yellow",
+            )
 
         if not self.keep_executor_alive:
             self.executor.shutdown(wait=False, cancel_futures=True)
