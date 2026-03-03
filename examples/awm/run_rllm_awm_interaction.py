@@ -194,11 +194,11 @@ async def _run(args):
     # This captures each step where the engine asks the Agent/LLM for a reply.
     original_get_model_response = engine.get_model_response
 
-    async def _debug_get_model_response(prompt, application_id, **kwargs):
-        pdb.set_trace()
-        return await original_get_model_response(prompt, application_id, **kwargs)
+    # async def _debug_get_model_response(prompt, application_id, **kwargs):
+    #     # pdb.set_trace()
+    #     return await original_get_model_response(prompt, application_id, **kwargs)
 
-    engine.get_model_response = _debug_get_model_response
+    # engine.get_model_response = _debug_get_model_response
 
     try:
         trajectories = await engine.execute_tasks(tasks)
