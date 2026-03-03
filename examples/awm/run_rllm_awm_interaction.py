@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import pdb
 import statistics
 from typing import Any
 
@@ -188,6 +189,16 @@ async def _run(args):
     # force OpenAI-compatible chat/completions instead of completions endpoint.
     if args.force_chat_completions:
         engine.rollout_engine._use_chat_completions = True
+
+    # Break before every model request during env-agent interaction.
+    # This captures each step where the engine asks the Agent/LLM for a reply.
+    original_get_model_response = engine.get_model_response
+
+    async def _debug_get_model_response(prompt, application_id, **kwargs):
+        pdb.set_trace()
+        return await original_get_model_response(prompt, application_id, **kwargs)
+
+    engine.get_model_response = _debug_get_model_response
 
     try:
         trajectories = await engine.execute_tasks(tasks)
