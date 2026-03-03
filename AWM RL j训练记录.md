@@ -1,7 +1,7 @@
 
 
 ```Python
-python -m examples.awm.run_rllm_awm_interaction   --dataset_path /mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/awm_data   --split train   --num_scenarios 10   --tasks_per_scenario 2   --max_tasks 20   --vllm_url http://127.0.0.1:6820/v1   --model Qwen3-32B   --tokenizer_name_or_path /mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-32B   --max_steps 10   --trajectory_timeout 900   --server_start_timeout 120   --n_parallel_agents 1   --max_workers 8   --no_proxy_local   --enable_reward   --save_jsonl /tmp/awm_interaction_20.jsonl
+python -m examples.awm.run_rllm_awm_interaction   --dataset_path /mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/awm_data   --split train   --num_scenarios 5   --tasks_per_scenario 2   --max_tasks 10   --vllm_url http://127.0.0.1:6820/v1   --model Qwen3-32B   --tokenizer_name_or_path /mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/checkpoints/base_models/Qwen3-32B   --max_steps 10   --trajectory_timeout 900   --server_start_timeout 120   --n_parallel_agents 5   --max_workers 8   --no_proxy_local   --enable_reward   --save_jsonl /tmp/awm_interaction_10.jsonl
 ```
 
 

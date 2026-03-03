@@ -162,8 +162,11 @@ def awm_reward_fn(task_info: dict, action: str) -> RewardOutput:
     """
     from rllm.environments.awm.awm_reward import AWMMCPPureCodeRewardFn
     
-    reward_config = RewardConfig()
-    reward_fn = AWMMCPPureCodeRewardFn(reward_config)
+    # Stateless verifier; cache singleton to avoid repeated object creation.
+    if not hasattr(awm_reward_fn, "_cached_reward_fn"):
+        reward_config = RewardConfig()
+        awm_reward_fn._cached_reward_fn = AWMMCPPureCodeRewardFn(reward_config)
+    reward_fn = awm_reward_fn._cached_reward_fn
     if isinstance(action, Action):
         action = action.action
     return reward_fn(task_info, action)

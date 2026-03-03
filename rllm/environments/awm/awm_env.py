@@ -80,9 +80,15 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
     _settings_lock = threading.Lock()
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
+        from mcp_agent.app import MCPApp
+
         self.mcp_url = mcp_url
         self.timeout = timeout
         self._tools: list[dict] = []
+        self._tools_cached = False
+        self._session_lock = threading.Lock()
+        self._settings = self._build_settings_thread_safe()
+        self._app = MCPApp(name="awm_agent", settings=self._settings)
         # Legacy implementation (kept as comments per request):
         # from mcp_agent.config import (
         #     Settings, MCPSettings, MCPServerSettings, LoggerSettings,
@@ -129,8 +135,19 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
             ),
         )
 
+    def _build_settings_thread_safe(self):
+        """
+        Build Settings in isolated env, but keep the lock scope minimal.
+
+        We only need locking while entering isolated_mcp_env()/constructing Settings
+        (both touch process-global environment variables). The expensive MCP network
+        handshake and tool calls run outside the global lock.
+        """
+        with self._settings_lock:
+            with isolated_mcp_env():
+                return self._build_settings()
+
     async def list_tools(self) -> list[dict]:
-        from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
 
         # Legacy implementation (kept as comments per request):
@@ -155,33 +172,34 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         #                 self._tools.append(tool_info)
         #             return self._tools
 
-        # Match awm.tools.check_mcp_server() lifecycle:
-        # isolate env -> build settings -> app.run() -> create Agent -> list_tools.
-        with self._settings_lock:
-            with isolated_mcp_env():
-                app = MCPApp(name="awm_agent", settings=self._build_settings())
-                with contextlib.redirect_stderr(io.StringIO()):
-                    async with app.run():
-                        agent = Agent(
-                            name="executor",
-                            server_names=[self._MCP_SERVER_NAME],
+        if self._tools_cached and self._tools:
+            return self._tools
+
+        # Match awm.tools.check_mcp_server() lifecycle, but only keep lock around
+        # settings creation to avoid serializing all MCP network traffic.
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.list_tools(), timeout=self.timeout
                         )
-                        async with agent:
-                            result = await asyncio.wait_for(
-                                agent.list_tools(), timeout=self.timeout
-                            )
-                            self._tools = []
-                            for t in result.tools:
-                                tool_info = {
-                                    "name": t.name,
-                                    "description": t.description or "",
-                                    "inputSchema": t.inputSchema or {},
-                                }
-                                self._tools.append(tool_info)
-                            return self._tools
+                        self._tools = []
+                        for t in result.tools:
+                            tool_info = {
+                                "name": t.name,
+                                "description": t.description or "",
+                                "inputSchema": t.inputSchema or {},
+                            }
+                            self._tools.append(tool_info)
+                        self._tools_cached = True
+                        return self._tools
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
-        from mcp_agent.app import MCPApp
         from mcp_agent.agents.agent import Agent
 
         # Legacy implementation (kept as comments per request):
@@ -208,30 +226,28 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         #                 return f"Error: {text}"
         #             return text
 
-        with self._settings_lock:
-            with isolated_mcp_env():
-                app = MCPApp(name="awm_agent", settings=self._build_settings())
-                with contextlib.redirect_stderr(io.StringIO()):
-                    async with app.run():
-                        agent = Agent(
-                            name="executor",
-                            server_names=[self._MCP_SERVER_NAME],
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.call_tool(tool_name, arguments),
+                            timeout=self.timeout,
                         )
-                        async with agent:
-                            result = await asyncio.wait_for(
-                                agent.call_tool(tool_name, arguments),
-                                timeout=self.timeout,
-                            )
-                            parts = []
-                            for c in result.content:
-                                if hasattr(c, "text"):
-                                    parts.append(c.text)
-                                else:
-                                    parts.append(str(c))
-                            text = "\n".join(parts)
-                            if result.isError:
-                                return f"Error: {text}"
-                            return text
+                        parts = []
+                        for c in result.content:
+                            if hasattr(c, "text"):
+                                parts.append(c.text)
+                            else:
+                                parts.append(str(c))
+                        text = "\n".join(parts)
+                        if result.isError:
+                            return f"Error: {text}"
+                        return text
 
 
 class AWMEnvironment(BaseEnv):
@@ -298,9 +314,12 @@ When you have completed the task, provide your final answer directly without any
         verifier_code: Optional[str] = None,
         database_dir: Optional[str] = None,
         max_steps: int = 30,
+        task_max_prompt_length: Optional[int] = None,
+        task_max_response_length: Optional[int] = None,
         reward_fn=None,
         server_host: str = "127.0.0.1",
         server_start_timeout: float = 120.0,  # Increased from 60s for large scenarios with many DB tables
+        prestart_server: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -314,9 +333,12 @@ When you have completed the task, provide your final answer directly without any
         self.verifier_code = verifier_code
         self.database_dir = database_dir
         self.max_steps = max_steps
+        self.task_max_prompt_length = task_max_prompt_length
+        self.task_max_response_length = task_max_response_length
         self.reward_fn = reward_fn
         self.server_host = server_host
         self.server_start_timeout = server_start_timeout
+        self.prestart_server = prestart_server
 
         # Server management
         self.server_port: Optional[int] = None
@@ -333,6 +355,7 @@ When you have completed the task, provide your final answer directly without any
         self.history: List[Dict[str, Any]] = []
         self.done = False
         self.available_tools: List[Dict] = []
+        self._is_prestarted = False
 
     # ------------------------------------------------------------------
     # Server lifecycle — mirrors awm/core/env.py::test_run_specific_env()
@@ -906,6 +929,22 @@ When you have completed the task, provide your final answer directly without any
             f"Server is healthy — proceeding anyway. Agent tool calls may fail at runtime."
         )
 
+    def prestart(self):
+        """
+        Optional server warm-up hook for training.
+
+        This does not change default behavior. It only takes effect when caller
+        explicitly enables prestart_server in env args.
+        """
+        if not self.prestart_server:
+            return
+        if self.server_process and self.server_process.poll() is None:
+            self._is_prestarted = True
+            return
+        self._cleanup_server()
+        self._start_server()
+        self._is_prestarted = True
+
     # ------------------------------------------------------------------
     # Process management
     # ------------------------------------------------------------------
@@ -973,14 +1012,17 @@ When you have completed the task, provide your final answer directly without any
     # ------------------------------------------------------------------
 
     def reset(self, **kwargs) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        self._cleanup_server()
+        if not (self.prestart_server and self._is_prestarted and self.server_process and self.server_process.poll() is None):
+            self._cleanup_server()
 
         self.current_step = 0
         self.history = []
         self.done = False
         self.available_tools = []
 
-        self._start_server()
+        if not (self.prestart_server and self._is_prestarted and self.server_process and self.server_process.poll() is None):
+            self._start_server()
+        self._is_prestarted = False
 
         observation = {
             "system_prompt": self.AWM_SYSTEM_PROMPT,
@@ -991,8 +1033,14 @@ When you have completed the task, provide your final answer directly without any
         info = {
             "scenario": self.scenario_name,
             "task": self.task_description,
+            "task_type": "awm",
             "max_steps": self.max_steps,
+            "task_max_steps": self.max_steps,
         }
+        if self.task_max_prompt_length is not None:
+            info["task_max_prompt_length"] = int(self.task_max_prompt_length)
+        if self.task_max_response_length is not None:
+            info["task_max_response_length"] = int(self.task_max_response_length)
 
         return observation, info
 
@@ -1098,7 +1146,10 @@ When you have completed the task, provide your final answer directly without any
 
         if name == "list_tools":
             try:
-                tools = self._run_async(self._mcp_executor.list_tools())
+                if self.available_tools:
+                    tools = self.available_tools
+                else:
+                    tools = self._run_async(self._mcp_executor.list_tools())
                 self.available_tools = tools
                 formatted_tools = format_tools_for_response(tools)
                 return {
@@ -1304,6 +1355,9 @@ When you have completed the task, provide your final answer directly without any
         if not database_dir:
             database_dir = os.environ.get("AWM_DATABASE_DIR")
         max_steps = _get("max_steps", "task_max_steps") or 30
+        task_max_prompt_length = _get("task_max_prompt_length")
+        task_max_response_length = _get("task_max_response_length")
+        prestart_server = bool(_get("prestart_server") or False)
 
         return AWMEnvironment(
             scenario_name=scenario_name,
@@ -1315,7 +1369,10 @@ When you have completed the task, provide your final answer directly without any
             verifier_code=verifier_code,
             database_dir=database_dir,
             max_steps=int(max_steps),
+            task_max_prompt_length=int(task_max_prompt_length) if task_max_prompt_length else None,
+            task_max_response_length=int(task_max_response_length) if task_max_response_length else None,
             reward_fn=reward_fn,
             server_host=server_host,
             server_start_timeout=server_start_timeout,
+            prestart_server=prestart_server,
         )

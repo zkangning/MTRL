@@ -73,6 +73,9 @@ class AgentPPOTrainer(RayPPOTrainer):
 
         engine_args = OmegaConf.to_container(self.config.rllm.agent.get("engine_args", {})) or {}
         n_parallel_agents = engine_args.pop("n_parallel_agents", None) or self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+        max_parallel_agents = int(self.config.rllm.agent.get("max_parallel_agents", 0) or 0)
+        if max_parallel_agents > 0:
+            n_parallel_agents = min(n_parallel_agents, max_parallel_agents)
         print(f"n_parallel_agents: {n_parallel_agents}")
 
         self.agent_execution_engine = AsyncAgentExecutionEngine(
@@ -152,6 +155,19 @@ class AgentPPOTrainer(RayPPOTrainer):
             for future in as_completed(env_futures):
                 idx, env = future.result()
                 envs[idx] = env
+
+        # Optional: eagerly prestart env servers to overlap startup cost.
+        if bool(self.config.rllm.env.get("prestart_server", False)):
+            prestart_workers = int(self.config.rllm.env.get("prestart_workers", 0) or 0)
+            if prestart_workers <= 0:
+                prestart_workers = 64
+            with ThreadPoolExecutor(max_workers=prestart_workers) as executor:
+                futures = []
+                for env in envs:
+                    if hasattr(env, "prestart"):
+                        futures.append(executor.submit(env.prestart))
+                for future in as_completed(futures):
+                    future.result()
 
         # Create agents in parallel while preserving order
         agents = [None] * len(envs)

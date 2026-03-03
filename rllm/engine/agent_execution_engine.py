@@ -62,6 +62,7 @@ class AgentExecutionEngine:
         self.n_parallel_agents = n_parallel_agents
         self.max_env_workers = max_workers
         self.overlong_filter = overlong_filter
+        self.keep_executor_alive = kwargs.get("keep_executor_alive", True)
 
         # For interaction
         self.gamma = gamma
@@ -534,7 +535,9 @@ class AgentExecutionEngine:
         if self.engine_name == "verl":
             self.rollout_engine.sleep()
 
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        # Keep executor alive across batches to avoid repeated thread pool churn.
+        if not self.keep_executor_alive:
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
     async def execute_tasks(self, tasks: list[dict]):
         """
@@ -594,7 +597,8 @@ class AgentExecutionEngine:
         all_trajectories = {task_id: trajectory for task_id, trajectory in results}
         ordered_trajectories = [all_trajectories[i] for i in range(len(all_trajectories))]
 
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        if not self.keep_executor_alive:
+            self.executor.shutdown(wait=False, cancel_futures=True)
 
         return ordered_trajectories
 

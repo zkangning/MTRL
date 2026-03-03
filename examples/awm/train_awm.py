@@ -181,6 +181,9 @@ def main(config):
         "reward_fn": awm_reward_fn,
         "server_host": "127.0.0.1",
         "server_start_timeout": config.rllm.env.get("server_start_timeout", 120.0),  # Configurable, increased default
+        "task_max_prompt_length": config.data.get("max_prompt_length"),
+        "task_max_response_length": config.data.get("max_response_length"),
+        "prestart_server": bool(config.rllm.env.get("prestart_server", False)),
     }
 
     # ============================================================
