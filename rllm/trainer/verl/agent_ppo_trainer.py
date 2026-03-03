@@ -17,7 +17,6 @@ from omegaconf import OmegaConf
 from rllm.rewards.toolcall_reward import ToolCallRewardFn
 
 from rllm.engine.agent_execution_engine import AsyncAgentExecutionEngine
-from rllm.environments.base.base_env import BaseEnv
 from verl import DataProto
 from verl.protocol import pad_dataproto_to_divisor
 from verl.trainer.ppo.core_algos import agg_loss
@@ -36,54 +35,7 @@ from verl.trainer.ppo.ray_trainer import (
 )
 
 
-class _SharedEnvProxy(BaseEnv):
-    """
-    Proxy wrapper that serializes full-trajectory access to one shared env.
-
-    This is used for repeated GRPO rollouts of the same uid so we don't create
-    N fully parallel heavy env/server stacks for identical tasks.
-    """
-
-    def __init__(self, shared_env: BaseEnv):
-        self._shared_env = shared_env
-        self._acquired = False
-
-    def reset(self, **kwargs):
-        lock = getattr(self._shared_env, "_trajectory_lock", None)
-        if lock is not None:
-            lock.acquire()
-            self._acquired = True
-        try:
-            return self._shared_env.reset(**kwargs)
-        except Exception:
-            if self._acquired and lock is not None:
-                lock.release()
-                self._acquired = False
-            raise
-
-    def step(self, action):
-        return self._shared_env.step(action)
-
-    def close(self):
-        try:
-            return self._shared_env.close()
-        finally:
-            lock = getattr(self._shared_env, "_trajectory_lock", None)
-            if self._acquired and lock is not None:
-                lock.release()
-                self._acquired = False
-
-    @staticmethod
-    def is_multithread_safe() -> bool:
-        return True
-
-    @staticmethod
-    def from_dict(env_args):
-        raise NotImplementedError("_SharedEnvProxy is not built from dict directly")
-
-
 class AgentPPOTrainer(RayPPOTrainer):
-
     def __init__(
         self,
         config,
@@ -197,34 +149,12 @@ class AgentPPOTrainer(RayPPOTrainer):
             return i, self.agent_class(**full_agent_args)
 
         # Create environments in parallel while preserving order
-        # Optional optimization: pool same-task (same uid) rollouts through shared envs.
-        pool_same_task_rollouts = bool(self.config.rllm.env.get("pool_same_task_rollouts", False))
         envs = [None] * len(env_args)
-        if pool_same_task_rollouts and "uid" in batch.non_tensor_batch:
-            uids = batch.non_tensor_batch["uid"]
-            uid_to_indices: dict[str, list[int]] = {}
-            for idx, uid in enumerate(uids.tolist()):
-                uid_to_indices.setdefault(str(uid), []).append(idx)
-            unique_indices = [indices[0] for indices in uid_to_indices.values()]
-
-            shared_envs: dict[str, BaseEnv] = {}
-            with ThreadPoolExecutor(max_workers=64) as executor:
-                env_futures = [executor.submit(_create_env, i) for i in unique_indices]
-                for future in as_completed(env_futures):
-                    idx, env = future.result()
-                    uid = str(uids[idx])
-                    shared_envs[uid] = env
-
-            for uid, indices in uid_to_indices.items():
-                shared_env = shared_envs[uid]
-                for idx in indices:
-                    envs[idx] = _SharedEnvProxy(shared_env)
-        else:
-            with ThreadPoolExecutor(max_workers=64) as executor:
-                env_futures = [executor.submit(_create_env, i) for i in range(len(env_args))]
-                for future in as_completed(env_futures):
-                    idx, env = future.result()
-                    envs[idx] = env
+        with ThreadPoolExecutor(max_workers=64) as executor:
+            env_futures = [executor.submit(_create_env, i) for i in range(len(env_args))]
+            for future in as_completed(env_futures):
+                idx, env = future.result()
+                envs[idx] = env
 
         # Optional: eagerly prestart env servers to overlap startup cost.
         if bool(self.config.rllm.env.get("prestart_server", False)):

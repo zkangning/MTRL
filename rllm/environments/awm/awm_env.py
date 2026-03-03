@@ -50,35 +50,6 @@ from awm.tools import (
 
 logger = logging.getLogger(__name__)
 
-class _AsyncLoopRunner:
-    """Run async coroutines on a dedicated background event loop thread."""
-
-    def __init__(self):
-        self._loop = asyncio.new_event_loop()
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._started = threading.Event()
-        self._stopped = False
-        self._thread.start()
-        self._started.wait(timeout=5.0)
-
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._started.set()
-        self._loop.run_forever()
-
-    def run(self, coro, timeout: float | None = None):
-        if self._stopped:
-            raise RuntimeError("Async loop runner already stopped")
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout)
-
-    def stop(self):
-        if self._stopped:
-            return
-        self._stopped = True
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=2.0)
-
 class _ThreadSafeMCPExecutor(MCPToolExecutor):
     """
     Thread-safe MCPToolExecutor for use in ThreadPoolExecutor.
@@ -115,20 +86,9 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         self.timeout = timeout
         self._tools: list[dict] = []
         self._tools_cached = False
-        self._rpc_lock = None
-        self._connect_lock = None
-        self._connected = False
+        self._session_lock = threading.Lock()
         self._settings = self._build_settings_thread_safe()
         self._app = MCPApp(name="awm_agent", settings=self._settings)
-        self._app_ctx = None
-        self._agent = None
-        self._agent_ctx = None
-
-    def _ensure_async_locks(self):
-        if self._rpc_lock is None:
-            self._rpc_lock = asyncio.Lock()
-        if self._connect_lock is None:
-            self._connect_lock = asyncio.Lock()
         # Legacy implementation (kept as comments per request):
         # from mcp_agent.config import (
         #     Settings, MCPSettings, MCPServerSettings, LoggerSettings,
@@ -215,80 +175,79 @@ class _ThreadSafeMCPExecutor(MCPToolExecutor):
         if self._tools_cached and self._tools:
             return self._tools
 
-        self._ensure_async_locks()
-        await self._ensure_connected()
-        async with self._rpc_lock:
-            result = await asyncio.wait_for(
-                self._agent.list_tools(), timeout=self.timeout
-            )
-            self._tools = []
-            for t in result.tools:
-                tool_info = {
-                    "name": t.name,
-                    "description": t.description or "",
-                    "inputSchema": t.inputSchema or {},
-                }
-                self._tools.append(tool_info)
-            self._tools_cached = True
-            return self._tools
+        # Match awm.tools.check_mcp_server() lifecycle, but only keep lock around
+        # settings creation to avoid serializing all MCP network traffic.
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.list_tools(), timeout=self.timeout
+                        )
+                        self._tools = []
+                        for t in result.tools:
+                            tool_info = {
+                                "name": t.name,
+                                "description": t.description or "",
+                                "inputSchema": t.inputSchema or {},
+                            }
+                            self._tools.append(tool_info)
+                        self._tools_cached = True
+                        return self._tools
 
     async def call_tool(self, tool_name: str, arguments: dict) -> str:
-        self._ensure_async_locks()
-        await self._ensure_connected()
-        async with self._rpc_lock:
-            result = await asyncio.wait_for(
-                self._agent.call_tool(tool_name, arguments),
-                timeout=self.timeout,
-            )
-            parts = []
-            for c in result.content:
-                if hasattr(c, "text"):
-                    parts.append(c.text)
-                else:
-                    parts.append(str(c))
-            text = "\n".join(parts)
-            if result.isError:
-                return f"Error: {text}"
-            return text
-
-    async def _ensure_connected(self):
-        self._ensure_async_locks()
-        if self._connected:
-            return
         from mcp_agent.agents.agent import Agent
-        async with self._connect_lock:
-            if self._connected:
-                return
-            with contextlib.redirect_stderr(io.StringIO()):
-                self._app_ctx = self._app.run()
-                await self._app_ctx.__aenter__()
-                self._agent = Agent(
-                    name="executor",
-                    server_names=[self._MCP_SERVER_NAME],
-                )
-                self._agent_ctx = self._agent
-                await self._agent_ctx.__aenter__()
-                self._connected = True
 
-    async def close(self):
-        self._ensure_async_locks()
-        if not self._connected:
-            return
-        async with self._connect_lock:
-            if not self._connected:
-                return
-            try:
-                if self._agent_ctx is not None:
-                    await self._agent_ctx.__aexit__(None, None, None)
-            finally:
-                self._agent_ctx = None
-                self._agent = None
-            try:
-                if self._app_ctx is not None:
-                    await self._app_ctx.__aexit__(None, None, None)
-            finally:
-                self._app_ctx = None
-                self._connected = False
+        # Legacy implementation (kept as comments per request):
+        # app = MCPApp(name="awm_agent", settings=self._settings)
+        # with contextlib.redirect_stderr(io.StringIO()):
+        #     async with app.run():
+        #         agent = Agent(
+        #             name="executor",
+        #             server_names=[self._MCP_SERVER_NAME],
+        #         )
+        #         async with agent:
+        #             result = await asyncio.wait_for(
+        #                 agent.call_tool(tool_name, arguments),
+        #                 timeout=self.timeout,
+        #             )
+        #             parts = []
+        #             for c in result.content:
+        #                 if hasattr(c, "text"):
+        #                     parts.append(c.text)
+        #                 else:
+        #                     parts.append(str(c))
+        #             text = "\n".join(parts)
+        #             if result.isError:
+        #                 return f"Error: {text}"
+        #             return text
+
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.call_tool(tool_name, arguments),
+                            timeout=self.timeout,
+                        )
+                        parts = []
+                        for c in result.content:
+                            if hasattr(c, "text"):
+                                parts.append(c.text)
+                            else:
+                                parts.append(str(c))
+                        text = "\n".join(parts)
+                        if result.isError:
+                            return f"Error: {text}"
+                        return text
 
 
 class AWMEnvironment(BaseEnv):
@@ -388,7 +347,6 @@ When you have completed the task, provide your final answer directly without any
         self.server_log_path: Optional[str] = None
         self.temp_dir: Optional[str] = None
         self._mcp_executor: Optional[_ThreadSafeMCPExecutor] = None
-        self._async_runner: Optional[_AsyncLoopRunner] = _AsyncLoopRunner()
         self.current_db_path: Optional[str] = None
         self.initial_db_path: Optional[str] = None
 
@@ -398,7 +356,6 @@ When you have completed the task, provide your final answer directly without any
         self.done = False
         self.available_tools: List[Dict] = []
         self._is_prestarted = False
-        self._trajectory_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Server lifecycle — mirrors awm/core/env.py::test_run_specific_env()
@@ -1044,11 +1001,6 @@ When you have completed the task, provide your final answer directly without any
                 pass
             self.temp_dir = None
 
-        if self._mcp_executor is not None:
-            try:
-                self._run_async(self._mcp_executor.close())
-            except Exception:
-                pass
         self._mcp_executor = None
         self._release_port()
         self.server_port = None
@@ -1176,14 +1128,13 @@ When you have completed the task, provide your final answer directly without any
     # ------------------------------------------------------------------
 
     def _run_async(self, coro, timeout: float = 120.0):  # noqa: ARG002
-        """Run *coro* on a dedicated background event loop.
+        """Run *coro* in a fresh event loop via asyncio.run().
 
-        This keeps MCP app/agent context on a stable loop so MCP session can be
-        reused across multiple tool calls in one trajectory.
+        Called from ThreadPoolExecutor worker threads (no existing event loop),
+        so asyncio.run() works directly.  The individual coroutines (list_tools,
+        call_tool) already contain their own asyncio.wait_for timeouts.
         """
-        if self._async_runner is None:
-            self._async_runner = _AsyncLoopRunner()
-        return self._async_runner.run(coro, timeout=timeout if timeout and timeout > 0 else None)
+        return asyncio.run(coro)
 
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -1291,9 +1242,6 @@ When you have completed the task, provide your final answer directly without any
 
     def close(self):
         self._cleanup_server()
-        if self._async_runner is not None:
-            self._async_runner.stop()
-            self._async_runner = None
 
     @staticmethod
     def is_multithread_safe() -> bool:
