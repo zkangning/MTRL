@@ -807,13 +807,13 @@ When you have completed the task, provide your final answer directly without any
         temp_env_json = os.path.join(self.temp_dir, "env_config.jsonl")
         tools_jsonl_save([env_config], temp_env_json)
 
-        # ── Steps 3-6: Server launch with retry ──
-        # Retry loop handles server startup failures (crashes, port conflicts).
-        # MCP verification (step 7) is separate — MCP client issues should NOT
-        # cause server restarts since the server itself is healthy.
+        # ── Steps 3-7: Server launch + MCP verification with retry ──
+        # Retry loop handles startup failures (crashes/port/readiness) AND
+        # transient MCP empty-tool states. We require non-empty MCP tools
+        # before declaring the environment ready.
         temp_server_path = os.path.join(self.temp_dir, "temp_server.py")
         max_launch_retries = 3
-        last_launch_error = None
+        max_mcp_retries = 5
 
         for launch_attempt in range(1, max_launch_retries + 1):
             try:
@@ -877,10 +877,44 @@ When you have completed the task, provide your final answer directly without any
                         f"Check the logs above for detailed diagnostic information."
                     )
 
-                break  # Server is up and healthy!
+                # ── Step 7: MCP verification (must discover non-empty tools) ──
+                mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
+                self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+                last_mcp_error = None
+
+                for mcp_attempt in range(1, max_mcp_retries + 1):
+                    try:
+                        # Give explicit timeout here to prevent hidden hangs in MCP startup.
+                        tools = self._run_async(self._mcp_executor.list_tools(), timeout=60.0)
+                        if tools:
+                            logger.info(
+                                f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                            )
+                            return
+
+                        # Empty tool list is treated as NOT READY (transient race in FastApiMCP startup).
+                        last_mcp_error = "empty_tools_list"
+                        logger.warning(
+                            f"[{self.scenario_name}] MCP returned empty tools list on attempt "
+                            f"{mcp_attempt}/{max_mcp_retries}; retrying..."
+                        )
+                    except Exception as e:
+                        last_mcp_error = str(e)
+                        logger.warning(
+                            f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}"
+                        )
+
+                    if mcp_attempt < max_mcp_retries:
+                        time.sleep(2.0 * mcp_attempt)
+                        # Re-create executor between attempts to avoid stale mcp_agent state.
+                        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+
+                raise RuntimeError(
+                    f"MCP verification failed after {max_mcp_retries} attempts "
+                    f"(last_error={last_mcp_error})"
+                )
 
             except RuntimeError as e:
-                last_launch_error = e
                 self._kill_server_process(reason=f"launch_retry_{launch_attempt}")
                 self._release_port()
                 if launch_attempt < max_launch_retries:
@@ -890,44 +924,6 @@ When you have completed the task, provide your final answer directly without any
                     )
                     continue
                 raise
-
-        # ── Step 7: MCP verification (separate from server launch) ──
-        # MCP issues are client-side — do NOT kill a healthy server for them.
-        # Re-create the executor between retries to avoid stale mcp_agent state.
-        mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
-        self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
-
-        max_mcp_retries = 5
-        last_mcp_error = None
-        for mcp_attempt in range(1, max_mcp_retries + 1):
-            try:
-                tools = self._run_async(self._mcp_executor.list_tools())
-                if tools:
-                    logger.info(
-                        f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
-                    )
-                    return
-                else:
-                    logger.warning(
-                        f"[{self.scenario_name}] MCP tools list is empty — "
-                        f"proceeding anyway (FastApiMCP may not discover tools for this scenario)"
-                    )
-                    return
-            except Exception as e:
-                last_mcp_error = str(e)
-                logger.warning(f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}")
-
-            if mcp_attempt < max_mcp_retries:
-                time.sleep(2.0 * mcp_attempt)
-                try:
-                    self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
-                except Exception:
-                    pass
-
-        logger.warning(
-            f"[{self.scenario_name}] MCP verification failed after {max_mcp_retries} attempts: {last_mcp_error}. "
-            f"Server is healthy — proceeding anyway. Agent tool calls may fail at runtime."
-        )
 
     def prestart(self):
         """
@@ -1127,14 +1123,14 @@ When you have completed the task, provide your final answer directly without any
     # (async with self._app.run(), async with self._agent).
     # ------------------------------------------------------------------
 
-    def _run_async(self, coro, timeout: float = 120.0):  # noqa: ARG002
+    def _run_async(self, coro, timeout: float = 120.0):
         """Run *coro* in a fresh event loop via asyncio.run().
 
         Called from ThreadPoolExecutor worker threads (no existing event loop),
         so asyncio.run() works directly.  The individual coroutines (list_tools,
         call_tool) already contain their own asyncio.wait_for timeouts.
         """
-        return asyncio.run(coro)
+        return asyncio.run(asyncio.wait_for(coro, timeout=timeout))
 
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
