@@ -51,6 +51,8 @@ class AWMMCPPureCodeRewardFn:
         """
         verifier_code = task_info.get("verifier_code", "")
         db_path = task_info.get("db_path", "")
+        initial_db_path = task_info.get("initial_db_path", db_path)
+        final_db_path = task_info.get("final_db_path", db_path)
         final_answer = task_info.get("final_answer", action)
         
         if not verifier_code or not db_path:
@@ -60,7 +62,7 @@ class AWMMCPPureCodeRewardFn:
         try:
             # Execute verification code
             result = self._execute_verification(
-                verifier_code, db_path, final_answer
+                verifier_code, initial_db_path, final_db_path, final_answer
             )
             
             # Parse result
@@ -117,7 +119,8 @@ class AWMMCPPureCodeRewardFn:
     def _execute_verification(
         self,
         python_code: str,
-        db_path: str,
+        initial_db_path: str,
+        final_db_path: str,
         final_answer: str,
         function_name: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -137,7 +140,8 @@ class AWMMCPPureCodeRewardFn:
             return execute_verification_code(
                 python_code=python_code,
                 function_name=function_name,
-                initial_db_path=db_path,
+                initial_db_path=initial_db_path,
+                final_db_path=final_db_path,
                 mode=VerificationMode.code
             )
         except Exception as e:

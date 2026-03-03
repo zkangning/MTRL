@@ -20,6 +20,7 @@ the thread-unsafe isolated_mcp_env() that the parent class uses.
 """
 
 import asyncio
+import copy
 import contextlib
 import io
 import json
@@ -295,6 +296,7 @@ When you have completed the task, provide your final answer directly without any
         db_schema: Optional[dict] = None,
         db_sample: Optional[dict] = None,
         verifier_code: Optional[str] = None,
+        database_dir: Optional[str] = None,
         max_steps: int = 30,
         reward_fn=None,
         server_host: str = "127.0.0.1",
@@ -310,6 +312,7 @@ When you have completed the task, provide your final answer directly without any
         self.db_schema = db_schema
         self.db_sample = db_sample
         self.verifier_code = verifier_code
+        self.database_dir = database_dir
         self.max_steps = max_steps
         self.reward_fn = reward_fn
         self.server_host = server_host
@@ -323,6 +326,7 @@ When you have completed the task, provide your final answer directly without any
         self.temp_dir: Optional[str] = None
         self._mcp_executor: Optional[_ThreadSafeMCPExecutor] = None
         self.current_db_path: Optional[str] = None
+        self.initial_db_path: Optional[str] = None
 
         # State tracking
         self.current_step = 0
@@ -657,6 +661,63 @@ When you have completed the task, provide your final answer directly without any
                 f"({len(AWMEnvironment._active_ports)} ports active)"
             )
 
+    def _resolve_source_db_path(self, scenario_norm: str) -> Optional[str]:
+        """Resolve initial DB source path, prioritizing explicit path then database_dir."""
+        if self.db_path and os.path.exists(self.db_path):
+            return self.db_path
+
+        if self.database_dir:
+            candidate = os.path.join(self.database_dir, f"{scenario_norm}.db")
+            if os.path.exists(candidate):
+                return candidate
+
+        return None
+
+    @staticmethod
+    def _normalize_db_sample_examples(db_sample: Any) -> dict[str, list[str]]:
+        """
+        Normalize db_sample into table_name -> list[SQL] format.
+
+        Supported formats:
+        1) {"users": ["INSERT ...", ...], ...}
+        2) {"tables": [{"table_name": "users", "insert_statements": [...]}, ...]}
+        """
+        if not isinstance(db_sample, dict):
+            return {}
+
+        table_examples: dict[str, list[str]] = {}
+
+        # Format 1: direct map
+        direct_keys = [k for k, v in db_sample.items() if isinstance(k, str) and isinstance(v, list)]
+        if direct_keys and "tables" not in db_sample:
+            for table_name in direct_keys:
+                values = [str(sql) for sql in db_sample.get(table_name, []) if isinstance(sql, str)]
+                if values:
+                    table_examples[table_name] = values
+            return table_examples
+
+        # Format 2: nested tables list
+        tables = db_sample.get("tables", [])
+        if isinstance(tables, list):
+            for table in tables:
+                if not isinstance(table, dict):
+                    continue
+                table_name = table.get("table_name") or table.get("name")
+                if not isinstance(table_name, str) or not table_name:
+                    continue
+
+                statements = table.get("insert_statements")
+                if not isinstance(statements, list):
+                    statements = table.get("examples")
+                if not isinstance(statements, list):
+                    continue
+
+                values = [str(sql) for sql in statements if isinstance(sql, str)]
+                if values:
+                    table_examples[table_name] = values
+
+        return table_examples
+
     def _release_port(self):
         """Release the allocated port back to the available pool."""
         if self.server_port is not None:
@@ -680,28 +741,39 @@ When you have completed the task, provide your final answer directly without any
         self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{scenario_norm}_")
 
         # ── Step 1: Prepare database ──
-        if self.db_path and os.path.exists(self.db_path):
+        source_db_path = self._resolve_source_db_path(scenario_norm)
+        if source_db_path:
             self.current_db_path = os.path.join(self.temp_dir, f"{scenario_norm}.db")
-            shutil.copyfile(self.db_path, self.current_db_path)
+            shutil.copyfile(source_db_path, self.current_db_path)
             os.chmod(self.current_db_path, 0o644)
-            logger.info(f"[{self.scenario_name}] Copied existing database from {self.db_path}")
+            logger.info(f"[{self.scenario_name}] Copied existing database from {source_db_path}")
         elif self.db_schema:
             logger.info(f"[{self.scenario_name}] Creating database from schema...")
-            full_schema = self.db_schema.copy()
-            if self.db_sample:
+            full_schema = copy.deepcopy(self.db_schema)
+            table_examples = self._normalize_db_sample_examples(self.db_sample)
+            if table_examples:
                 for table in full_schema.get("tables", []):
                     table_name = table.get("name")
-                    if table_name and table_name in self.db_sample:
-                        table["examples"] = self.db_sample[table_name]
+                    if table_name and table_name in table_examples:
+                        table["examples"] = table_examples[table_name]
 
             db_path, successful, failed, errors = create_sqlite_database(
                 self.scenario_name, full_schema, self.temp_dir
             )
             self.current_db_path = db_path
+            logger.info(
+                f"[{self.scenario_name}] Database built from schema: "
+                f"tables_ok={successful}, tables_failed={failed}"
+            )
             if failed > 0:
                 logger.warning(f"[{self.scenario_name}] Database creation had {failed} failures: {errors}")
         else:
             raise ValueError("Either db_path or db_schema must be provided for AWMEnvironment")
+
+        # Snapshot initial DB for verifier initial/final comparison.
+        self.initial_db_path = os.path.join(self.temp_dir, f"{scenario_norm}.initial.db")
+        shutil.copyfile(self.current_db_path, self.initial_db_path)
+        os.chmod(self.initial_db_path, 0o644)
 
         # ── Step 2: Write env_config as jsonl (same format as awm/core/env.py) ──
         env_config = {
@@ -894,6 +966,7 @@ When you have completed the task, provide your final answer directly without any
         self._release_port()
         self.server_port = None
         self.current_db_path = None
+        self.initial_db_path = None
 
     # ------------------------------------------------------------------
     # Gym-like interface
@@ -1105,6 +1178,8 @@ When you have completed the task, provide your final answer directly without any
                 "task": self.task_description,
                 "verifier_code": self.verifier_code,
                 "db_path": self.current_db_path or self.db_path,
+                "initial_db_path": self.initial_db_path or self.current_db_path or self.db_path,
+                "final_db_path": self.current_db_path or self.db_path,
                 "history": self.history,
                 "final_answer": final_answer,
             }
@@ -1224,16 +1299,21 @@ When you have completed the task, provide your final answer directly without any
                 pass
 
         verifier_code = _get("verifier_code") or ""
+        db_path = _get("db_path")
+        database_dir = _get("database_dir")
+        if not database_dir:
+            database_dir = os.environ.get("AWM_DATABASE_DIR")
         max_steps = _get("max_steps", "task_max_steps") or 30
 
         return AWMEnvironment(
             scenario_name=scenario_name,
             task_description=task_description,
             env_code=env_code,
-            db_path=None,
+            db_path=db_path,
             db_schema=db_schema,
             db_sample=db_sample,
             verifier_code=verifier_code,
+            database_dir=database_dir,
             max_steps=int(max_steps),
             reward_fn=reward_fn,
             server_host=server_host,

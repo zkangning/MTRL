@@ -84,13 +84,15 @@ def execute_verification_code(
     python_code: str,
     function_name: str,
     initial_db_path: str,
+    final_db_path: str | None = None,
     mode: VerificationMode = VerificationMode.sql,
 ) -> dict:
 
     if not os.path.exists(initial_db_path):
         raise RuntimeError(f"Database not found: {initial_db_path}")
 
-    final_db_path = initial_db_path  # use same db for testing
+    if final_db_path is None:
+        final_db_path = initial_db_path
     original_mode = os.stat(initial_db_path).st_mode
 
     try:

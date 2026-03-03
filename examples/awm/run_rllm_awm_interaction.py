@@ -155,6 +155,7 @@ async def _run(args):
         "reward_fn": awm_reward_fn if args.enable_reward else None,
         "server_host": "127.0.0.1",
         "server_start_timeout": args.server_start_timeout,
+        "database_dir": args.database_dir,
     }
     agent_args = {
         "system_prompt": AWM_SYSTEM_PROMPT,
@@ -218,6 +219,11 @@ async def _run(args):
 def build_parser():
     parser = argparse.ArgumentParser(description="Run RLLM AWMAgent <-> AWMEnvironment interaction")
     parser.add_argument("--dataset_path", required=True, help="Local AWM dataset path")
+    parser.add_argument(
+        "--database_dir",
+        default="",
+        help="Optional directory containing per-scenario initial DB files (<normalized_scenario>.db)",
+    )
     parser.add_argument("--split", default="train", choices=["train", "test"], help="Dataset split")
     parser.add_argument("--scenario", default=None, help="Exact scenario name (e.g. booking_marketplace_1)")
     parser.add_argument("--num_scenarios", type=int, default=1, help="How many scenarios to sample before filtering")
