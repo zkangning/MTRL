@@ -32,6 +32,7 @@ python3 -m examples.awm.train_awm \
     +data.test_scenarios=20 \
     +data.tasks_per_scenario=10 \
     +data.verification_mode=pure_code \
+    +data.precheck_db=True \
     \
     '+task_configs.awm.max_prompt_length=2048' \
     '+task_configs.awm.max_response_length=15360' \
@@ -90,6 +91,7 @@ python3 -m examples.awm.train_awm \
     rllm.agent.max_steps=30 \
     +rllm.agent.max_parallel_agents=64 \
     +rllm.env.server_start_timeout=120.0 \
+    +rllm.env.tool_call_timeout=30.0 \
     +rllm.env.prestart_server=True \
     +rllm.env.prestart_workers=64 \
     +rllm.agent.engine_args.keep_executor_alive=True \

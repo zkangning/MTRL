@@ -328,8 +328,9 @@ When you have completed the task, provide your final answer directly without any
         task_max_response_length: Optional[int] = None,
         reward_fn=None,
         server_host: str = "127.0.0.1",
-        server_start_timeout: float = 120.0,  # Increased from 60s for large scenarios with many DB tables
+        server_start_timeout: float = 120.0,
         prestart_server: bool = False,
+        tool_call_timeout: float = 30.0,
         **kwargs
     ):
         super().__init__()
@@ -349,6 +350,7 @@ When you have completed the task, provide your final answer directly without any
         self.server_host = server_host
         self.server_start_timeout = server_start_timeout
         self.prestart_server = prestart_server
+        self.tool_call_timeout = tool_call_timeout
 
         # Server management
         self.server_port: Optional[int] = None
@@ -366,6 +368,7 @@ When you have completed the task, provide your final answer directly without any
         self.done = False
         self.available_tools: List[Dict] = []
         self._is_prestarted = False
+        self._mcp_dead = False
 
     # ------------------------------------------------------------------
     # Server lifecycle — mirrors awm/core/env.py::test_run_specific_env()
@@ -1033,6 +1036,7 @@ When you have completed the task, provide your final answer directly without any
         self.history = []
         self.done = False
         self.available_tools = []
+        self._mcp_dead = False
 
         if not (self.prestart_server and self._is_prestarted and self.server_process and self.server_process.poll() is None):
             self._start_server()
@@ -1072,6 +1076,18 @@ When you have completed the task, provide your final answer directly without any
         for tc in tool_calls:
             result = self._execute_tool_call(tc)
             results.append(result)
+
+        if self._mcp_dead:
+            self.done = True
+            reward = 0.0
+            observation = {"tool_results": results, "step": self.current_step}
+            info = {
+                "step": self.current_step, "action": action,
+                "tool_calls": tool_calls, "results": results,
+                "termination_reason": "mcp_deadlock",
+            }
+            self.history.append(info)
+            return observation, reward, self.done, info
 
         if self.current_step >= self.max_steps:
             self.done = True
@@ -1177,9 +1193,11 @@ When you have completed the task, provide your final answer directly without any
         t.join(timeout=hard_timeout)
 
         if t.is_alive():
+            self._mcp_dead = True
             logger.error(
                 f"[{self.scenario_name}] _run_async hard timeout after {hard_timeout:.0f}s — "
-                f"asyncio.run() likely deadlocked. Abandoning coroutine."
+                f"asyncio.run() likely deadlocked. Abandoning coroutine. "
+                f"MCP executor marked dead; subsequent tool calls will fail fast."
             )
             raise TimeoutError(
                 f"_run_async hard timeout ({hard_timeout:.0f}s) for scenario "
@@ -1194,17 +1212,46 @@ When you have completed the task, provide your final answer directly without any
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a tool call — mirrors awm/core/agent.py::run_agent() tool dispatch.
+
+        Uses self.tool_call_timeout (default 30s) for individual tool calls
+        during agent interaction.  This is intentionally shorter than the
+        startup timeout (120s) because tool calls should complete quickly;
+        prolonged waits indicate MCP deadlocks or stuck queries.
+
+        If a previous call caused a hard timeout (deadlock), the MCP executor's
+        _session_lock is permanently held by the abandoned daemon thread.
+        All subsequent calls would block on that lock and also timeout.
+        We detect this via _mcp_dead and fail fast + terminate the episode.
         """
         name = tool_call.get("name", "")
         arguments = tool_call.get("arguments", {})
         tool_call_id = tool_call.get("id", "")
+
+        if self._mcp_dead:
+            self.done = True
+            logger.warning(
+                f"[{self.scenario_name}] MCP executor is dead (previous deadlock). "
+                f"Terminating episode. tool={name}"
+            )
+            return {
+                "tool": name,
+                "tool_call_id": tool_call_id,
+                "result": (
+                    "Error: MCP connection is permanently broken due to a previous "
+                    "deadlock. This episode is terminated."
+                ),
+                "success": False,
+            }
 
         if name == "list_tools":
             try:
                 if self.available_tools:
                     tools = self.available_tools
                 else:
-                    tools = self._run_async(self._mcp_executor.list_tools())
+                    tools = self._run_async(
+                        self._mcp_executor.list_tools(),
+                        timeout=self.tool_call_timeout,
+                    )
                 self.available_tools = tools
                 formatted_tools = format_tools_for_response(tools)
                 return {
@@ -1212,6 +1259,16 @@ When you have completed the task, provide your final answer directly without any
                     "tool_call_id": tool_call_id,
                     "result": formatted_tools,
                     "success": True
+                }
+            except TimeoutError:
+                logger.warning(
+                    f"[{self.scenario_name}] list_tools timed out after {self.tool_call_timeout}s"
+                )
+                return {
+                    "tool": "list_tools",
+                    "tool_call_id": tool_call_id,
+                    "result": f"Error: list_tools timed out after {self.tool_call_timeout}s. The server may be overloaded.",
+                    "success": False
                 }
             except Exception as e:
                 return {
@@ -1225,13 +1282,31 @@ When you have completed the task, provide your final answer directly without any
             tool_name, tool_args = self._parse_call_tool_arguments(arguments)
 
             try:
-                result = self._run_async(self._mcp_executor.call_tool(tool_name, tool_args))
+                result = self._run_async(
+                    self._mcp_executor.call_tool(tool_name, tool_args),
+                    timeout=self.tool_call_timeout,
+                )
                 return {
                     "tool": tool_name,
                     "tool_call_id": tool_call_id,
                     "arguments": tool_args,
                     "result": result,
                     "success": not result.startswith("Error:")
+                }
+            except TimeoutError:
+                logger.warning(
+                    f"[{self.scenario_name}] call_tool({tool_name}) timed out after "
+                    f"{self.tool_call_timeout}s"
+                )
+                return {
+                    "tool": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "arguments": tool_args,
+                    "result": (
+                        f"Error: Tool call '{tool_name}' timed out after "
+                        f"{self.tool_call_timeout}s. The operation may be too slow or the server is unresponsive."
+                    ),
+                    "success": False
                 }
             except Exception as e:
                 return {
@@ -1337,7 +1412,8 @@ When you have completed the task, provide your final answer directly without any
         # Pop base env_args (from trainer's env_args)
         reward_fn = env_args.pop("reward_fn", None)
         server_host = env_args.pop("server_host", "127.0.0.1")
-        server_start_timeout = env_args.pop("server_start_timeout", 120.0)  # Increased from 60s for large scenarios
+        server_start_timeout = env_args.pop("server_start_timeout", 120.0)
+        tool_call_timeout = env_args.pop("tool_call_timeout", 30.0)
 
         # ============================================================
         # 提取 AWM 字段 — 兼容两种格式:
@@ -1430,4 +1506,5 @@ When you have completed the task, provide your final answer directly without any
             server_host=server_host,
             server_start_timeout=server_start_timeout,
             prestart_server=prestart_server,
+            tool_call_timeout=float(tool_call_timeout),
         )
