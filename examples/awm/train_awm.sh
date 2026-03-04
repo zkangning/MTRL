@@ -26,10 +26,10 @@ export AWM_PREFILTERED_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rll
 # ================= 启动训练 =================
 python3 -m examples.awm.train_awm \
     algorithm.adv_estimator=grpo \
-    data.train_batch_size=32 \
+    data.train_batch_size=64 \
     data.val_batch_size=500 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=15360 \
+    data.max_prompt_length=1024 \
+    data.max_response_length=20480 \
     \
     +data.dataset_path="$AWM_DATA_DIR" \
     +data.prefiltered_dir="$AWM_PREFILTERED_DIR" \
@@ -39,8 +39,8 @@ python3 -m examples.awm.train_awm \
     +data.verification_mode=pure_code \
     +data.precheck_db=False \
     \
-    '+task_configs.awm.max_prompt_length=2048' \
-    '+task_configs.awm.max_response_length=15360' \
+    '+task_configs.awm.max_prompt_length=1024' \
+    '+task_configs.awm.max_response_length=20480' \
     '+task_configs.awm.max_steps=20' \
     \
     actor_rollout_ref.model.path=$BASE_MODEL_PATH \
@@ -84,16 +84,16 @@ python3 -m examples.awm.train_awm \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='rllm-agent' \
-    trainer.experiment_name='4b-awm' \
+    trainer.experiment_name='m3_4_4b_awm' \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \
     trainer.save_freq=50 \
-    trainer.test_freq=20 \
+    trainer.test_freq=10 \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=4 \
     \
-    rllm.agent.max_steps=30 \
+    rllm.agent.max_steps=20 \
     +rllm.agent.max_parallel_agents=64 \
     +rllm.env.server_start_timeout=120.0 \
     +rllm.env.tool_call_timeout=30.0 \
