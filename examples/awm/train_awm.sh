@@ -12,6 +12,10 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 # AWM HuggingFace 数据集路径
 export AWM_DATA_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/awm_data"
 
+# 预检查数据目录（precheck_scenarios.py 的输出，包含已过滤的 train.parquet + test.parquet）
+# 设置此项后，训练将跳过数据加载和 DB 预检查，直接使用已过滤的数据
+export AWM_PREFILTERED_DIR="/mnt/tidalfs-bdsz01/dataset/llm_dataset/zkn_data/rllm/awm_data/awm_precheck/s1000_t10_pure_code"
+
 # ================= 任务级别配置说明 =================
 # AWM 任务默认值（在 rllm/config/task_config.py 中定义）：
 #   awm: prompt=2048, response=15360, steps=30
@@ -28,11 +32,12 @@ python3 -m examples.awm.train_awm \
     data.max_response_length=15360 \
     \
     +data.dataset_path="$AWM_DATA_DIR" \
-    +data.train_scenarios=100 \
-    +data.test_scenarios=20 \
+    +data.prefiltered_dir="$AWM_PREFILTERED_DIR" \
+    +data.train_scenarios=1000 \
+    +data.test_scenarios=200 \
     +data.tasks_per_scenario=10 \
     +data.verification_mode=pure_code \
-    +data.precheck_db=True \
+    +data.precheck_db=False \
     \
     '+task_configs.awm.max_prompt_length=2048' \
     '+task_configs.awm.max_response_length=15360' \

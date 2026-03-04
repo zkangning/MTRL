@@ -10,24 +10,22 @@ Server lifecycle follows awm/core/env.py::test_run_specific_env():
   3. Launch `python -m awm.core.server` as subprocess
   4. Wait for server readiness via HTTP + MCP tool verification
 
-MCP client architecture:
-  _DirectMCPExecutor uses the low-level `mcp` SDK (mcp.client.streamable_http +
-  mcp.client.session.ClientSession) directly, bypassing the mcp_agent library
-  entirely. This eliminates the _global_context process-level singleton race
-  that caused asyncio.run() deadlocks when multiple threads concurrently ran
-  MCPApp.initialize() / cleanup().
-
-  Each executor runs its own background daemon thread with a dedicated asyncio
-  event loop and a persistent MCP session. Requests are dispatched via a
-  thread-safe queue. No process-global locks, no _session_lock, no MCPApp.
+NOTE on threading:  Original AWM uses ProcessPoolExecutor (each env in its own
+process).  RLLM uses ThreadPoolExecutor (all envs share one process).  Each
+MCP operation (list_tools / call_tool) uses asyncio.run() to create a fresh
+event loop — the mcp_agent library requires this; persistent background loops
+cause the MCP initialization handshake to fail silently.
+A _ThreadSafeMCPExecutor (subclass of awm.core.agent.MCPToolExecutor) avoids
+the thread-unsafe isolated_mcp_env() that the parent class uses.
 """
 
 import asyncio
 import copy
+import contextlib
+import io
 import json
 import logging
 import os
-import queue
 import shutil
 import signal
 import subprocess
@@ -35,7 +33,6 @@ import sys
 import tempfile
 import threading
 import time
-from contextlib import AsyncExitStack
 from typing import Any, Dict, List, Optional, Tuple
 
 from rllm.environments.base.base_env import BaseEnv
@@ -43,246 +40,214 @@ from rllm.rewards.reward_types import RewardOutput
 
 # AWM core imports
 from awm.core.db import create_sqlite_database
-from awm.core.agent import format_tools_for_response
+from awm.core.agent import MCPToolExecutor, format_tools_for_response
 from awm.tools import (
     normalize_scenario_name as normalize_awm_name,
     get_random_available_port,
     tools_jsonl_save,
+    isolated_mcp_env,
 )
 
 logger = logging.getLogger(__name__)
 
-class _DirectMCPExecutor:
+class _ThreadSafeMCPExecutor(MCPToolExecutor):
     """
-    MCP tool executor using the low-level `mcp` SDK directly.
+    Thread-safe MCPToolExecutor for use in ThreadPoolExecutor.
 
-    Completely bypasses the `mcp_agent` library (MCPApp, Agent, Settings,
-    _global_context) to eliminate the asyncio.run() deadlock caused by
-    concurrent MCPApp.initialize()/cleanup() racing on the process-level
-    _global_context singleton.
+    Two problems with the native MCPToolExecutor.__init__:
 
-    Architecture:
-      - A background daemon thread runs a dedicated asyncio event loop
-      - The event loop maintains a persistent streamable_http connection
-        and ClientSession (no per-call initialize/cleanup cycle)
-      - Caller threads submit requests via a thread-safe queue and block
-        on a per-request response queue
-      - No process-global state, no _session_lock, no MCPApp
+    1. It calls isolated_mcp_env() which modifies os.environ globally —
+       unsafe when multiple threads share the same process.
+    2. mcp_agent.config.Settings inherits from pydantic_settings.BaseSettings,
+       which auto-reads os.environ.  Training env vars like ENV, DATABASE_PATH
+       collide with Settings fields and cause JSON parse errors.
 
-    This design mirrors MCPConnectionManager in rllm/environments/tools/mcp_env.py
-    (which uses stdio transport) but adapted for streamable_http transport.
+    Solution: use isolated_mcp_env() with a process-wide lock, and construct
+    mcp-agent Settings inside the isolated context for each request. This keeps
+    behavior aligned with awm.tools.check_mcp_server() while remaining
+    thread-safe for RLLM's ThreadPoolExecutor.
+
+    CRITICAL: The mcp_agent Agent must be created INSIDE the MCPApp.run()
+    async context — Agent resolves server configurations from the app
+    context at creation time.  Creating Agent outside app.run() causes
+    silent MCP handshake failures (only SSE GET, no POST initialize).
+    list_tools() and call_tool() are overridden to follow the same pattern
+    as awm.tools.check_mcp_server() which creates Agent inside app.run().
     """
+
+    # Keep server alias consistent with awm.tools.check_mcp_server()
+    _MCP_SERVER_NAME = "mcp_tool"
+    _settings_lock = threading.Lock()
 
     def __init__(self, mcp_url: str, timeout: float = 60.0):
+        from mcp_agent.app import MCPApp
+
         self.mcp_url = mcp_url
         self.timeout = timeout
         self._tools: list[dict] = []
         self._tools_cached = False
-        self._request_queue: queue.Queue = queue.Queue()
-        self._running = False
-        self._worker_thread: Optional[threading.Thread] = None
-        self._ready_event = threading.Event()
-        self._init_error: Optional[str] = None
+        self._session_lock = threading.Lock()
+        self._settings = self._build_settings_thread_safe()
+        self._app = MCPApp(name="awm_agent", settings=self._settings)
+        # Legacy implementation (kept as comments per request):
+        # from mcp_agent.config import (
+        #     Settings, MCPSettings, MCPServerSettings, LoggerSettings,
+        # )
+        # with self._settings_lock:
+        #     with isolated_mcp_env():
+        #         self._settings = Settings(
+        #             execution_engine="asyncio",
+        #             logger=LoggerSettings(
+        #                 type="none",
+        #                 transports=["none"],
+        #                 progress_display=False,
+        #                 level="error",
+        #             ),
+        #             mcp=MCPSettings(
+        #                 servers={
+        #                     self._MCP_SERVER_NAME: MCPServerSettings(
+        #                         transport="streamable_http",
+        #                         url=self.mcp_url,
+        #                     ),
+        #                 }
+        #             ),
+        #         )
 
-        self._start_worker()
-
-    def _start_worker(self):
-        """Start background worker thread with dedicated event loop."""
-        self._running = True
-        self._ready_event.clear()
-        self._init_error = None
-        self._worker_thread = threading.Thread(
-            target=self._run_worker, daemon=True, name="mcp-direct-worker"
+    def _build_settings(self):
+        from mcp_agent.config import (
+            Settings, MCPSettings, MCPServerSettings, LoggerSettings,
         )
-        self._worker_thread.start()
+        return Settings(
+            execution_engine="asyncio",
+            logger=LoggerSettings(
+                type="none",
+                transports=["none"],
+                progress_display=False,
+                level="error",
+            ),
+            mcp=MCPSettings(
+                servers={
+                    self._MCP_SERVER_NAME: MCPServerSettings(
+                        transport="streamable_http",
+                        url=self.mcp_url,
+                    ),
+                }
+            ),
+        )
 
-        if not self._ready_event.wait(timeout=self.timeout + 10):
-            self._running = False
-            if self._init_error:
-                raise RuntimeError(f"MCP session init failed: {self._init_error}")
-            raise RuntimeError(
-                f"MCP session init timed out after {self.timeout + 10}s for {self.mcp_url}"
-            )
-        if self._init_error:
-            raise RuntimeError(f"MCP session init failed: {self._init_error}")
+    def _build_settings_thread_safe(self):
+        """
+        Build Settings in isolated env, but keep the lock scope minimal.
 
-    def _run_worker(self):
-        """Background thread: run asyncio event loop with persistent MCP session."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self._async_main())
-        except Exception as e:
-            logger.error(f"[MCP-Direct] Worker crashed: {e}", exc_info=True)
-            self._init_error = str(e)
-            self._ready_event.set()
-        finally:
-            try:
-                tasks = asyncio.all_tasks(loop)
-                for t in tasks:
-                    t.cancel()
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.close()
-            except Exception:
-                pass
-            self._running = False
+        We only need locking while entering isolated_mcp_env()/constructing Settings
+        (both touch process-global environment variables). The expensive MCP network
+        handshake and tool calls run outside the global lock.
+        """
+        with self._settings_lock:
+            with isolated_mcp_env():
+                return self._build_settings()
 
-    async def _async_main(self):
-        """Async main loop: establish persistent MCP connection and process requests."""
-        from mcp.client.streamable_http import streamable_http_client
-        from mcp.client.session import ClientSession
+    async def list_tools(self) -> list[dict]:
+        from mcp_agent.agents.agent import Agent
 
-        try:
-            async with AsyncExitStack() as stack:
-                transport = await stack.enter_async_context(
-                    streamable_http_client(self.mcp_url)
-                )
-                read_stream, write_stream, _ = transport
-                session = await stack.enter_async_context(
-                    ClientSession(read_stream, write_stream)
-                )
-                await session.initialize()
+        # Legacy implementation (kept as comments per request):
+        # app = MCPApp(name="awm_agent", settings=self._settings)
+        # with contextlib.redirect_stderr(io.StringIO()):
+        #     async with app.run():
+        #         agent = Agent(
+        #             name="executor",
+        #             server_names=[self._MCP_SERVER_NAME],
+        #         )
+        #         async with agent:
+        #             result = await asyncio.wait_for(
+        #                 agent.list_tools(), timeout=self.timeout
+        #             )
+        #             self._tools = []
+        #             for t in result.tools:
+        #                 tool_info = {
+        #                     "name": t.name,
+        #                     "description": t.description or "",
+        #                     "inputSchema": t.inputSchema or {},
+        #                 }
+        #                 self._tools.append(tool_info)
+        #             return self._tools
 
-                self._ready_event.set()
-                logger.info(f"[MCP-Direct] Session established for {self.mcp_url}")
-
-                while self._running:
-                    # Use get_nowait() + asyncio.sleep() instead of blocking
-                    # get(timeout=N). The streamable_http transport runs its
-                    # post_writer/SSE tasks in the same event loop via anyio;
-                    # a blocking queue.get() would starve those tasks.
-                    try:
-                        cmd, data, resp_q = self._request_queue.get_nowait()
-                    except queue.Empty:
-                        await asyncio.sleep(0.01)
-                        continue
-
-                    if cmd == "stop":
-                        break
-                    elif cmd == "list_tools":
-                        await self._handle_list_tools(session, resp_q)
-                    elif cmd == "call_tool":
-                        await self._handle_call_tool(session, data, resp_q)
-                    else:
-                        if resp_q:
-                            resp_q.put(("error", f"Unknown command: {cmd}"))
-
-        except Exception as e:
-            logger.error(f"[MCP-Direct] Connection failed: {e}", exc_info=True)
-            self._init_error = str(e)
-            self._ready_event.set()
-            self._drain_pending_requests(str(e))
-
-    def _drain_pending_requests(self, error_msg: str):
-        """Drain any pending requests with error responses on shutdown."""
-        while True:
-            try:
-                cmd, data, resp_q = self._request_queue.get_nowait()
-                if resp_q:
-                    resp_q.put(("error", error_msg))
-            except queue.Empty:
-                break
-
-    async def _handle_list_tools(self, session, resp_q: queue.Queue):
-        try:
-            result = await asyncio.wait_for(
-                session.list_tools(), timeout=self.timeout
-            )
-            tools = []
-            for t in result.tools:
-                tools.append({
-                    "name": t.name,
-                    "description": t.description or "",
-                    "inputSchema": t.inputSchema or {},
-                })
-            resp_q.put(("ok", tools))
-        except Exception as e:
-            resp_q.put(("error", str(e)))
-
-    async def _handle_call_tool(self, session, data: dict, resp_q: queue.Queue):
-        try:
-            tool_name = data["tool_name"]
-            arguments = data["arguments"]
-            result = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments),
-                timeout=self.timeout,
-            )
-            parts = []
-            for c in result.content:
-                if hasattr(c, "text"):
-                    parts.append(c.text)
-                else:
-                    parts.append(str(c))
-            text = "\n".join(parts)
-            if result.isError:
-                resp_q.put(("ok", f"Error: {text}"))
-            else:
-                resp_q.put(("ok", text))
-        except Exception as e:
-            resp_q.put(("error", str(e)))
-
-    def list_tools(self) -> list[dict]:
-        """Synchronous list_tools — submits to background thread, blocks for result."""
         if self._tools_cached and self._tools:
             return self._tools
 
-        if not self._running:
-            raise RuntimeError("MCP executor is not running")
+        # Match awm.tools.check_mcp_server() lifecycle, but only keep lock around
+        # settings creation to avoid serializing all MCP network traffic.
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.list_tools(), timeout=self.timeout
+                        )
+                        self._tools = []
+                        for t in result.tools:
+                            tool_info = {
+                                "name": t.name,
+                                "description": t.description or "",
+                                "inputSchema": t.inputSchema or {},
+                            }
+                            self._tools.append(tool_info)
+                        self._tools_cached = True
+                        return self._tools
 
-        resp_q: queue.Queue = queue.Queue()
-        self._request_queue.put(("list_tools", None, resp_q))
+    async def call_tool(self, tool_name: str, arguments: dict) -> str:
+        from mcp_agent.agents.agent import Agent
 
-        try:
-            status, payload = resp_q.get(timeout=self.timeout + 10)
-        except queue.Empty:
-            raise TimeoutError(
-                f"list_tools timed out after {self.timeout + 10}s"
-            )
+        # Legacy implementation (kept as comments per request):
+        # app = MCPApp(name="awm_agent", settings=self._settings)
+        # with contextlib.redirect_stderr(io.StringIO()):
+        #     async with app.run():
+        #         agent = Agent(
+        #             name="executor",
+        #             server_names=[self._MCP_SERVER_NAME],
+        #         )
+        #         async with agent:
+        #             result = await asyncio.wait_for(
+        #                 agent.call_tool(tool_name, arguments),
+        #                 timeout=self.timeout,
+        #             )
+        #             parts = []
+        #             for c in result.content:
+        #                 if hasattr(c, "text"):
+        #                     parts.append(c.text)
+        #                 else:
+        #                     parts.append(str(c))
+        #             text = "\n".join(parts)
+        #             if result.isError:
+        #                 return f"Error: {text}"
+        #             return text
 
-        if status == "error":
-            raise RuntimeError(f"list_tools failed: {payload}")
-
-        self._tools = payload
-        self._tools_cached = True
-        return self._tools
-
-    def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Synchronous call_tool — submits to background thread, blocks for result."""
-        if not self._running:
-            raise RuntimeError("MCP executor is not running")
-
-        resp_q: queue.Queue = queue.Queue()
-        self._request_queue.put((
-            "call_tool",
-            {"tool_name": tool_name, "arguments": arguments},
-            resp_q,
-        ))
-
-        try:
-            status, payload = resp_q.get(timeout=self.timeout + 10)
-        except queue.Empty:
-            raise TimeoutError(
-                f"call_tool({tool_name}) timed out after {self.timeout + 10}s"
-            )
-
-        if status == "error":
-            raise RuntimeError(f"call_tool({tool_name}) failed: {payload}")
-
-        return payload
-
-    def stop(self):
-        """Gracefully shut down the background worker."""
-        self._running = False
-        try:
-            self._request_queue.put(("stop", None, None))
-        except Exception:
-            pass
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=5)
-
-    @property
-    def is_alive(self) -> bool:
-        return self._running and self._worker_thread is not None and self._worker_thread.is_alive()
+        with self._session_lock:
+            with contextlib.redirect_stderr(io.StringIO()):
+                async with self._app.run():
+                    agent = Agent(
+                        name="executor",
+                        server_names=[self._MCP_SERVER_NAME],
+                    )
+                    async with agent:
+                        result = await asyncio.wait_for(
+                            agent.call_tool(tool_name, arguments),
+                            timeout=self.timeout,
+                        )
+                        parts = []
+                        for c in result.content:
+                            if hasattr(c, "text"):
+                                parts.append(c.text)
+                            else:
+                                parts.append(str(c))
+                        text = "\n".join(parts)
+                        if result.isError:
+                            return f"Error: {text}"
+                        return text
 
 
 class AWMEnvironment(BaseEnv):
@@ -338,6 +303,15 @@ When you have completed the task, provide your final answer directly without any
     _port_lock = threading.Lock()
     _active_ports: set = set()
 
+    # Process-level MCP initialization lock: serializes MCP executor creation
+    # and tool verification across all AWMEnvironment instances.
+    #
+    # When multiple threads concurrently create MCP connections (e.g. same
+    # scenario with tasks_per_scenario > 1), the underlying mcp_agent library
+    # can deadlock inside asyncio.run() due to global state / event-loop
+    # interactions. Serializing MCP verification eliminates this race at the
+    # cost of slightly slower startup for parallel environments.
+    _mcp_init_lock = threading.Lock()
 
     def __init__(
         self,
@@ -384,7 +358,7 @@ When you have completed the task, provide your final answer directly without any
         self.server_log_file = None
         self.server_log_path: Optional[str] = None
         self.temp_dir: Optional[str] = None
-        self._mcp_executor: Optional[_DirectMCPExecutor] = None
+        self._mcp_executor: Optional[_ThreadSafeMCPExecutor] = None
         self.current_db_path: Optional[str] = None
         self.initial_db_path: Optional[str] = None
 
@@ -797,7 +771,7 @@ When you have completed the task, provide your final answer directly without any
         4. Launch `python -m awm.core.server` as subprocess
         5. Sleep 3s then check if process crashed (same as original)
         6. Wait for server readiness (TCP + HTTP /awm_health, with middleware fallback)
-        7. Verify MCP connectivity via _DirectMCPExecutor.list_tools()
+        7. Verify MCP connectivity via _ThreadSafeMCPExecutor.list_tools()
         """
         scenario_norm = normalize_awm_name(self.scenario_name)
         self.temp_dir = tempfile.mkdtemp(prefix=f"awm_env_{scenario_norm}_")
@@ -918,24 +892,30 @@ When you have completed the task, provide your final answer directly without any
 
                 # ── Step 7: MCP verification (must discover non-empty tools) ──
                 #
-                # _DirectMCPExecutor uses the low-level mcp SDK with a persistent
-                # background connection. No MCPApp, no _global_context, no
-                # process-level locks needed.
+                # CRITICAL: Serialize MCP initialization across all AWMEnvironment
+                # instances using a process-level lock. When multiple threads
+                # concurrently create MCP connections (e.g. tasks_per_scenario > 1),
+                # the mcp_agent library can deadlock inside asyncio.run() due to
+                # global state / event-loop interactions. The lock scope covers
+                # only the executor creation + first list_tools() verification;
+                # subsequent call_tool() / list_tools() calls during agent
+                # interaction run without this lock.
                 mcp_url = f"http://{self.server_host}:{self.server_port}/mcp"
                 last_mcp_error = None
 
                 for mcp_attempt in range(1, max_mcp_retries + 1):
                     try:
-                        self._mcp_executor = _DirectMCPExecutor(
-                            mcp_url, timeout=self.tool_call_timeout
-                        )
-                        tools = self._mcp_executor.list_tools()
+                        with AWMEnvironment._mcp_init_lock:
+                            self._mcp_executor = _ThreadSafeMCPExecutor(mcp_url)
+                            # Give explicit timeout here to prevent hidden hangs in MCP startup.
+                            tools = self._run_async(self._mcp_executor.list_tools(), timeout=60.0)
                         if tools:
                             logger.info(
                                 f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
                             )
                             return
 
+                        # Empty tool list is treated as NOT READY (transient race in FastApiMCP startup).
                         last_mcp_error = "empty_tools_list"
                         logger.warning(
                             f"[{self.scenario_name}] MCP returned empty tools list on attempt "
@@ -946,10 +926,6 @@ When you have completed the task, provide your final answer directly without any
                         logger.warning(
                             f"[{self.scenario_name}] MCP verify attempt {mcp_attempt}/{max_mcp_retries} failed: {e}"
                         )
-
-                    if self._mcp_executor:
-                        self._mcp_executor.stop()
-                        self._mcp_executor = None
 
                     if mcp_attempt < max_mcp_retries:
                         time.sleep(2.0 * mcp_attempt)
@@ -1033,13 +1009,6 @@ When you have completed the task, provide your final answer directly without any
 
     def _cleanup_server(self):
         """Clean up server process and temporary files."""
-        if self._mcp_executor:
-            try:
-                self._mcp_executor.stop()
-            except Exception:
-                pass
-            self._mcp_executor = None
-
         self._kill_server_process(reason="cleanup_called")
 
         if self.temp_dir and os.path.exists(self.temp_dir):
@@ -1049,6 +1018,7 @@ When you have completed the task, provide your final answer directly without any
                 pass
             self.temp_dir = None
 
+        self._mcp_executor = None
         self._release_port()
         self.server_port = None
         self.current_db_path = None
@@ -1178,17 +1148,80 @@ When you have completed the task, provide your final answer directly without any
 
         return tool_calls
 
+    # ------------------------------------------------------------------
+    # Async execution — each MCP call uses asyncio.run() with a fresh
+    # event loop.  The mcp_agent library does not work correctly on
+    # persistent background event loops (only SSE GET is sent; the
+    # initialization POSTs never fire).  This is safe because each
+    # list_tools / call_tool call creates entirely new async contexts
+    # (async with self._app.run(), async with self._agent).
+    # ------------------------------------------------------------------
+
+    def _run_async(self, coro, timeout: float = 120.0):
+        """Run *coro* in a fresh event loop via asyncio.run(), with a thread-level
+        hard timeout as a safety net.
+
+        Called from ThreadPoolExecutor worker threads (no existing event loop),
+        so asyncio.run() works directly.  The individual coroutines (list_tools,
+        call_tool) already contain their own asyncio.wait_for timeouts.
+
+        However, when multiple ThreadPoolExecutor threads concurrently create
+        MCP connections (e.g. same scenario with tasks_per_scenario > 1), the
+        underlying mcp_agent library can occasionally deadlock inside
+        asyncio.run(), causing the asyncio-level timeout to never fire.
+
+        To guard against this, we run asyncio.run() inside a daemon thread with
+        a hard wall-clock timeout.  If the inner call doesn't return within
+        *timeout* seconds, the daemon thread is abandoned and a TimeoutError
+        is raised, allowing the caller (_start_server retry loop) to recover.
+        """
+        result_container: dict = {}
+
+        def _target():
+            try:
+                result_container["value"] = asyncio.run(
+                    asyncio.wait_for(coro, timeout=timeout)
+                )
+            except Exception as e:
+                result_container["error"] = e
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        # Use a generous multiplier so the inner asyncio timeout fires first
+        # under normal circumstances; the hard timeout only kicks in on deadlocks.
+        hard_timeout = timeout + 30.0
+        t.join(timeout=hard_timeout)
+
+        if t.is_alive():
+            self._mcp_dead = True
+            logger.error(
+                f"[{self.scenario_name}] _run_async hard timeout after {hard_timeout:.0f}s — "
+                f"asyncio.run() likely deadlocked. Abandoning coroutine. "
+                f"MCP executor marked dead; subsequent tool calls will fail fast."
+            )
+            raise TimeoutError(
+                f"_run_async hard timeout ({hard_timeout:.0f}s) for scenario "
+                f"'{self.scenario_name}'. MCP connection likely deadlocked."
+            )
+
+        if "error" in result_container:
+            raise result_container["error"]
+
+        return result_container.get("value")
+
     def _execute_tool_call(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a tool call — mirrors awm/core/agent.py::run_agent() tool dispatch.
 
-        _DirectMCPExecutor.list_tools() / call_tool() are synchronous calls that
-        submit to the executor's background thread and block on its response queue.
-        No asyncio.run(), no daemon threads, no _session_lock — the persistent
-        session handles everything.
+        Uses self.tool_call_timeout (default 30s) for individual tool calls
+        during agent interaction.  This is intentionally shorter than the
+        startup timeout (120s) because tool calls should complete quickly;
+        prolonged waits indicate MCP deadlocks or stuck queries.
 
-        If the background worker dies (connection lost, etc.), _mcp_dead is set
-        and subsequent calls fail fast, terminating the episode.
+        If a previous call caused a hard timeout (deadlock), the MCP executor's
+        _session_lock is permanently held by the abandoned daemon thread.
+        All subsequent calls would block on that lock and also timeout.
+        We detect this via _mcp_dead and fail fast + terminate the episode.
         """
         name = tool_call.get("name", "")
         arguments = tool_call.get("arguments", {})
@@ -1197,29 +1230,16 @@ When you have completed the task, provide your final answer directly without any
         if self._mcp_dead:
             self.done = True
             logger.warning(
-                f"[{self.scenario_name}] MCP executor is dead. "
+                f"[{self.scenario_name}] MCP executor is dead (previous deadlock). "
                 f"Terminating episode. tool={name}"
             )
             return {
                 "tool": name,
                 "tool_call_id": tool_call_id,
                 "result": (
-                    "Error: MCP connection is broken. This episode is terminated."
+                    "Error: MCP connection is permanently broken due to a previous "
+                    "deadlock. This episode is terminated."
                 ),
-                "success": False,
-            }
-
-        if self._mcp_executor and not self._mcp_executor.is_alive:
-            self._mcp_dead = True
-            self.done = True
-            logger.warning(
-                f"[{self.scenario_name}] MCP executor worker thread died. "
-                f"Terminating episode. tool={name}"
-            )
-            return {
-                "tool": name,
-                "tool_call_id": tool_call_id,
-                "result": "Error: MCP connection lost. This episode is terminated.",
                 "success": False,
             }
 
@@ -1228,7 +1248,10 @@ When you have completed the task, provide your final answer directly without any
                 if self.available_tools:
                     tools = self.available_tools
                 else:
-                    tools = self._mcp_executor.list_tools()
+                    tools = self._run_async(
+                        self._mcp_executor.list_tools(),
+                        timeout=self.tool_call_timeout,
+                    )
                 self.available_tools = tools
                 formatted_tools = format_tools_for_response(tools)
                 return {
@@ -1238,7 +1261,6 @@ When you have completed the task, provide your final answer directly without any
                     "success": True
                 }
             except TimeoutError:
-                self._mcp_dead = True
                 logger.warning(
                     f"[{self.scenario_name}] list_tools timed out after {self.tool_call_timeout}s"
                 )
@@ -1260,7 +1282,10 @@ When you have completed the task, provide your final answer directly without any
             tool_name, tool_args = self._parse_call_tool_arguments(arguments)
 
             try:
-                result = self._mcp_executor.call_tool(tool_name, tool_args)
+                result = self._run_async(
+                    self._mcp_executor.call_tool(tool_name, tool_args),
+                    timeout=self.tool_call_timeout,
+                )
                 return {
                     "tool": tool_name,
                     "tool_call_id": tool_call_id,
@@ -1269,7 +1294,6 @@ When you have completed the task, provide your final answer directly without any
                     "success": not result.startswith("Error:")
                 }
             except TimeoutError:
-                self._mcp_dead = True
                 logger.warning(
                     f"[{self.scenario_name}] call_tool({tool_name}) timed out after "
                     f"{self.tool_call_timeout}s"

@@ -267,6 +267,7 @@ def main(config):
     verification_mode = config.data.get("verification_mode", "pure_code")
     precheck_db = bool(config.data.get("precheck_db", False))
     precheck_max_failed_tables = int(config.data.get("precheck_max_failed_tables", 0))
+    prefiltered_dir = config.data.get("prefiltered_dir", None)
 
     logger.info(">>> AWM Training Configuration:")
     logger.info(f"  Dataset: {dataset_path}")
@@ -277,75 +278,104 @@ def main(config):
     logger.info(f"  DB precheck enabled: {precheck_db}")
     if precheck_db:
         logger.info(f"  DB precheck max_failed_tables: {precheck_max_failed_tables}")
+    if prefiltered_dir:
+        logger.info(f"  Pre-filtered data dir: {prefiltered_dir}")
 
     # ============================================================
     # Prepare Dataset — 独立管道，直接生成 verl parquet
     # ============================================================
-    output_dir = os.path.join(
-        config.data.get("output_dir", "/tmp/awm_data"),
-        f"s{train_scenarios}_t{tasks_per_scenario}_{verification_mode}"
-    )
+    if prefiltered_dir and os.path.isdir(prefiltered_dir):
+        # 使用预先过滤好的 parquet 文件（来自 precheck_scenarios.py 的输出）
+        train_parquet_path = os.path.join(prefiltered_dir, "train.parquet")
+        # precheck_scenarios.py 生成 test.parquet，兼容两种命名
+        val_parquet_path = os.path.join(prefiltered_dir, "val.parquet")
+        if not os.path.exists(val_parquet_path):
+            val_parquet_path = os.path.join(prefiltered_dir, "test.parquet")
 
-    train_parquet_path = os.path.join(output_dir, "train.parquet")
-    val_parquet_path = os.path.join(output_dir, "val.parquet")
-
-    # 加载训练数据
-    logger.info(">>> Loading AWM training data...")
-    train_data = load_awm_dataset(
-        dataset_path=dataset_path,
-        split="train",
-        num_scenarios=train_scenarios,
-        tasks_per_scenario=tasks_per_scenario,
-        verification_mode=verification_mode,
-    )
-
-    # 加载验证数据
-    logger.info(">>> Loading AWM validation data...")
-    val_data = load_awm_dataset(
-        dataset_path=dataset_path,
-        split="test",
-        num_scenarios=test_scenarios,
-        tasks_per_scenario=tasks_per_scenario,
-        verification_mode=verification_mode,
-    )
-
-    if precheck_db:
-        logger.info(">>> Running database precheck for train split...")
-        train_data, train_precheck_report = precheck_and_filter_awm_records(
-            train_data, split_name="train", max_failed_tables=precheck_max_failed_tables
-        )
-        logger.info(
-            f">>> Train precheck done: kept={train_precheck_report['kept']}, "
-            f"dropped={train_precheck_report['dropped']}"
-        )
-
-        logger.info(">>> Running database precheck for val split...")
-        val_data, val_precheck_report = precheck_and_filter_awm_records(
-            val_data, split_name="val", max_failed_tables=precheck_max_failed_tables
-        )
-        logger.info(
-            f">>> Val precheck done: kept={val_precheck_report['kept']}, "
-            f"dropped={val_precheck_report['dropped']}"
-        )
-
-        if not train_data:
-            raise RuntimeError(
-                "All training records were filtered out by DB precheck. "
-                "Try increasing +data.precheck_max_failed_tables or disabling +data.precheck_db."
+        if not os.path.exists(train_parquet_path):
+            raise FileNotFoundError(
+                f"Pre-filtered train parquet not found: {train_parquet_path}. "
+                f"Run precheck_scenarios.py first or remove +data.prefiltered_dir."
             )
-        if not val_data:
-            logger.warning(
-                "All validation records were filtered out by DB precheck. "
-                "Validation metrics may be unavailable."
+        if not os.path.exists(val_parquet_path):
+            raise FileNotFoundError(
+                f"Pre-filtered val/test parquet not found in {prefiltered_dir}. "
+                f"Run precheck_scenarios.py first or remove +data.prefiltered_dir."
             )
 
-    save_awm_parquet(train_data, train_parquet_path)
-    save_awm_parquet(val_data, val_parquet_path)
-    
+        train_count = len(hf_datasets.Dataset.from_parquet(train_parquet_path))
+        val_count = len(hf_datasets.Dataset.from_parquet(val_parquet_path))
 
-    logger.info(f">>> Dataset prepared: {len(train_data)} train, {len(val_data)} val samples")
-    logger.info(f"  Train parquet: {train_parquet_path}")
-    logger.info(f"  Val parquet:   {val_parquet_path}")
+        logger.info(
+            f">>> Using pre-filtered data from {prefiltered_dir}: "
+            f"{train_count} train, {val_count} val samples"
+        )
+        logger.info(">>> Skipping data loading, precheck, and parquet generation.")
+    else:
+        output_dir = os.path.join(
+            config.data.get("output_dir", "/tmp/awm_data"),
+            f"s{train_scenarios}_t{tasks_per_scenario}_{verification_mode}"
+        )
+
+        train_parquet_path = os.path.join(output_dir, "train.parquet")
+        val_parquet_path = os.path.join(output_dir, "val.parquet")
+
+        # 加载训练数据
+        logger.info(">>> Loading AWM training data...")
+        train_data = load_awm_dataset(
+            dataset_path=dataset_path,
+            split="train",
+            num_scenarios=train_scenarios,
+            tasks_per_scenario=tasks_per_scenario,
+            verification_mode=verification_mode,
+        )
+
+        # 加载验证数据
+        logger.info(">>> Loading AWM validation data...")
+        val_data = load_awm_dataset(
+            dataset_path=dataset_path,
+            split="test",
+            num_scenarios=test_scenarios,
+            tasks_per_scenario=tasks_per_scenario,
+            verification_mode=verification_mode,
+        )
+
+        if precheck_db:
+            logger.info(">>> Running database precheck for train split...")
+            train_data, train_precheck_report = precheck_and_filter_awm_records(
+                train_data, split_name="train", max_failed_tables=precheck_max_failed_tables
+            )
+            logger.info(
+                f">>> Train precheck done: kept={train_precheck_report['kept']}, "
+                f"dropped={train_precheck_report['dropped']}"
+            )
+
+            logger.info(">>> Running database precheck for val split...")
+            val_data, val_precheck_report = precheck_and_filter_awm_records(
+                val_data, split_name="val", max_failed_tables=precheck_max_failed_tables
+            )
+            logger.info(
+                f">>> Val precheck done: kept={val_precheck_report['kept']}, "
+                f"dropped={val_precheck_report['dropped']}"
+            )
+
+            if not train_data:
+                raise RuntimeError(
+                    "All training records were filtered out by DB precheck. "
+                    "Try increasing +data.precheck_max_failed_tables or disabling +data.precheck_db."
+                )
+            if not val_data:
+                logger.warning(
+                    "All validation records were filtered out by DB precheck. "
+                    "Validation metrics may be unavailable."
+                )
+
+        save_awm_parquet(train_data, train_parquet_path)
+        save_awm_parquet(val_data, val_parquet_path)
+
+        logger.info(f">>> Dataset prepared: {len(train_data)} train, {len(val_data)} val samples")
+        logger.info(f"  Train parquet: {train_parquet_path}")
+        logger.info(f"  Val parquet:   {val_parquet_path}")
 
     # ============================================================
     # 直接设置 verl 数据路径（绕过 DatasetRegistry）

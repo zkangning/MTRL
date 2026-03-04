@@ -172,17 +172,18 @@ def diagnose_awm_native(host: str, port: int):
 
 
 def diagnose_rllm_executor(host: str, port: int):
-    """Layer 3: rllm's _ThreadSafeMCPExecutor (the one used during training)."""
-    from rllm.environments.awm.awm_env import _ThreadSafeMCPExecutor
+    """Layer 3: rllm's _DirectMCPExecutor (the one used during training)."""
+    from rllm.environments.awm.awm_env import _DirectMCPExecutor
 
     print("\n" + "=" * 70)
-    print("LAYER 3: rllm _ThreadSafeMCPExecutor (used during training)")
+    print("LAYER 3: rllm _DirectMCPExecutor (used during training)")
     print("=" * 70)
     mcp_url = f"http://{host}:{port}/mcp"
-    executor = _ThreadSafeMCPExecutor(mcp_url)
+    executor = None
 
     try:
-        tools = asyncio.run(executor.list_tools())
+        executor = _DirectMCPExecutor(mcp_url)
+        tools = executor.list_tools()
         print(f"  Tools returned: {len(tools)}")
         if tools:
             for i, tool in enumerate(tools[:10], 1):
@@ -195,6 +196,9 @@ def diagnose_rllm_executor(host: str, port: int):
     except Exception as e:
         print(f"  EXCEPTION: {type(e).__name__}: {e}")
         return []
+    finally:
+        if executor:
+            executor.stop()
 
 
 def diagnose_awm_environment(scenario_data: dict):
@@ -464,7 +468,7 @@ def main():
         # Layer 2: AWM native check_mcp_server
         native_tools = diagnose_awm_native(host, port)
 
-        # Layer 3: rllm _ThreadSafeMCPExecutor
+        # Layer 3: rllm _DirectMCPExecutor
         rllm_tools = diagnose_rllm_executor(host, port)
 
         # Summary
@@ -476,7 +480,7 @@ def main():
 
         if native_tools and not rllm_tools:
             print("\n  *** BUG: AWM native finds tools but rllm executor does NOT ***")
-            print("  Root cause is likely in _ThreadSafeMCPExecutor or event loop handling.")
+            print("  Root cause is likely in _DirectMCPExecutor or server-side issue.")
         elif not native_tools and not rllm_tools:
             print("\n  *** Both layers return empty. Issue is in FastApiMCP tool extraction ***")
             print("  Check the generated code's OpenAPI schema and FastApiMCP compatibility.")
