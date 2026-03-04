@@ -147,7 +147,7 @@ class _DirectMCPExecutor:
                 await session.initialize()
 
                 self._ready_event.set()
-                logger.info(f"[MCP-Direct] Session established for {self.mcp_url}")
+                # logger.info(f"[MCP-Direct] Session established for {self.mcp_url}")
 
                 while self._running:
                     # Use get_nowait() + asyncio.sleep() instead of blocking
@@ -581,7 +581,7 @@ When you have completed the task, provide your final answer directly without any
         last_http_status = None
         http_non_200_count = 0
         
-        logger.info(f"[{self.scenario_name}] Waiting for server readiness on port {port} (timeout={timeout}s)...")
+        # logger.info(f"[{self.scenario_name}] Waiting for server readiness on port {port} (timeout={timeout}s)...")
 
         health_endpoint = "/awm_health"
 
@@ -606,7 +606,7 @@ When you have completed the task, provide your final answer directly without any
                         s.settimeout(1.0)
                         s.connect((self.server_host, port))
                         tcp_ready = True
-                        logger.info(f"[{self.scenario_name}] TCP port {port} is open after {elapsed:.1f}s, checking HTTP health...")
+                        # logger.info(f"[{self.scenario_name}] TCP port {port} is open after {elapsed:.1f}s, checking HTTP health...")
                 except (socket.timeout, ConnectionRefusedError, OSError) as e:
                     if int(elapsed) % 10 == 0 and int(elapsed) > 0:
                         logger.debug(f"[{self.scenario_name}] Still waiting for TCP port {port} ({elapsed:.0f}s elapsed): {e}")
@@ -622,33 +622,34 @@ When you have completed the task, provide your final answer directly without any
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     last_http_status = resp.status
                     if resp.status == 200:
-                        logger.info(
-                            f"[{self.scenario_name}] Server HTTP ready on port {port} "
-                            f"after {elapsed:.1f}s ({http_attempts} HTTP attempts)"
-                        )
+                        # logger.info(
+                        #     f"[{self.scenario_name}] Server HTTP ready on port {port} "
+                        #     f"after {elapsed:.1f}s ({http_attempts} HTTP attempts)"
+                        # )
                         return True
             except urllib.error.HTTPError as e:
                 last_http_status = e.code
                 last_http_error = f"HTTP Error {e.code}: {e.reason}"
                 http_non_200_count += 1
                 
-                if http_non_200_count == 1 or http_non_200_count % 20 == 0:
-                    logger.info(
-                        f"[{self.scenario_name}] Health check returned {e.code} on {health_endpoint} "
-                        f"({http_non_200_count} total non-200, {elapsed:.1f}s elapsed)"
-                    )
+                # if http_non_200_count == 1 or http_non_200_count % 20 == 0:
+                #     logger.info(
+                #         f"[{self.scenario_name}] Health check returned {e.code} on {health_endpoint} "
+                #         f"({http_non_200_count} total non-200, {elapsed:.1f}s elapsed)"
+                #     )
                 
                 # If we're getting consistent non-200 responses after the server has been
                 # running for a while, the generated code likely has a global middleware
                 # blocking all HTTP responses. Fall back to TCP-only readiness check.
                 # The MCP verification in _start_server Step 7 will do the real validation.
                 if http_non_200_count >= 10 and elapsed >= 15.0:
-                    logger.warning(
-                        f"[{self.scenario_name}] Health endpoint consistently returning {e.code} "
-                        f"({http_non_200_count} times over {elapsed:.1f}s). "
-                        f"Generated code likely has a global middleware. "
-                        f"Proceeding with TCP-only readiness — MCP verification will follow."
-                    )
+                    # logger.warning(
+                    #     f"[{self.scenario_name}] Health endpoint consistently returning {e.code} "
+                    #     f"({http_non_200_count} times over {elapsed:.1f}s). "
+                    #     f"Generated code likely has a global middleware. "
+                    #     f"Proceeding with TCP-only readiness — MCP verification will follow."
+                    # )
+                    pass
                     return True
             except (urllib.error.URLError, OSError, TimeoutError) as e:
                 last_http_error = str(e)
@@ -716,10 +717,10 @@ When you have completed the task, provide your final answer directly without any
                 port = get_random_available_port()
                 if port not in AWMEnvironment._active_ports:
                     AWMEnvironment._active_ports.add(port)
-                    logger.info(
-                        f"[{self.scenario_name}] Allocated port {port} "
-                        f"({len(AWMEnvironment._active_ports)} active)"
-                    )
+                    # logger.info(
+                    #     f"[{self.scenario_name}] Allocated port {port} "
+                    #     f"({len(AWMEnvironment._active_ports)} active)"
+                    # )
                     return port
             raise RuntimeError(
                 f"Failed to allocate unique port after {max_attempts} attempts "
@@ -811,9 +812,9 @@ When you have completed the task, provide your final answer directly without any
             self.current_db_path = os.path.join(self.temp_dir, f"{scenario_norm}.db")
             shutil.copyfile(source_db_path, self.current_db_path)
             os.chmod(self.current_db_path, 0o644)
-            logger.info(f"[{self.scenario_name}] Copied existing database from {source_db_path}")
+            # logger.info(f"[{self.scenario_name}] Copied existing database from {source_db_path}")
         elif self.db_schema:
-            logger.info(f"[{self.scenario_name}] Creating database from schema...")
+            # logger.info(f"[{self.scenario_name}] Creating database from schema...")
             full_schema = copy.deepcopy(self.db_schema)
             table_examples = self._normalize_db_sample_examples(self.db_sample)
             if table_examples:
@@ -826,10 +827,10 @@ When you have completed the task, provide your final answer directly without any
                 self.scenario_name, full_schema, self.temp_dir
             )
             self.current_db_path = db_path
-            logger.info(
-                f"[{self.scenario_name}] Database built from schema: "
-                f"tables_ok={successful}, tables_failed={failed}"
-            )
+            # logger.info(
+            #     f"[{self.scenario_name}] Database built from schema: "
+            #     f"tables_ok={successful}, tables_failed={failed}"
+            # )
             if failed > 0:
                 logger.warning(f"[{self.scenario_name}] Database creation had {failed} failures: {errors}")
         else:
@@ -863,10 +864,10 @@ When you have completed the task, provide your final answer directly without any
                 self.server_port = self._allocate_port()
 
                 # ── Step 4: Launch subprocess ──
-                logger.info(
-                    f"[{self.scenario_name}] Starting AWM server on port {self.server_port} "
-                    f"(attempt {launch_attempt}/{max_launch_retries})..."
-                )
+                # logger.info(
+                #     f"[{self.scenario_name}] Starting AWM server on port {self.server_port} "
+                #     f"(attempt {launch_attempt}/{max_launch_retries})..."
+                # )
 
                 self.server_log_path = os.path.join(self.temp_dir, "server.log")
                 self.server_log_file = open(self.server_log_path, "w")
@@ -886,12 +887,12 @@ When you have completed the task, provide your final answer directly without any
                     text=True,
                 )
 
-                logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
+                # logger.info(f"[{self.scenario_name}] Server process started (pid={self.server_process.pid})")
 
                 # ── Step 5: Initial crash check ──
                 code_size_kb = len(self.env_code) / 1024
                 initial_wait = min(3.0 + (code_size_kb / 50), 10.0)
-                logger.info(f"[{self.scenario_name}] Waiting {initial_wait:.1f}s for initial startup (code: {code_size_kb:.0f}KB)...")
+                # logger.info(f"[{self.scenario_name}] Waiting {initial_wait:.1f}s for initial startup (code: {code_size_kb:.0f}KB)...")
                 time.sleep(initial_wait)
 
                 if self.server_process.poll() is not None:
@@ -934,9 +935,9 @@ When you have completed the task, provide your final answer directly without any
                         )
                         tools = self._mcp_executor.list_tools()
                         if tools:
-                            logger.info(
-                                f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
-                            )
+                            # logger.info(
+                            #     f"[{self.scenario_name}] MCP verified: {len(tools)} tools on port {self.server_port}"
+                            # )
                             return
 
                         last_mcp_error = "empty_tools_list"

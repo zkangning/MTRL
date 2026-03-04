@@ -46,7 +46,7 @@ def summarize_errors(args: Config, client: GPTClient, raw_error_msg_list: list[s
             "model": args.model,
         }
 
-    logger.info(f"Summarizing {len(raw_error_msg_list)} error messages...")
+    # logger.info(f"Summarizing {len(raw_error_msg_list)} error messages...")
     requests = [create_sum_request(msg) for msg in raw_error_msg_list]
     responses = client.batch_chat_completion(requests, progress_bar=True)
 
@@ -57,7 +57,7 @@ def summarize_errors(args: Config, client: GPTClient, raw_error_msg_list: list[s
             logger.error(f"Failed to summarize error message: Empty response")
             summaries.append(raw_msg)  # Fallback to raw message
         else:
-            logger.info(f"Summarized error message: {len(response)} chars ({tools_token_count(response, args.model)} tokens)\nPreview: {response[:800]}...")
+            # logger.info(f"Summarized error message: {len(response)} chars ({tools_token_count(response, args.model)} tokens)\nPreview: {response[:800]}...")
             summaries.append(response)
     
     return summaries
@@ -76,7 +76,7 @@ def create_sqlite_database(scenario_name: str, db_schema: dict, db_dir: str) -> 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    logger.info(f"Creating database for {scenario_name}...")
+    # logger.info(f"Creating database for {scenario_name}...")
     
     successful_tables = 0
     failed_tables = 0
@@ -104,7 +104,7 @@ def create_sqlite_database(scenario_name: str, db_schema: dict, db_dir: str) -> 
     
     cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
     tables = cursor.fetchall()
-    logger.success(f"Database created with {len(tables)} tables: {[t[0] for t in tables]}")
+    # logger.success(f"Database created with {len(tables)} tables: {[t[0] for t in tables]}")
     
     conn.close()
     
@@ -114,7 +114,7 @@ def create_sqlite_database(scenario_name: str, db_schema: dict, db_dir: str) -> 
 def generate_all_databases(args: Config):
     user_intentions = tools_jsonl_load(args.input)
     
-    logger.info(f"Preparing batch requests for {len(user_intentions)} scenarios...")
+    # logger.info(f"Preparing batch requests for {len(user_intentions)} scenarios...")
     
     # Filter scenarios
     requested_intentions = []
@@ -172,7 +172,7 @@ def generate_all_databases(args: Config):
         if not current_requests:
             break
         
-        logger.info(f"Sending batch requests (Attempt {attempt+1}/{max_retries+1}) count={len(current_requests)}...")
+        # logger.info(f"Sending batch requests (Attempt {attempt+1}/{max_retries+1}) count={len(current_requests)}...")
         responses = client.batch_chat_completion(current_requests, progress_bar=True)
         
         next_items = []
@@ -188,7 +188,7 @@ def generate_all_databases(args: Config):
                 logger.error(f"Failed to generate database schema for {scenario_name}: Empty response")
             else:
                 try:
-                    logger.info(f"Processing response for {scenario_name}: {len(response)} chars")
+                    # logger.info(f"Processing response for {scenario_name}: {len(response)} chars")
                     db_schema = tools_robust_json_loads(response)
                     
                     db_data = {
@@ -209,13 +209,13 @@ def generate_all_databases(args: Config):
                         error_ratio = 1.0
                     
                     tables = db_schema.get("tables", [])
-                    logger.info(f"{scenario_name}: {len(tables)} tables, error ratio: {error_ratio:.2%}")
+                    # logger.info(f"{scenario_name}: {len(tables)} tables, error ratio: {error_ratio:.2%}")
                     
                     if error_ratio > error_threshold:
                         logger.warning(f"Error ratio too high for {scenario_name}: {failed} / {total_tables} = {error_ratio:.2%} > {error_threshold}, scheduling retry...")
                     else:
                         results.append(db_data)
-                        logger.success(f"{scenario_name}: Successfully processed with {error_ratio:.2%} error rate")
+                        # logger.success(f"{scenario_name}: Successfully processed with {error_ratio:.2%} error rate")
                         continue
                     
                 except Exception as e:
@@ -258,8 +258,8 @@ def generate_all_databases(args: Config):
 
     tools_jsonl_save(results, args.output)
 
-    logger.info(f"\nDatabase schemas saved to {args.output}")
-    logger.info(f"Total scenarios processed: {len(results)}/{len(requested_intentions)}")
+    # logger.info(f"\nDatabase schemas saved to {args.output}")
+    # logger.info(f"Total scenarios processed: {len(results)}/{len(requested_intentions)}")
     return results
 
 
