@@ -129,7 +129,10 @@ class _DirectMCPExecutor:
 
     async def _async_main(self):
         """Async main loop: establish persistent MCP connection and process requests."""
-        from mcp.client.streamable_http import streamable_http_client
+        try:
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError:
+            from mcp.client.streamable_http import streamablehttp_client as streamable_http_client
         from mcp.client.session import ClientSession
 
         try:
